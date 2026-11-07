@@ -285,6 +285,12 @@ impl Ctx<'_> {
     fn key_parts(&self, j: &Job) -> (Vec<String>, BTreeMap<String, String>) {
         let n = self.node(j);
         let mut flags = flags_for(j, self.g, &self.chosen);
+        if j.node == self.g.root {
+            if let Ok(extra) = std::env::var("STRIKE_EXTRA") {
+                // Part of the key, so an experiment never lands in a real brand.
+                flags.push(format!("env STRIKE_EXTRA={extra}"));
+            }
+        }
         let env = match j.kind {
             JobKind::ScriptRun => {
                 let e = self.script_env(n);
@@ -322,6 +328,9 @@ impl Ctx<'_> {
     fn rustc(&self, j: &Job, flags: &[String], results: &[Option<Result_>], tmp: &Path) -> Command {
         let n = self.node(j);
         let mut cmd = Command::new("rustc");
+        // A RUSTC_BOOTSTRAP from outside would make build scripts take rustc
+        // for a nightly and change what they build; it never reaches the work.
+        cmd.env_remove("RUSTC_BOOTSTRAP");
         let m = meta(n);
         let piped = self.pipelined(j);
         cmd.arg("--edition").arg(&n.edition);
@@ -333,7 +342,11 @@ impl Ctx<'_> {
         }
         for f in flags {
             if f == "incremental" {
-                let dir = lightning::home().join("incr").join(&hex(&Sha256::digest(j.id.as_bytes()))[..16]);
+                // One folder per flag set: rustc throws its incremental work
+                // away when the flags change, so builds that switch between
+                // settings (a profile, a linker, a test) each keep their own.
+                let tag = format!("{}|{}", j.id, flags.join(" "));
+                let dir = lightning::home().join("incr").join(&hex(&Sha256::digest(tag.as_bytes()))[..16]);
                 cmd.arg(format!("-Cincremental={}", dir.display()));
             } else if !f.starts_with("env ") {
                 cmd.arg(f);
@@ -341,6 +354,15 @@ impl Ctx<'_> {
         }
         if j.node != self.g.root {
             cmd.arg("--cap-lints").arg("allow");
+        } else if let Ok(extra) = std::env::var("STRIKE_EXTRA") {
+            // For experiments only: more flags for the root package's own
+            // rustc; -Z flags are let through on a stable rustc for it alone
+            // (a build script that sees RUSTC_BOOTSTRAP takes rustc for a
+            // nightly and changes what it builds).
+            if extra.contains("-Z") {
+                cmd.env("RUSTC_BOOTSTRAP", "1");
+            }
+            cmd.args(extra.split_whitespace());
         }
         for f in &n.features {
             cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
@@ -539,7 +561,7 @@ impl Ctx<'_> {
             let _ = std::fs::remove_dir_all(&out_dir);
             std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
             let mut cmd = Command::new(dir.join(format!("build-script{}", std::env::consts::EXE_SUFFIX)));
-            cmd.current_dir(&n.dir).envs(&env);
+            cmd.current_dir(&n.dir).envs(&env).env_remove("RUSTC_BOOTSTRAP");
             // What a dependency's build script told its dependents.
             for (d, x) in &n.active {
                 let dn = &self.g.nodes[*x];
