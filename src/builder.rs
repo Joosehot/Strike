@@ -6,6 +6,7 @@ use crate::graph::{DepKind, Graph, Node, Target};
 use crate::lightning::{self, hex, Learned, Lightning};
 use crate::manifest::{Kind, Package, Unit};
 use crate::motor::{self, Branded, Candidate, Rules};
+use crate::times;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -519,9 +520,9 @@ impl Ctx<'_> {
         let n = self.node(j);
         let (flags, env) = self.key_parts(j);
         let links = self.links(j, results);
-        if let Some(k) = self.lightning.key(&j.id, &flags, &links, &env) {
+        if let Some(k) = times::time("5 key (hash the inputs)", || self.lightning.key(&j.id, &flags, &links, &env)) {
             if self.lightning.strike(&k) {
-                self.lightning.restore(&k, &self.out)?;
+                times::time("6 restore a struck brand", || self.lightning.restore(&k, &self.out))?;
                 let script = if j.kind == JobKind::ScriptRun { self.script_out(n)? } else { ScriptOut::default() };
                 return Ok((Result_ { key: k, script }, true));
             }
@@ -580,6 +581,7 @@ impl Ctx<'_> {
             (learned, outputs, self.out.clone())
         } else {
             let mut cmd = self.rustc(j, &flags, results, &tmp);
+            let rustc_start = Instant::now();
             if self.pipelined(j) {
                 self.rustc_piped(j, &mut cmd, &flags, &links, &env, &tmp, on_meta)?;
             } else {
@@ -588,6 +590,7 @@ impl Ctx<'_> {
                     return Err(format!("rustc could not build {}:\n{}", j.id, String::from_utf8_lossy(&o.stderr)));
                 }
             }
+            times::add("7 rustc itself", rustc_start.elapsed().as_secs_f64());
             let mut outputs: Vec<PathBuf> = lightning::files_under(&tmp)
                 .into_iter()
                 .filter(|p| p.extension().is_none_or(|x| x != "d"))
@@ -617,9 +620,9 @@ impl Ctx<'_> {
                 .ok_or("rustc wrote no dep-info")?;
             (lightning::read_dep_info(&dep_info)?, outputs, tmp.clone())
         };
-        let key = self.lightning.brand(&j.id, &flags, &links, &env, learned, &root, &outputs)?;
+        let key = times::time("8 brand the result", || self.lightning.brand(&j.id, &flags, &links, &env, learned, &root, &outputs))?;
         if j.kind != JobKind::ScriptRun {
-            self.lightning.restore(&key, &self.out)?;
+            times::time("9 restore the new brand", || self.lightning.restore(&key, &self.out))?;
         }
         let _ = std::fs::remove_dir_all(&tmp);
         let script = if j.kind == JobKind::ScriptRun { self.script_out(n)? } else { ScriptOut::default() };
@@ -760,10 +763,10 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
         opt.profile,
         rules.profiles.keys().cloned().collect::<Vec<_>>().join(", ")
     ))?;
-    let target = Target::host()?;
-    let g = crate::graph::resolve(&pkg.dir, &target, opt.test)?;
+    let target = times::time("1 rustc --print cfg", Target::host)?;
+    let g = times::time("2 graph (lock, manifests)", || crate::graph::resolve(&pkg.dir, &target, opt.test))?;
     let jobs = plan(&g, pkg, opt.test)?;
-    let lightning = Lightning::open(rustc_version()?);
+    let lightning = times::time("3 rustc -vV, memory", || rustc_version().map(Lightning::open))?;
     let out = pkg.dir.join("strike-out").join(&opt.profile);
     std::fs::create_dir_all(out.join("deps")).map_err(|e| e.to_string())?;
     let base = Ctx { g: &g, target: &target, lightning: &lightning, jobs: &jobs, out: out.clone(), profile: opt.profile.clone(), chosen: Vec::new() };
@@ -782,7 +785,7 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
         sets: sets
             .into_iter()
             .map(|s| {
-                let n = keys_for(&base, &s).iter().filter(|k| k.as_ref().is_some_and(|k| lightning.strike(k))).count();
+                let n = times::time("4 judge: keys per flag set", || keys_for(&base, &s)).iter().filter(|k| k.as_ref().is_some_and(|k| lightning.strike(k))).count();
                 (s, n)
             })
             .filter(|(_, n)| *n > 0)

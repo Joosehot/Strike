@@ -9,6 +9,7 @@ mod graph;
 mod lightning;
 mod manifest;
 mod motor;
+mod times;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -67,7 +68,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             let pkg = manifest::read(&dir)?;
             let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let opt = builder::Options { profile, explain, test: command == "test", jobs };
-            let r = builder::build(&pkg, &rules, &opt)?;
+            let r = builder::build(&pkg, &rules, &opt);
+            times::report();
+            let r = r?;
 
             let choice: Vec<String> = r.chosen.choice.iter().map(|(n, v)| format!("{n}={v}")).collect();
             println!("strike: {} chose {}", pkg.name, choice.join(" "));
