@@ -60,7 +60,7 @@ impl Rules {
             profiles.insert(name.clone(), axes(p, &format!("profile.{name}"))?);
         }
         // The decisions Strike knows how to turn into rustc flags.
-        let known = ["opt_level", "codegen_units", "incremental", "debuginfo"];
+        let known = ["opt_level", "codegen_units", "incremental", "debuginfo", "linker"];
         let mut rules = Vec::new();
         for name in known {
             let at = format!("rule.{name}");
@@ -113,6 +113,11 @@ pub fn flags(choice: &Choice) -> Vec<String> {
     }
     if let Some(v) = get("debuginfo") {
         f.push(format!("-Cdebuginfo={v}"));
+    }
+    if get("linker") == Some("lld") {
+        // The LLVM linker rustup ships next to rustc.
+        f.push("-Clinker=rust-lld".to_string());
+        f.push("-Clinker-flavor=lld-link".to_string());
     }
     if get("incremental") == Some("on") {
         // The directory is not part of the flags: it does not change the output.

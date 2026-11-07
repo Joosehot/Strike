@@ -1,4 +1,4 @@
-﻿//! Steps 4 to 8: the motor chooses the build, then every job of the graph
+//! Steps 4 to 8: the motor chooses the build, then every job of the graph
 //! (build scripts, their runs, libraries, proc macros, binaries, tests) runs
 //! as soon as what it uses is done; the lightning strikes before each one.
 
@@ -62,6 +62,9 @@ struct Job {
     unit: Option<Unit>,
     /// The jobs whose results this one needs.
     needs: Vec<usize>,
+    /// For each need: is the library's interface (rmeta) enough? A library
+    /// built on another only reads its interface; whatever links needs it all.
+    meta_ok: Vec<bool>,
     /// The memory's name for this job.
     id: String,
 }
@@ -112,7 +115,7 @@ fn plan(g: &Graph, pkg: &Package, test: bool) -> Result<Vec<Job>, String> {
                 .filter(|(d, _)| d.kind == DepKind::Build)
                 .filter_map(|(_, x)| lib_job.get(x).copied())
                 .collect();
-            jobs.push(Job { kind: JobKind::ScriptBuild, node: i, unit: None, needs, id: ident(n, "script") });
+            jobs.push(Job { kind: JobKind::ScriptBuild, node: i, unit: None, needs, meta_ok: Vec::new(), id: ident(n, "script") });
             let mut needs = vec![jobs.len() - 1];
             for (d, x) in &n.active {
                 if d.kind == DepKind::Normal && g.nodes[*x].links.is_some() {
@@ -121,7 +124,7 @@ fn plan(g: &Graph, pkg: &Package, test: bool) -> Result<Vec<Job>, String> {
                     }
                 }
             }
-            jobs.push(Job { kind: JobKind::ScriptRun, node: i, unit: None, needs, id: ident(n, "run") });
+            jobs.push(Job { kind: JobKind::ScriptRun, node: i, unit: None, needs, meta_ok: Vec::new(), id: ident(n, "run") });
             run_job.insert(i, jobs.len() - 1);
         }
         if n.lib.is_some() {
@@ -134,7 +137,7 @@ fn plan(g: &Graph, pkg: &Package, test: bool) -> Result<Vec<Job>, String> {
             if let Some(r) = run_job.get(&i) {
                 needs.push(*r);
             }
-            jobs.push(Job { kind: JobKind::Lib, node: i, unit: None, needs, id: ident(n, "lib") });
+            jobs.push(Job { kind: JobKind::Lib, node: i, unit: None, needs, meta_ok: Vec::new(), id: ident(n, "lib") });
             lib_job.insert(i, jobs.len() - 1);
         }
     }
@@ -168,7 +171,12 @@ fn plan(g: &Graph, pkg: &Package, test: bool) -> Result<Vec<Job>, String> {
             needs.push(*r);
         }
         let id = format!("{}|{}", pkg.dir.display(), u.id());
-        jobs.push(Job { kind: JobKind::Root, node: root, unit: Some(u), needs, id });
+        jobs.push(Job { kind: JobKind::Root, node: root, unit: Some(u), needs, meta_ok: Vec::new(), id });
+    }
+    let pipelined = |j: &Job| j.kind == JobKind::Lib && !g.nodes[j.node].proc_macro && std::env::var_os("STRIKE_NO_PIPE").is_none();
+    for k in 0..jobs.len() {
+        let ok = jobs[k].needs.iter().map(|&x| pipelined(&jobs[k]) && pipelined(&jobs[x])).collect();
+        jobs[k].meta_ok = ok;
     }
     Ok(jobs)
 }
@@ -314,7 +322,14 @@ impl Ctx<'_> {
         let n = self.node(j);
         let mut cmd = Command::new("rustc");
         let m = meta(n);
-        cmd.arg("--edition").arg(&n.edition).arg("--error-format=short");
+        let piped = self.pipelined(j);
+        cmd.arg("--edition").arg(&n.edition);
+        if piped {
+            // rustc says when the interface is written, before machine code.
+            cmd.arg("--error-format=json").arg("--json=artifacts,diagnostic-short");
+        } else {
+            cmd.arg("--error-format=short");
+        }
         for f in flags {
             if f == "incremental" {
                 let dir = lightning::home().join("incr").join(&hex(&Sha256::digest(j.id.as_bytes()))[..16]);
@@ -359,7 +374,9 @@ impl Ctx<'_> {
             if !kinds.contains(&d.kind) {
                 continue;
             }
-            if let Some(p) = self.lib_file(&self.g.nodes[*x]) {
+            let dn = &self.g.nodes[*x];
+            let p = if piped && !dn.proc_macro { self.meta_file(dn) } else { self.lib_file(dn) };
+            if let Some(p) = p {
                 cmd.arg("--extern").arg(format!("{}={}", d.extern_name, p.display()));
             }
         }
@@ -379,7 +396,7 @@ impl Ctx<'_> {
                 cmd.arg(root)
                     .arg(format!("-Cmetadata={m}"))
                     .arg(format!("-Cextra-filename=-{m}"))
-                    .arg("--emit=dep-info,link")
+                    .arg(if piped { "--emit=dep-info,metadata,link" } else { "--emit=dep-info,link" })
                     .arg("--out-dir")
                     .arg(tmp.join("deps"))
                     .env("CARGO_CRATE_NAME", name);
@@ -413,6 +430,18 @@ impl Ctx<'_> {
         cmd
     }
 
+    /// A library others may start on as soon as its interface is written.
+    /// (STRIKE_NO_PIPE turns this off, to measure what it gives.)
+    fn pipelined(&self, j: &Job) -> bool {
+        j.kind == JobKind::Lib && !self.node(j).proc_macro && std::env::var_os("STRIKE_NO_PIPE").is_none()
+    }
+
+    /// A library's interface file.
+    fn meta_file(&self, n: &Node) -> Option<PathBuf> {
+        let (name, _) = n.lib.as_ref()?;
+        Some(self.out.join("deps").join(format!("lib{name}-{}.rmeta", meta(n))))
+    }
+
     fn is_test(&self, j: &Job) -> bool {
         j.unit.as_ref().is_some_and(|u| u.kind == Kind::Test)
     }
@@ -433,8 +462,59 @@ impl Ctx<'_> {
         Ok(parse_script(&text, n))
     }
 
+    /// A library's rustc, read as it goes: once the interface is written,
+    /// its key is taken and `on_meta` lets the libraries built on it start.
+    #[allow(clippy::too_many_arguments)]
+    fn rustc_piped(
+        &self,
+        j: &Job,
+        cmd: &mut Command,
+        flags: &[String],
+        links: &[String],
+        env: &BTreeMap<String, String>,
+        tmp: &Path,
+        on_meta: &dyn Fn(String),
+    ) -> Result<(), String> {
+        use std::io::BufRead;
+        let mut child = cmd
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("rustc: {e}"))?;
+        let mut said = String::new();
+        let mut told = false;
+        for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                said.push_str(&line);
+                said.push('\n');
+                continue;
+            };
+            if v.get("emit").and_then(|e| e.as_str()) == Some("metadata") && !told {
+                let n = self.node(j);
+                let dep_info = lightning::files_under(tmp)
+                    .into_iter()
+                    .find(|p| p.extension().is_some_and(|x| x == "d"))
+                    .ok_or("rustc wrote no dep-info")?;
+                self.lightning.learn(&j.id, flags, &lightning::read_dep_info(&dep_info)?);
+                let key = self.lightning.key(&j.id, flags, links, env).ok_or("the interface's inputs are gone")?;
+                let name = format!("lib{}-{}.rmeta", n.lib.as_ref().unwrap().0, meta(n));
+                std::fs::copy(tmp.join("deps").join(&name), self.out.join("deps").join(&name)).map_err(|e| format!("{name}: {e}"))?;
+                on_meta(key);
+                told = true;
+            } else if let Some(r) = v.get("rendered").and_then(|r| r.as_str()) {
+                said.push_str(r);
+            }
+        }
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!("rustc could not build {}:\n{said}", j.id));
+        }
+        Ok(())
+    }
+
     /// Strike, or do the job and brand it.
-    fn run(&self, ji: usize, results: &[Option<Result_>]) -> Result<(Result_, bool), String> {
+    fn run(&self, ji: usize, results: &[Option<Result_>], on_meta: &dyn Fn(String)) -> Result<(Result_, bool), String> {
         let j = &self.jobs[ji];
         let n = self.node(j);
         let (flags, env) = self.key_parts(j);
@@ -500,9 +580,13 @@ impl Ctx<'_> {
             (learned, outputs, self.out.clone())
         } else {
             let mut cmd = self.rustc(j, &flags, results, &tmp);
-            let o = cmd.output().map_err(|e| format!("rustc: {e}"))?;
-            if !o.status.success() {
-                return Err(format!("rustc could not build {}:\n{}", j.id, String::from_utf8_lossy(&o.stderr)));
+            if self.pipelined(j) {
+                self.rustc_piped(j, &mut cmd, &flags, &links, &env, &tmp, on_meta)?;
+            } else {
+                let o = cmd.output().map_err(|e| format!("rustc: {e}"))?;
+                if !o.status.success() {
+                    return Err(format!("rustc could not build {}:\n{}", j.id, String::from_utf8_lossy(&o.stderr)));
+                }
             }
             let mut outputs: Vec<PathBuf> = lightning::files_under(&tmp)
                 .into_iter()
@@ -723,6 +807,8 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
     // The jobs run as soon as what they need is done.
     struct State {
         results: Vec<Option<Result_>>,
+        /// A library whose interface is written while its machine code is not.
+        interface: Vec<Option<Result_>>,
         started: Vec<bool>,
         done: Vec<Done>,
         error: Option<String>,
@@ -730,6 +816,7 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
     }
     let state = Mutex::new(State {
         results: vec![None; jobs.len()],
+        interface: vec![None; jobs.len()],
         started: vec![false; jobs.len()],
         done: Vec::new(),
         error: None,
@@ -745,11 +832,19 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
                         if st.error.is_some() {
                             return;
                         }
-                        let ready = (0..jobs.len()).find(|&i| !st.started[i] && jobs[i].needs.iter().all(|&x| st.results[x].is_some()));
+                        let ready = (0..jobs.len()).find(|&i| {
+                            !st.started[i]
+                                && jobs[i]
+                                    .needs
+                                    .iter()
+                                    .zip(&jobs[i].meta_ok)
+                                    .all(|(&x, &m)| st.results[x].is_some() || (m && st.interface[x].is_some()))
+                        });
                         if let Some(i) = ready {
                             st.started[i] = true;
                             st.running += 1;
-                            break (i, st.results.clone());
+                            let seen: Vec<Option<Result_>> = st.results.iter().zip(&st.interface).map(|(r, f)| r.clone().or_else(|| f.clone())).collect();
+                            break (i, seen);
                         }
                         if st.started.iter().all(|s| *s) || (st.running == 0) {
                             return;
@@ -758,7 +853,12 @@ pub fn build(pkg: &Package, rules: &Rules, opt: &Options) -> Result<Report, Stri
                     }
                 };
                 let t = Instant::now();
-                let r = ctx.run(ji, &snapshot);
+                let on_meta = |key: String| {
+                    let mut st = state.lock().unwrap();
+                    st.interface[ji] = Some(Result_ { key, script: ScriptOut::default() });
+                    wake.notify_all();
+                };
+                let r = ctx.run(ji, &snapshot, &on_meta);
                 let mut st = state.lock().unwrap();
                 st.running -= 1;
                 match r {

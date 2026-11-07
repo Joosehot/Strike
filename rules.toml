@@ -48,6 +48,13 @@ variants = [
   { value = "2", build = 0.2, run = 0.5, disk = 0.1 },
 ]
 
+[rule.linker]
+weight = 0.5
+variants = [
+  { value = "system", build = 0.3, run = 0.5, disk = 0.5 },
+  { value = "lld",    build = 0.9, run = 0.5, disk = 0.5 },
+]
+
 # Judges look at the whole set of choices.
 [judge]
 # The lightning judge: a build already branded costs no build at all.

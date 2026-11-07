@@ -91,7 +91,8 @@ impl Lightning {
             return None;
         }
         let mut h = Sha256::new();
-        h.update(b"strike-key-2\n");
+        // 3: libraries carry their interface (rmeta) too.
+        h.update(b"strike-key-3\n");
         h.update(self.tool.as_bytes());
         h.update(format!("\nunit {unit}\n").as_bytes());
         for f in flags {
@@ -138,10 +139,29 @@ impl Lightning {
             if let Some(p) = to.parent() {
                 std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
-            std::fs::copy(dir.join("files").join(f), &to).map_err(|e| format!("{f}: {e}"))?;
+            let from = dir.join("files").join(f);
+            // A file already there with the same content is left alone: a
+            // library's interface copied early may be open in the next rustc,
+            // and Windows does not let an open mapped file be replaced.
+            if same_content(&from, &to) {
+                made.push(to);
+                continue;
+            }
+            std::fs::copy(&from, &to).map_err(|e| format!("{f}: {e}"))?;
             made.push(to);
         }
         Ok(made)
+    }
+
+    /// Remember what a unit's work read, so its key can be taken.
+    pub fn learn(&self, unit: &str, flags: &[String], learned: &Learned) {
+        let mut mem = self.memory.lock().unwrap();
+        let rem = mem.units.entry(unit.to_string()).or_default();
+        rem.inputs = learned.inputs.clone();
+        rem.env = learned.env.clone();
+        if !rem.flag_sets.iter().any(|f| f == flags) {
+            rem.flag_sets.push(flags.to_vec());
+        }
     }
 
     /// After the work ran: remember what it read, then brand its outputs
@@ -157,15 +177,7 @@ impl Lightning {
         root: &Path,
         outputs: &[PathBuf],
     ) -> Result<String, String> {
-        {
-            let mut mem = self.memory.lock().unwrap();
-            let rem = mem.units.entry(unit.to_string()).or_default();
-            rem.inputs = learned.inputs;
-            rem.env = learned.env;
-            if !rem.flag_sets.iter().any(|f| f == flags) {
-                rem.flag_sets.push(flags.to_vec());
-            }
-        }
+        self.learn(unit, flags, &learned);
         let key = self.key(unit, flags, links, env).ok_or(format!("{unit}: the work read a file that is gone"))?;
         if self.strike(&key) {
             return Ok(key);
@@ -242,6 +254,13 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+fn same_content(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) if x.len() == y.len() => std::fs::read(a).ok() == std::fs::read(b).ok(),
+        _ => false,
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
