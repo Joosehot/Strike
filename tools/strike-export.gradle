@@ -1,0 +1,47 @@
+// Writes what every main Java and Kotlin compile task of the build does, for
+// Strike to read (like a lockfile): sources, classpath, options, output, and
+// which compile tasks must come first. Run once: gradlew strikeExport -I this.
+import groovy.json.JsonOutput
+
+allprojects { p ->
+    p.tasks.register("strikeExport") { t ->
+        t.doLast {
+            def out = []
+            p.tasks.matching { it.name ==~ /compile(Java|Kotlin|Module|Java\d+Java|Java\d+)/ || it.name.startsWith("compileMainRelease") || it.name ==~ /compileJava\d+Java/ }.each { c ->
+                def kind = c.class.name.contains("Kotlin") ? "kotlin" : (c instanceof JavaCompile ? "java" : null)
+                if (kind == null) return
+                def deps = c.taskDependencies.getDependencies(c).findAll { d -> d.name.startsWith("compile") || d.name.contains("generate") || d.name.contains("Generate") }.collect { d -> d.project.path + ":" + d.name }
+                def e = [project: p.path, task: c.name, kind: kind, dependsOn: deps,
+                         dir: p.projectDir.absolutePath]
+                if (kind == "java") {
+                    e.sources = c.source.files.collect { it.absolutePath }.sort()
+                    e.classpath = c.classpath.files.collect { it.absolutePath }
+                    e.release = c.options.release.getOrNull()
+                    e.encoding = c.options.encoding
+                    e.args = c.options.allCompilerArgs
+                    e.inferModulePath = c.modularity.inferModulePath.getOrElse(false)
+                    e.output = c.destinationDirectory.get().asFile.absolutePath
+                    e.javaHome = c.javaCompiler.isPresent() ? c.javaCompiler.get().metadata.installationPath.asFile.absolutePath : null
+                } else {
+                    e.sources = c.sources.files.collect { it.absolutePath }.sort()
+                    e.classpath = c.libraries.files.collect { it.absolutePath }
+                    def o = c.compilerOptions
+                    e.jvmTarget = o.jvmTarget.getOrNull()?.target
+                    e.apiVersion = o.apiVersion.getOrNull()?.version
+                    e.languageVersion = o.languageVersion.getOrNull()?.version
+                    e.moduleName = o.moduleName.getOrNull()
+                    e.args = o.freeCompilerArgs.getOrElse([])
+                    e.output = c.destinationDirectory.get().asFile.absolutePath
+                    // The Java sources of the same module: Kotlin code reads them.
+                    e.javaSources = c.hasProperty("javaSources") ? c.javaSources.files.collect { it.absolutePath }.sort() : []
+                    def cc = p.configurations.findByName("kotlinCompilerClasspath")
+                    e.compilerClasspath = cc != null ? cc.resolve().collect { it.absolutePath } : []
+                }
+                out << e
+            }
+            def f = new File(rootProject.layout.buildDirectory.get().asFile, "strike-export/" + p.path.replace(":", "_") + ".json")
+            f.parentFile.mkdirs()
+            f.text = JsonOutput.prettyPrint(JsonOutput.toJson(out))
+        }
+    }
+}

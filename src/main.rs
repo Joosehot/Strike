@@ -2,10 +2,12 @@
 //!
 //!   strike build <dir> [--for build|run] [--rules FILE] [--explain]
 //!   strike test  <dir> [--for build|run] [--rules FILE] [--explain]
+//!   strike jvm <export-dir> <out-dir>   a JVM build's compile tasks
 //!   strike brand          every branded build
 
 mod builder;
 mod graph;
+mod jvm;
 mod lightning;
 mod manifest;
 mod motor;
@@ -17,6 +19,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   strike build <dir> [--for build|run] [--rules FILE] [--explain]
   strike test  <dir> [--for build|run] [--rules FILE] [--explain]
+  strike jvm <export-dir> <out-dir>
   strike brand";
 
 fn main() -> ExitCode {
@@ -96,6 +99,18 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 println!("  tests: {} of {} harnesses passed", r.tests.len() - failed.len(), r.tests.len());
             }
             Ok(if failed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+        "jvm" => {
+            let (Some(export), Some(out)) = (args.get(1), args.get(2)) else { return Err(USAGE.into()) };
+            let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let r = jvm::build(std::path::Path::new(export), std::path::Path::new(out), jobs)?;
+            for d in &r.done {
+                let how = if d.struck { "struck" } else { "built " };
+                println!("  {how} {:<55} {:>7.2} s", d.task, d.seconds);
+            }
+            let built = r.done.iter().filter(|d| !d.struck).count();
+            println!("  {} of {} from the brand, {built} built, {:.2} s; out: {}", r.done.len() - built, r.done.len(), r.seconds, r.out.display());
+            Ok(ExitCode::SUCCESS)
         }
         _ => Err(USAGE.into()),
     }
