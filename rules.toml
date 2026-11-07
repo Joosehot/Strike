@@ -1,0 +1,56 @@
+# Every number Strike's motor uses. The code holds the logic, this file the taste.
+
+# How many partial builds the beam keeps after each rule.
+beam = 4
+
+# The axes a build trades between, as the command's --for asks for them.
+[profile.build]   # a quick build, as while developing
+build = 1.0
+run = 0.2
+disk = 0.1
+
+[profile.run]     # a quick program, as for long runs
+build = 0.2
+run = 1.0
+disk = 0.1
+
+# One rule per decision. Each variant says how it scores on the axes (0 to 1).
+
+[rule.opt_level]
+weight = 1.0
+variants = [
+  { value = "0", build = 1.0, run = 0.0,  disk = 0.5 },
+  { value = "1", build = 0.7, run = 0.6,  disk = 0.6 },
+  { value = "2", build = 0.4, run = 0.95, disk = 0.6 },
+  { value = "3", build = 0.3, run = 1.0,  disk = 0.5 },
+]
+
+[rule.codegen_units]
+weight = 0.6
+variants = [
+  { value = "256", build = 0.9, run = 0.3, disk = 0.4 },
+  { value = "16",  build = 0.6, run = 0.6, disk = 0.5 },
+  { value = "1",   build = 0.1, run = 0.8, disk = 0.6 },
+]
+
+[rule.incremental]
+weight = 0.5
+variants = [
+  { value = "on",  build = 0.9, run = 0.4, disk = 0.1 },
+  { value = "off", build = 0.3, run = 0.6, disk = 1.0 },
+]
+
+[rule.debuginfo]
+weight = 0.3
+variants = [
+  { value = "0", build = 0.8, run = 0.5, disk = 1.0 },
+  { value = "1", build = 0.5, run = 0.5, disk = 0.5 },
+  { value = "2", build = 0.2, run = 0.5, disk = 0.1 },
+]
+
+# Judges look at the whole set of choices.
+[judge]
+# The lightning judge: a build already branded costs no build at all.
+lightning = 3.0
+# Incremental work is kept per codegen unit; with one unit it keeps nothing.
+incremental_one_unit = 1.0
