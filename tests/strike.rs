@@ -21,6 +21,7 @@ fn pkg(name: &str) -> Pkg {
     write(&dir, "src/main.rs", "fn main() { println!(\"demo {} sum {}\", demo_pkg::version(), demo_pkg::sum::sum(&[4, 5])); }\n");
     write(&dir, "src/bin/other-tool.rs", "fn main() { println!(\"other {}\", demo_pkg::sum::sum(&[1])); }\n");
     write(&dir, "tests/outer.rs", "#[test] fn outer() { assert_eq!(demo_pkg::version(), \"0.3.1\"); }\n");
+    write(&dir, "Cargo.lock", "version = 3\n\n[[package]]\nname = \"demo-pkg\"\nversion = \"0.3.1\"\n");
     Pkg { dir, home: root.join("home") }
 }
 
@@ -113,13 +114,50 @@ fn tests_run_and_a_failing_one_fails_the_command() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("tests: 1 of 2 harnesses passed"));
 }
 
+/// A package with a path dependency (and a feature of it), a proc macro and
+/// a build script that writes code into OUT_DIR and sets a cfg.
+fn graph_pkg(name: &str) -> Pkg {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["app/src", "helper/src", "mac/src"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let app = root.join("app");
+    write(&app, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[dependencies]\nhelper = { path = \"../helper\", features = [\"loud\"] }\nmac = { path = \"../mac\" }\n");
+    write(&app, "build.rs", "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/gen.rs\"), \"pub const MADE: u32 = 7;\").unwrap();\n    println!(\"cargo:rustc-cfg=from_script\");\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n");
+    write(&app, "src/main.rs", "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\nfn main() {\n    let s = if cfg!(from_script) { \"cfg\" } else { \"none\" };\n    println!(\"{} {} {} {}\", helper::word(), mac::answer!(), MADE, s);\n}\n");
+    write(&root.join("helper"), "Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\n\n[features]\nloud = []\n");
+    write(&root.join("helper"), "src/lib.rs", "pub fn word() -> &'static str { if cfg!(feature = \"loud\") { \"LOUD\" } else { \"quiet\" } }\n");
+    write(&root.join("mac"), "Cargo.toml", "[package]\nname = \"mac\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n");
+    write(&root.join("mac"), "src/lib.rs", "use proc_macro::TokenStream;\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream { \"42\".parse().unwrap() }\n");
+    write(&app, "Cargo.lock", "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n \"mac\",\n]\n\n[[package]]\nname = \"helper\"\nversion = \"0.2.0\"\n\n[[package]]\nname = \"mac\"\nversion = \"0.1.0\"\n");
+    Pkg { dir: app, home: root.join("home") }
+}
+
 #[test]
-fn what_stage_one_cannot_build_is_refused_with_why() {
-    let p = pkg("refuse");
-    write(&p.dir, "Cargo.toml", "[package]\nname = \"demo-pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n");
+fn dependencies_features_proc_macros_and_build_scripts() {
+    let p = graph_pkg("graph");
+    let (_, built, text) = p.counts(&["build", "--verbose"]);
+    // helper, mac, the script's build and run, app's bin: 5 jobs.
+    assert_eq!(built, 5, "{text}");
+    assert_eq!(p.run("build", "app"), "LOUD 42 7 cfg");
+    assert_eq!(p.counts(&["build", "--verbose"]).0, 5);
+    // The build script changes: it runs again, and what it made is used.
+    let script = p.dir.join("build.rs");
+    let s = std::fs::read_to_string(&script).unwrap().replace("MADE: u32 = 7", "MADE: u32 = 8");
+    std::fs::write(&script, s).unwrap();
+    let (struck, built, text) = p.counts(&["build", "--verbose"]);
+    assert_eq!((struck, built), (2, 3), "{text}");
+    assert_eq!(p.run("build", "app"), "LOUD 42 8 cfg");
+}
+
+#[test]
+fn a_package_missing_from_the_lockfile_is_refused_with_why() {
+    let p = graph_pkg("nolock");
+    write(&p.dir, "Cargo.lock", "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"mac\",\n]\n\n[[package]]\nname = \"mac\"\nversion = \"0.1.0\"\n");
     let out = p.strike(&["build"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("[dependencies] is not empty"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("app needs helper, which Cargo.lock does not have"));
 }
 
 #[test]

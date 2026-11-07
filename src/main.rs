@@ -5,6 +5,7 @@
 //!   strike brand          every branded build
 
 mod builder;
+mod graph;
 mod lightning;
 mod manifest;
 mod motor;
@@ -44,12 +45,14 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             let mut profile = "build".to_string();
             let mut rules_file: Option<PathBuf> = None;
             let mut explain = false;
+            let mut verbose = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--for" => profile = it.next().ok_or("--for needs build or run")?.clone(),
                     "--rules" => rules_file = Some(PathBuf::from(it.next().ok_or("--rules needs a file")?)),
                     "--explain" => explain = true,
+                    "--verbose" => verbose = true,
                     s if s.starts_with("--") => return Err(format!("unknown option {s}\n{USAGE}")),
                     s if dir.is_none() => dir = Some(PathBuf::from(s)),
                     s => return Err(format!("one folder only, got also {s}\n{USAGE}")),
@@ -62,17 +65,29 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             };
             let rules = motor::Rules::parse(&text)?;
             let pkg = manifest::read(&dir)?;
-            let opt = builder::Options { profile, explain, test: command == "test" };
+            let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let opt = builder::Options { profile, explain, test: command == "test", jobs };
             let r = builder::build(&pkg, &rules, &opt)?;
 
             let choice: Vec<String> = r.chosen.choice.iter().map(|(n, v)| format!("{n}={v}")).collect();
             println!("strike: {} chose {}", pkg.name, choice.join(" "));
-            for d in &r.done {
+            for d in r.done.iter().filter(|d| d.root || verbose) {
                 let how = if d.struck { "struck" } else { "built " };
-                println!("  {how} {:<28} {:>7.2} s  {}", d.unit, d.seconds, &d.key[..12]);
+                println!("  {how} {:<40} {:>7.2} s  {}", d.job, d.seconds, &d.key[..12]);
+            }
+            let deps: Vec<_> = r.done.iter().filter(|d| !d.root).collect();
+            if !deps.is_empty() {
+                let built = deps.iter().filter(|d| !d.struck).count();
+                println!("  dependencies: {} jobs, {} struck, {built} built", deps.len(), deps.len() - built);
             }
             let built = r.done.iter().filter(|d| !d.struck).count();
-            println!("  {} of {} from the brand, {built} built; out: {}", r.done.len() - built, r.done.len(), r.out.display());
+            println!(
+                "  {} of {} from the brand, {built} built, {:.2} s; out: {}",
+                r.done.len() - built,
+                r.done.len(),
+                r.seconds,
+                r.out.display()
+            );
             let failed: Vec<&String> = r.tests.iter().filter(|(_, ok)| !ok).map(|(t, _)| t).collect();
             if !r.tests.is_empty() {
                 println!("  tests: {} of {} harnesses passed", r.tests.len() - failed.len(), r.tests.len());

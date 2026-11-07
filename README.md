@@ -16,10 +16,24 @@ A build system that calls the compiler itself. Two parts decide every build:
   already branded costs no build time, so it scores as much as the profile
   asks for build time.
 
-Stage 1 builds Rust packages without dependencies: the library, every
-binary, and with `test` the library's tests and every file of `tests/`.
-Dependencies, build scripts and proc macros are refused with the reason
-(stage 2).
+Strike builds Rust packages with their dependencies. The versions come from
+Cargo.lock and the sources from the registry folder Cargo already
+downloaded (Strike does not resolve or fetch). Features are unified over
+the graph. Build scripts are built and run, proc macros are built as
+libraries the compiler loads, and every job of the graph runs as soon as
+what it uses is done, on every core. Brands are shared by every project: a
+dependency with the same version and features is built once for all of them.
+
+Measured on Nuome (53 locked packages, 66 jobs):
+
+| | time |
+|---|---|
+| first build, empty brand store | 42 s |
+| nothing changed (or only a file's time) | 0.7 s |
+| one line changed in the library | 8-12 s (cargo: 9-12 s) |
+| `strike test`: 341 tests in 3 harnesses, all pass | 101 s |
+
+Strike built itself next: 9 of its 44 jobs were struck from Nuome's brands.
 
 ```
 strike build <dir> [--for build|run] [--rules FILE] [--explain]
@@ -32,9 +46,7 @@ The output goes to `<dir>/strike-out/<profile>/`, the brands to
 
 ## Next
 
-1. Dependencies from Cargo.lock and the sources already downloaded, with
-   features, build scripts and proc macros; checked on Nuome.
-2. Drivers for other languages: the motor and the lightning do not depend on
+1. Drivers for other languages: the motor and the lightning do not depend on
    the language. A driver says how to read the project, what to build in
    which order, the compiler's flags as rules, and where the compiler says
    which files it read (C/C++ through MSVC `/showIncludes`, CUDA through

@@ -1,4 +1,4 @@
-//! Step 1: reading the package's Cargo.toml into the units Strike builds.
+﻿//! Step 1: reading the package's Cargo.toml into the units Strike builds.
 
 use std::path::{Path, PathBuf};
 
@@ -34,8 +34,6 @@ impl Unit {
 pub struct Package {
     pub dir: PathBuf,
     pub name: String,
-    pub version: String,
-    pub edition: String,
     pub lib: Option<Unit>,
     pub bins: Vec<Unit>,
     /// tests/*.rs, each its own harness.
@@ -64,28 +62,6 @@ pub fn read(dir: &Path) -> Result<Package, String> {
         .and_then(|v| v.as_str())
         .ok_or("[package] has no name")?
         .to_string();
-    let version = pkg
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.0.0")
-        .to_string();
-    // Cargo's default when the edition is not written.
-    let edition = pkg
-        .get("edition")
-        .and_then(|v| v.as_str())
-        .unwrap_or("2015")
-        .to_string();
-
-    for key in ["dependencies", "build-dependencies", "dev-dependencies"] {
-        if doc.get(key).and_then(|d| d.as_table()).is_some_and(|d| !d.is_empty()) {
-            return Err(format!(
-                "[{key}] is not empty: Strike builds packages without dependencies so far (stage 1)"
-            ));
-        }
-    }
-    if pkg.get("build").is_some() || dir.join("build.rs").exists() {
-        return Err("a build script: Strike does not run build scripts yet (stage 1)".into());
-    }
 
     let crate_name = name.replace('-', "_");
     let lib_path = doc
@@ -143,7 +119,7 @@ pub fn read(dir: &Path) -> Result<Package, String> {
         });
     }
 
-    Ok(Package { dir, name, version, edition, lib, bins, tests })
+    Ok(Package { dir, name, lib, bins, tests })
 }
 
 /// The .rs files directly in a folder, in name order.
