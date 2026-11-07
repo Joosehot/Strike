@@ -1,5 +1,7 @@
 # Strike
 
+**The King Killer.**
+
 A build system that calls the compiler itself. Two parts decide every build:
 
 - **HotMotor** chooses how to build. One rule per decision (opt-level,
