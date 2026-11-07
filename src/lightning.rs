@@ -19,6 +19,8 @@ pub struct Lightning {
     home: PathBuf,
     tool: String,
     memory: Mutex<Memory>,
+    /// Each source file is hashed once per run (see `file_hash`).
+    hashes: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
 /// What Strike remembers of each unit between runs.
@@ -69,7 +71,7 @@ impl Lightning {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        Lightning { home, tool: tool_version, memory: Mutex::new(memory) }
+        Lightning { home, tool: tool_version, memory: Mutex::new(memory), hashes: Mutex::new(Default::default()) }
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -104,8 +106,7 @@ impl Lightning {
         let mut inputs = rem.inputs.clone();
         inputs.sort();
         for path in &inputs {
-            let bytes = std::fs::read(path).ok()?;
-            h.update(format!("file {} {}\n", path.display(), hex(&Sha256::digest(&bytes))).as_bytes());
+            h.update(format!("file {} {}\n", path.display(), self.file_hash(path)?).as_bytes());
         }
         let mut names = rem.env.clone();
         names.sort();
@@ -114,6 +115,23 @@ impl Lightning {
             h.update(format!("env {name}={value}\n").as_bytes());
         }
         Some(hex(&h.finalize()))
+    }
+
+    /// A file's content hash. A source file is hashed once per run and kept:
+    /// the run does not write it. A file under Strike's own folders (a build
+    /// script's OUT_DIR) is made during the run, so it is hashed every time.
+    fn file_hash(&self, path: &Path) -> Option<String> {
+        let made_here = path.starts_with(&self.home) || path.components().any(|c| c.as_os_str() == "strike-out");
+        if !made_here {
+            if let Some(h) = self.hashes.lock().unwrap().get(path) {
+                return Some(h.clone());
+            }
+        }
+        let h = hex(&Sha256::digest(std::fs::read(path).ok()?));
+        if !made_here {
+            self.hashes.lock().unwrap().insert(path.to_path_buf(), h.clone());
+        }
+        Some(h)
     }
 
     /// The strike: is this exact build already branded?
@@ -126,7 +144,9 @@ impl Lightning {
         self.memory.lock().unwrap().units.get(unit).map(|r| r.flag_sets.clone()).unwrap_or_default()
     }
 
-    /// Copies a brand's files into `root`, at the places they were taken from.
+    /// Puts a brand's files into `root`, at the places they were taken from,
+    /// as hard links: a brand never changes, and rustc writes every build to
+    /// a new file, so the link and the brand stay the same file.
     pub fn restore(&self, key: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
         let dir = self.brand_dir(key);
         let seal: Seal = serde_json::from_str(
@@ -140,14 +160,7 @@ impl Lightning {
                 std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
             let from = dir.join("files").join(f);
-            // A file already there with the same content is left alone: a
-            // library's interface copied early may be open in the next rustc,
-            // and Windows does not let an open mapped file be replaced.
-            if same_content(&from, &to) {
-                made.push(to);
-                continue;
-            }
-            std::fs::copy(&from, &to).map_err(|e| format!("{f}: {e}"))?;
+            place(&from, &to).map_err(|e| format!("{f}: {e}"))?;
             made.push(to);
         }
         Ok(made)
@@ -191,7 +204,9 @@ impl Lightning {
             let rel = o.strip_prefix(root).map_err(|_| format!("{} is not under {}", o.display(), root.display()))?;
             let to = tmp.join("files").join(rel);
             std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
-            std::fs::copy(o, &to).map_err(|e| format!("{}: {e}", o.display()))?;
+            if std::fs::hard_link(o, &to).is_err() {
+                std::fs::copy(o, &to).map_err(|e| format!("{}: {e}", o.display()))?;
+            }
             files.push(rel.to_string_lossy().replace('\\', "/"));
         }
         std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
@@ -254,6 +269,28 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Makes `to` the file `from`: a hard link, or a copy where a link cannot be.
+fn place(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let (Ok(a), Ok(b)) = (std::fs::metadata(from), std::fs::metadata(to)) {
+        // Links of one file share its size and time: already in place.
+        if a.len() == b.len() && a.modified().ok() == b.modified().ok() {
+            return Ok(());
+        }
+        if std::fs::remove_file(to).is_err() {
+            // Open in a running rustc (Windows keeps a mapped file): fine
+            // only when it is already the same content.
+            if same_content(from, to) {
+                return Ok(());
+            }
+            return Err(std::io::Error::other("in use, and not the same content"));
+        }
+    }
+    if std::fs::hard_link(from, to).is_err() {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
 }
 
 fn same_content(a: &Path, b: &Path) -> bool {
