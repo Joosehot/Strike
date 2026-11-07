@@ -181,11 +181,11 @@ fn plan(g: &Graph, pkg: &Package, test: bool) -> Result<Vec<Job>, String> {
     Ok(jobs)
 }
 
-/// The flags a job is built with: the root's own code gets the motor's
-/// choice; the dependencies the same without incremental work, as their
-/// sources do not change.
-fn flags_for(job: &Job, root: usize, chosen: &[String]) -> Vec<String> {
-    if job.node == root {
+/// The flags a job is built with: the root's own code, and every package of
+/// its own on a path, gets the motor's choice; the registry's packages the
+/// same without incremental work, as their sources do not change.
+fn flags_for(job: &Job, g: &Graph, chosen: &[String]) -> Vec<String> {
+    if job.node == g.root || !is_registry(&g.nodes[job.node]) {
         chosen.to_vec()
     } else {
         chosen.iter().filter(|f| *f != "incremental").cloned().collect()
@@ -283,7 +283,7 @@ impl Ctx<'_> {
     /// The env a job's key is taken over, and its flags.
     fn key_parts(&self, j: &Job) -> (Vec<String>, BTreeMap<String, String>) {
         let n = self.node(j);
-        let mut flags = flags_for(j, self.g.root, &self.chosen);
+        let mut flags = flags_for(j, self.g, &self.chosen);
         let env = match j.kind {
             JobKind::ScriptRun => {
                 let e = self.script_env(n);
