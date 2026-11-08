@@ -440,7 +440,9 @@ impl G {
             return;
         }
         self.to_reg(left, RAX);
+        let zero = matches!(o, Opd::Imm(0));
         match b {
+            BinOp::Add | BinOp::Sub | BinOp::Bor | BinOp::Bxor if zero => {}
             BinOp::Add => self.alu(0, RAX, o),
             BinOp::Sub => self.alu(5, RAX, o),
             BinOp::Band => self.alu(4, RAX, o),
@@ -640,12 +642,242 @@ impl G {
         }
     }
 
+    /// An operation whose result is stored at once into a local that lives
+    /// in a register: worked out in that register (`x = x - 2` is one
+    /// `sub`), leaving rax and what it holds alone. False when the shape
+    /// does not allow it; nothing is emitted then.
+    fn bin_into(&mut self, b: BinOp, s: u32) -> bool {
+        let ext = match b {
+            BinOp::Add => 0,
+            BinOp::Bor => 1,
+            BinOp::Band => 4,
+            BinOp::Sub => 5,
+            BinOp::Bxor => 6,
+            BinOp::Mul => 8,
+            _ => return false,
+        };
+        let Loc::Reg(d) = self.loc[s as usize] else { return false };
+        let n = self.v.len();
+        if n < 2 {
+            return false;
+        }
+        let (mut left, mut right) = (self.v[n - 2], self.v[n - 1]);
+        // `acc = x + acc` is `acc += x`: these operations do not mind the order
+        if right == V::Slot(s) && left != V::Slot(s) && ext != 5 {
+            std::mem::swap(&mut left, &mut right);
+        }
+        let fits = |x: V| match x {
+            V::Imm(c) => i32::try_from(c).is_ok(),
+            V::Slot(_) | V::Rax => true,
+            _ => false,
+        };
+        if !fits(left) || !fits(right) || (right == V::Slot(s) && left != V::Slot(s)) {
+            return false;
+        }
+        self.v.truncate(n - 2);
+        if let Some(i) = self.v.iter().rposition(|y| *y == V::Slot(s)) {
+            self.flush_to(i);
+        }
+        if left != V::Slot(s) {
+            self.to_reg(left, d);
+        }
+        let o = match right {
+            V::Imm(c) => Opd::Imm(c as i32),
+            V::Rax => Opd::Reg(RAX),
+            V::Slot(t) => match self.loc[t as usize] {
+                Loc::Reg(y) => Opd::Reg(y),
+                Loc::Mem(m) => Opd::Mem(m),
+            },
+            _ => unreachable!(),
+        };
+        match (ext, o) {
+            (8, Opd::Imm(i)) => {
+                self.rr(&[0x69], d, d);
+                self.a.d32(i);
+            }
+            (8, Opd::Reg(r)) => self.rr(&[0x0F, 0xAF], d, r),
+            (8, Opd::Mem(m)) => self.rm(&[0x0F, 0xAF], d, m),
+            (0 | 1 | 5 | 6, Opd::Imm(0)) => {}
+            (e, o) => self.alu(e, d, o),
+        }
+        true
+    }
+
+    fn un(&mut self, u: UnOp) {
+        let x = self.pop();
+        match (u, x) {
+            (UnOp::Plus, x) => self.v.push(x),
+            (UnOp::Not, V::Flags(cc)) => self.v.push(V::Flags(cc ^ 1)),
+            (UnOp::Not, x) => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                self.a.e(&[0x48, 0x85, 0xC0]);
+                self.v.push(V::Flags(0x94));
+            }
+            (u, x) => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                self.a.e(if u == UnOp::Neg { &[0x48, 0xF7, 0xD8] } else { &[0x48, 0xF7, 0xD0] });
+                self.v.push(V::Rax);
+            }
+        }
+    }
+
+    /// The fast path's operations (fast_path checked them).
+    fn fast_ops(&mut self, ops: &[Op]) {
+        for op in ops {
+            match op {
+                Op::Push(c) => self.push(V::Imm(*c)),
+                Op::Load(s) => self.push(V::Slot(*s)),
+                Op::Bin(b) => self.bin(*b, &mut |a: &mut Asm| a.label()),
+                Op::Un(u) => self.un(*u),
+                _ => unreachable!("fast_path takes only plain operations"),
+            }
+        }
+    }
+
+    /// The value on top into a register and tested: a jump to `to` when it
+    /// is zero (`on_zero`) or when it is not.
+    fn branch(&mut self, on_zero: bool, to: u32) {
+        match self.pop() {
+            V::Flags(cc) => self.a.jcc(if on_zero { (cc ^ 1) & 0x0F } else { cc & 0x0F }, to),
+            x => {
+                let r = match x {
+                    V::Slot(s) => match self.loc[s as usize] {
+                        Loc::Reg(y) => y,
+                        Loc::Mem(_) => {
+                            self.need_rax();
+                            self.to_reg(x, RAX);
+                            RAX
+                        }
+                    },
+                    x => {
+                        self.need_rax();
+                        self.to_reg(x, RAX);
+                        RAX
+                    }
+                };
+                self.rr(&[0x85], r, r);
+                self.a.jcc(if on_zero { 4 } else { 5 }, to);
+            }
+        }
+    }
+
     fn epilogue(&mut self) {
         for (r, d) in self.saved.clone() {
             self.rm(&[0x8B], r, d);
         }
         self.a.epilogue();
     }
+}
+
+/// A function that begins by testing its parameters and returning at once
+/// (fib's `if (n < 2) return n`): the test and that return, worked out from
+/// the argument registers before any frame is made or register saved. The
+/// slots other than the parameters hold, at the start, the constants the
+/// function's first operations store in them (zero otherwise), so their
+/// loads become those constants. Only what cannot touch an argument
+/// register is taken: loads of the first four parameters, constants, and
+/// operations whose right side is a constant or a parameter (no division,
+/// no shift by a variable, no call).
+struct Fast {
+    /// the test, ending where the branch to the rest of the function is
+    test: Vec<Op>,
+    /// true: the rest runs when the test is zero (the IR's Jz)
+    rest_on_zero: bool,
+    /// the return's value
+    value: Vec<Op>,
+}
+
+fn fast_path(f: &Func) -> Option<Fast> {
+    let mut known = vec![0i64; f.slots as usize];
+    let mut i = 0;
+    let code = &f.code;
+    // stores of constants and labels the start passes through
+    loop {
+        match (code.get(i), code.get(i + 1)) {
+            (Some(Op::Push(c)), Some(Op::Store(s))) if *s >= f.params => {
+                known[*s as usize] = *c;
+                i += 2;
+            }
+            (Some(Op::Label(_)), _) => i += 1,
+            _ => break,
+        }
+    }
+    // a run of plain operations, checked on a stack of what each value is
+    #[derive(Clone, Copy, PartialEq)]
+    enum K {
+        Imm,
+        Param,
+        Done,
+    }
+    let plain = |from: usize, ops: &mut Vec<Op>| -> Option<(usize, usize)> {
+        let mut st: Vec<K> = Vec::new();
+        let mut j = from;
+        loop {
+            match code.get(j)? {
+                Op::Push(c) => {
+                    i32::try_from(*c).ok()?;
+                    st.push(K::Imm);
+                    ops.push(Op::Push(*c));
+                }
+                Op::Load(s) if *s < f.params => {
+                    if *s >= 4 {
+                        return None;
+                    }
+                    st.push(K::Param);
+                    ops.push(Op::Load(*s));
+                }
+                Op::Load(s) => {
+                    let c = known[*s as usize];
+                    i32::try_from(c).ok()?;
+                    st.push(K::Imm);
+                    ops.push(Op::Push(c));
+                }
+                Op::Un(u) => {
+                    st.pop()?;
+                    st.push(K::Done);
+                    ops.push(Op::Un(*u));
+                }
+                Op::Bin(b) => {
+                    use BinOp::*;
+                    let r = st.pop()?;
+                    st.pop()?;
+                    let ok = match b {
+                        Add | Sub | Mul | Band | Bor | Bxor | Eq | Ne | Lt | Le | Gt | Ge => r != K::Done,
+                        Shl | Shr => r == K::Imm,
+                        _ => false,
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    st.push(K::Done);
+                    ops.push(Op::Bin(*b));
+                }
+                _ => return Some((j, st.len())),
+            }
+            j += 1;
+        }
+    };
+    let mut test = Vec::new();
+    let (j, depth) = plain(i, &mut test)?;
+    let rest_on_zero = match code.get(j)? {
+        Op::Jz(_) => true,
+        Op::Jnz(_) => false,
+        _ => return None,
+    };
+    if depth != 1 || test.is_empty() {
+        return None;
+    }
+    let mut value = Vec::new();
+    let (k, depth) = plain(j + 1, &mut value)?;
+    if depth != 1 || code.get(k) != Some(&Op::Ret) {
+        return None;
+    }
+    if let [Op::Push(_)] = test.as_slice() {
+        return None; // a constant test: one way or the other always
+    }
+    Some(Fast { test, rest_on_zero, value })
 }
 
 pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
@@ -685,6 +917,22 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         .unwrap_or(0);
     let frame = (mem * 8 + widest + 15) / 16 * 16;
     let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, magic: release && rules.release.magic_division };
+    if let Some(fp) = fast_path(f) {
+        // before the frame: the parameters are still in rcx, rdx, r8, r9
+        let at_entry = (0..f.slots).map(|s| if s < f.params.min(4) { Loc::Reg(ARGS[s as usize]) } else { Loc::Mem(0) }).collect();
+        let real = std::mem::replace(&mut g.loc, at_entry);
+        let rest = g.a.label();
+        g.fast_ops(&fp.test);
+        g.branch(fp.rest_on_zero, rest);
+        g.v.clear();
+        g.fast_ops(&fp.value);
+        let x = g.pop();
+        g.to_reg(x, RAX);
+        g.a.e(&[0xC3]); // ret: no frame was made
+        g.a.bind(rest);
+        g.v.clear();
+        g.loc = real;
+    }
     g.a.prologue(frame);
     for (r, d) in g.saved.clone() {
         g.rm(&[0x89], r, d);
@@ -721,31 +969,23 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     let labels_of: Vec<u32> = (0..labels).map(|_| g.a.label()).collect();
     let mut depth_at: Vec<Option<u32>> = vec![None; labels as usize];
     let mut new_label = |a: &mut Asm| a.label();
-    for op in &f.code {
+    let mut stored_already = false;
+    for (at, op) in f.code.iter().enumerate() {
+        if std::mem::take(&mut stored_already) {
+            continue; // the Store bin_into did
+        }
+        if let (Op::Bin(b), Some(Op::Store(s))) = (op, f.code.get(at + 1)) {
+            if g.bin_into(*b, *s) {
+                stored_already = true;
+                continue;
+            }
+        }
         match op {
             Op::Push(c) => g.push(V::Imm(*c)),
             Op::Load(s) => g.push(V::Slot(*s)),
             Op::Store(s) => g.store(*s),
             Op::Bin(b) => g.bin(*b, &mut new_label),
-            Op::Un(u) => {
-                let x = g.pop();
-                match (u, x) {
-                    (UnOp::Plus, x) => g.v.push(x),
-                    (UnOp::Not, V::Flags(cc)) => g.v.push(V::Flags(cc ^ 1)),
-                    (UnOp::Not, x) => {
-                        g.need_rax();
-                        g.to_reg(x, RAX);
-                        g.a.e(&[0x48, 0x85, 0xC0]);
-                        g.v.push(V::Flags(0x94));
-                    }
-                    (u, x) => {
-                        g.need_rax();
-                        g.to_reg(x, RAX);
-                        g.a.e(if *u == UnOp::Neg { &[0x48, 0xF7, 0xD8] } else { &[0x48, 0xF7, 0xD0] });
-                        g.v.push(V::Rax);
-                    }
-                }
-            }
+            Op::Un(u) => g.un(*u),
             Op::Dup => match g.v.last().copied() {
                 Some(x @ (V::Imm(_) | V::Slot(_))) => g.push(x),
                 _ => {

@@ -235,8 +235,27 @@ must not be changed (`f(n-1) - x`, `x + f(n-1) * 3`). In the 100 programs,
 266 calls became jumps, and all printed what the plain code prints.
 
 fib(36): 0.082 s became **0.043 s**. That is faster than clang -O0
-(0.058 s) and Go (0.059 s). clang -O2 takes 0.033 s; it also leaves the
-saving of registers out of the base case. A release build of big.c takes 0.08 s, with all 2000 calls in
+(0.058 s) and Go (0.059 s).
+
+Two more changes went in for calls:
+
+- **A frameless fast path.** A function that begins by testing its
+  parameters and returning at once, like fib's `if (n < 2) return n`, gets
+  that test and that return first, worked out from the argument registers.
+  No frame is made and no register is saved: fib's base case is four
+  instructions. Only operations that cannot touch an argument register are
+  taken: no call, no division, constants that fit 32 bits. In the 100
+  random programs, 208 functions in 91 programs got a fast path, and all
+  printed what the plain code prints.
+- **Results stored straight into a register.** An operation whose result
+  goes at once into a local held in a register is worked out in that
+  register: `n = n - 2` is one `sub`, and `acc = x + acc` is one `add`. The
+  call's result can then stay in rax.
+
+These took fib(36) only from 0.043 s to 0.041 s; clang -O2 takes 0.033 s.
+Its loop is now nearly instruction for instruction Strike's. What is left
+is the frame: Strike saves registers to memory under an rbp frame, where
+clang pushes and pops them. A release build of big.c takes 0.08 s, with all 2000 calls in
 main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes
