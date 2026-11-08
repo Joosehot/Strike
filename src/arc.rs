@@ -426,8 +426,9 @@ impl Chan {
 
 // ---- discovery -----------------------------------------------------------
 
-/// Devices that announce themselves: name -> (OS, address).
-pub fn devices(wait: Duration) -> Result<BTreeMap<String, (String, String)>, String> {
+/// Devices that announce themselves: name -> (OS, address). With `want`,
+/// stops as soon as that one is heard.
+pub fn devices(wait: Duration, want: Option<&str>) -> Result<BTreeMap<String, (String, String)>, String> {
     let sock = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).map_err(|e| format!("discovery port {DISCOVERY_PORT}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let end = Instant::now() + wait;
@@ -440,6 +441,9 @@ pub fn devices(wait: Duration) -> Result<BTreeMap<String, (String, String)>, Str
             if f.next() == Some("ARCSTRIKE1") {
                 if let (Some(name), Some(os), Some(port)) = (f.next(), f.next(), f.next()) {
                     out.insert(name.to_string(), (os.to_string(), format!("{}:{port}", from.ip())));
+                    if want == Some(name) {
+                        break;
+                    }
                 }
             }
         }
@@ -478,7 +482,7 @@ pub fn send(root: &Path, to: &str, streams: usize, stop_after: Option<u64>) -> R
     let addr = if to.contains(':') {
         to.to_string()
     } else {
-        let found = devices(Duration::from_secs(4))?;
+        let found = devices(Duration::from_secs(4), Some(to))?;
         found.get(to).map(|d| d.1.clone()).ok_or(format!("{to}: not found on the network (strike arc devices)"))?
     };
     let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

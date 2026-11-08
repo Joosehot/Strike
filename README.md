@@ -127,8 +127,16 @@ its own files (a game patching itself) needs a copy, not a strike.
 Measured on one machine over 127.0.0.1 (two Nimbus homes, 4 files of 512 MB
 of random bytes): 2147.5 MB in 14.4 s with 4 streams (149 MB/s, more than
 gigabit Ethernet carries), 19.9 s with 1 stream; nothing changed 1.3 s, 0 MB
-sent; 1 MB overwritten in one file 2.5 s, 1.5 MB sent. Between two devices:
-see below when measured.
+sent; 1 MB overwritten in one file 2.5 s, 1.5 MB sent.
+
+Between two devices (desktop on Ethernet, laptop on the same home network),
+the same 2147.5 MB:
+
+| | time | over the wire |
+|---|---|---|
+| fresh | about 250 s of transfer (8.7 MB/s, the network's rate) | 2147.5 MB |
+| nothing changed | 1.15 s | 0 MB |
+| 20 MB (about 1%) rewritten in one file | 9.1 s (4 s of it finding the device, since fixed) | 21.3 MB in 65 chunks |
 
 ## JVM (Java and Kotlin)
 

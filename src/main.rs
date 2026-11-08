@@ -164,7 +164,7 @@ fn arc_command(args: &[String]) -> Result<ExitCode, String> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     match args.first().map(String::as_str) {
         Some("devices") => {
-            let found = arc::devices(std::time::Duration::from_secs(3))?;
+            let found = arc::devices(std::time::Duration::from_secs(3), None)?;
             for (name, (os, addr)) in &found {
                 println!("  {name:<24} {os:<8} {addr}");
             }
