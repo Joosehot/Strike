@@ -11,6 +11,7 @@
 //! The brands are one pack (~/.strike/uc/pack), read whole once per
 //! compile, with new brands added at its end.
 
+mod inline;
 pub mod ir;
 mod lang;
 mod lex;
@@ -96,6 +97,8 @@ pub struct Report {
     pub exe_seconds: f64,
     pub seconds: f64,
     pub exe_bytes: usize,
+    /// calls HotMotor chose to copy the callee into
+    pub inlined: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -230,6 +233,8 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         Gen::Opt => rules.key(),
         Gen::Plain => "x64-plain".to_string(),
     };
+    let mut low = low;
+    let inlined = if gen == Gen::Opt { inline::run(&mut low.funcs, &rules) } else { 0 };
     let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
     let mut funcs: Vec<(String, Code)> = x64::runtime(&low.entry);
     let mut struck = 0;
@@ -274,6 +279,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         exe_seconds: t.elapsed().as_secs_f64(),
         seconds: start.elapsed().as_secs_f64(),
         exe_bytes: exe.len(),
+        inlined,
     })
 }
 

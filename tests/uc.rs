@@ -169,7 +169,7 @@ impl Gen {
 fn the_optimized_code_prints_what_the_plain_code_prints() {
     let r = root("differ");
     let mut g = Gen(0x9E37_79B9_7F4A_7C15);
-    for n in 0..40 {
+    for n in 0..100 {
         let src = r.join(format!("p{n}.c"));
         std::fs::write(&src, g.program()).unwrap();
         let mut outs = Vec::new();

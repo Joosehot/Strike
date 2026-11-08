@@ -148,26 +148,40 @@ first generator, which is kept as the reference.
   per compile, and new brands are added at its end. The brand covers the
   IR and the generator with its rules, so other rules give other code.
 
-Every optimized program is checked against the plain one. One test writes
-40 random C programs, with up to six parameters, loops, every operator and
-calls between functions. Both generators must give the same output and
-the same exit code. The suites also still print what clang, Go and Python
-print.
+- **Calls take their arguments straight in registers.** Each argument goes
+  to rcx, rdx, r8, r9 or its stack slot from wherever it is. Nothing is
+  pushed except a result in rax that must outlive the call.
+- **HotMotor chooses which calls are inlined** ([src/uc/inline.rs](src/uc/inline.rs)).
+  The rule is the `[inline]` part of codegen.toml, and it applies to every
+  call of a function that calls nothing itself. There are two variants:
+  the call, or the callee's IR copied in its place. The judge scores the
+  cost of the call saved, weighted by the loops around the call, against
+  the operations copied. This is done before branding, so a caller's brand
+  covers what was copied into it.
+
+Every optimized program is checked against the plain one, which is not
+inlined either. One test writes 100 random C programs, with up to six
+parameters, loops, every operator and calls between functions; HotMotor
+inlines calls in most of them. Both must give the same output and the same
+exit code. The suites also still print what clang, Go and Python print.
 
 Running, the second and third runs:
 
-| | fib(36) | primes below 300 000 |
-|---|---|---|
-| **Strike, optimized** | **0.096 s** | **0.022 s** |
-| Strike, plain | 0.125 s | 0.043 s |
-| clang -O0 | 0.059 s | 0.021 s |
-| go | 0.059 s | 0.028 s |
-| clang -O2 | 0.031 s | 0.021 s |
-| python | 1.3 s | |
+| | fib(36) | 30 million calls in a loop | primes below 300 000 |
+|---|---|---|---|
+| **Strike, optimized** | **0.079 s** | **0.086 s** | **0.022 s** |
+| Strike, plain | 0.125 s | 0.133 s | 0.043 s |
+| clang -O0 | 0.058 s | 0.126 s | 0.021 s |
+| go | 0.058 s | 0.091 s | 0.028 s |
+| clang -O2 | 0.031 s | 0.100 s | 0.021 s |
+| python | 1.3 s | | |
 
-In loops, Strike's code is now as fast as clang -O0 and faster than Go.
-Calls still go through the stack, which is why fib is 1.6 times as slow as
-clang -O0. Passing the arguments straight in registers is the next step.
+- **A small function called in a loop:** Strike's code is the fastest of
+  all, because HotMotor inlined the call.
+- **Loops:** it is as fast as clang -O0 and faster than Go.
+- **Recursion (fib, which cannot be inlined):** it is 1.35 times as slow
+  as clang -O0, against 1.6 times before direct calls. The first call's
+  result still crosses the second call on the stack.
 
 Compiling big.c (2000 functions) with the optimizing generator takes
 0.07 s, 3 runs. The code part takes 0.004 s when every function is struck

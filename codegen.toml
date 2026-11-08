@@ -10,3 +10,16 @@ loop_weight = 8.0
 save_cost = 2.0
 # how many partial choices the beam keeps
 beam = 4
+
+# HotMotor's rule for every call of a function that calls nothing itself:
+# the call, or the function's body copied in its place. The judge scores the
+# cost of the call saved (a call in a loop weighs loop_weight more per
+# level) less the cost of the code copied; a copy is made where it scores
+# above zero.
+[inline]
+# moving the arguments, the call and the return, the callee's frame
+call_cost = 12.0
+# each operation of the IR copied into the caller
+size_cost = 0.5
+# a function longer than this is never copied
+max_ops = 60

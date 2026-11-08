@@ -22,6 +22,14 @@ pub struct Rules {
     pub loop_weight: f64,
     pub save_cost: f64,
     pub beam: usize,
+    pub inline: InlineRules,
+}
+
+#[derive(serde::Deserialize, Clone)]
+pub struct InlineRules {
+    pub call_cost: f64,
+    pub size_cost: f64,
+    pub max_ops: usize,
 }
 
 impl Rules {
@@ -30,12 +38,16 @@ impl Rules {
     }
     /// What the rules add to a brand: other numbers give other code.
     pub fn key(&self) -> String {
-        format!("x64opt-1 loop={} save={} beam={}", self.loop_weight, self.save_cost, self.beam)
+        format!(
+            "x64opt-2 loop={} save={} beam={} inline={},{},{}",
+            self.loop_weight, self.save_cost, self.beam, self.inline.call_cost, self.inline.size_cost, self.inline.max_ops
+        )
     }
 }
 
 const RAX: u8 = 0;
 const RCX: u8 = 1;
+const R10: u8 = 10;
 const R11: u8 = 11;
 /// rbx, rsi, rdi, r12 to r15: kept across calls (Windows x64)
 const SAVED: [u8; 7] = [3, 6, 7, 12, 13, 14, 15];
@@ -72,22 +84,7 @@ fn rex(r: u8, b: u8) -> u8 {
 /// How much each local is used, a use in a loop counting `loop_weight`
 /// times per level (a loop: the ops between a label and a jump back to it).
 fn weights(f: &Func, r: &Rules) -> Vec<f64> {
-    let mut at = vec![0usize; f.code.len()];
-    let mut label_at = std::collections::HashMap::new();
-    for (i, op) in f.code.iter().enumerate() {
-        if let Op::Label(l) = op {
-            label_at.insert(*l, i);
-        }
-    }
-    for (j, op) in f.code.iter().enumerate() {
-        if let Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) = op {
-            if let Some(&i) = label_at.get(l) {
-                if i < j {
-                    at[i..=j].iter_mut().for_each(|d| *d += 1);
-                }
-            }
-        }
-    }
+    let at = super::ir::loop_depths(&f.code);
     let mut w = vec![0.0; f.slots as usize];
     for (i, op) in f.code.iter().enumerate() {
         if let Op::Load(s) | Op::Store(s) = op {
@@ -413,6 +410,76 @@ impl G {
         }
     }
 
+    /// A call whose arguments go straight to rcx, rdx, r8, r9 and the
+    /// stack slots above the shadow space, from wherever they are: nothing
+    /// is pushed but what must outlive the call (a result in rax below the
+    /// arguments). Arguments already on the machine's stack take the
+    /// plain way.
+    fn call_direct(&mut self, sym: &str, n: usize) {
+        let at = self.v.len() - n;
+        if self.v[at..].contains(&V::Stack) {
+            self.flush();
+            let mut d = self.depth();
+            call(&mut self.a, sym, n as u32, &mut d, false);
+            self.v.truncate(d as usize);
+            self.v.push(V::Rax);
+            return;
+        }
+        let args: Vec<V> = self.v.split_off(at);
+        if let Some(i) = self.v.iter().rposition(|x| *x == V::Rax) {
+            self.flush_to(i);
+        }
+        // a comparison's flags become a number before anything changes them
+        let flags_in_r10 = if let Some(&V::Flags(cc)) = args.last() {
+            self.setcc_into(R10, cc);
+            true
+        } else {
+            false
+        };
+        let physical = self.v.iter().filter(|x| **x == V::Stack).count() as u32;
+        let k = n.saturating_sub(4) as u32;
+        let mut s = 32 + 8 * k;
+        if (physical + s / 8) % 2 == 1 {
+            s += 8;
+        }
+        self.a.sub_rsp(s as i32);
+        // no source is an argument register, so the order does not matter
+        for (i, x) in args.iter().enumerate() {
+            let src = if flags_in_r10 && i == n - 1 { None } else { Some(*x) };
+            if i < 4 {
+                match src {
+                    None => self.mov_rr(ARGS[i], R10),
+                    Some(x) => self.to_reg(x, ARGS[i]),
+                }
+            } else {
+                let disp = 32 + 8 * (i as i32 - 4);
+                let reg = match src {
+                    None => R10,
+                    Some(V::Rax) => RAX,
+                    Some(V::Imm(c)) if i32::try_from(c).is_ok() => {
+                        self.a.e(&[0x48, 0xC7, 0x84, 0x24]); // mov qword [rsp + d], imm32
+                        self.a.d32(disp);
+                        self.a.d32(c as i32);
+                        continue;
+                    }
+                    Some(V::Slot(t)) if matches!(self.loc[t as usize], Loc::Reg(_)) => {
+                        let Loc::Reg(y) = self.loc[t as usize] else { unreachable!() };
+                        y
+                    }
+                    Some(x) => {
+                        self.to_reg(x, R11);
+                        R11
+                    }
+                };
+                self.a.e(&[rex(reg, 0), 0x89, 0x84 | (reg & 7) << 3, 0x24]); // mov [rsp + d], reg
+                self.a.d32(disp);
+            }
+        }
+        self.a.call(sym);
+        self.a.add_rsp(s as i32);
+        self.v.push(V::Rax);
+    }
+
     fn epilogue(&mut self) {
         for (r, d) in self.saved.clone() {
             self.rm(&[0x8B], r, d);
@@ -520,13 +587,7 @@ pub fn compile(f: &Func, rules: &Rules) -> Code {
                     g.a.e(&[0x48, 0x83, 0xC4, 0x08]);
                 }
             }
-            Op::Call(sym, n) => {
-                g.flush();
-                let mut d = g.depth();
-                call(&mut g.a, sym, *n, &mut d, false);
-                g.v.truncate(d as usize);
-                g.v.push(V::Rax);
-            }
+            Op::Call(sym, n) => g.call_direct(sym, *n as usize),
             Op::PrintInt => {
                 let x = g.pop();
                 g.need_rax();

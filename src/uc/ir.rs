@@ -130,6 +130,33 @@ pub struct Func {
     pub code: Vec<Op>,
 }
 
+/// How many loops hold each operation (a loop: the operations between a
+/// label and a jump back to it).
+pub fn loop_depths(code: &[Op]) -> Vec<usize> {
+    let mut at = vec![0usize; code.len()];
+    let mut label_at = std::collections::HashMap::new();
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            label_at.insert(*l, i);
+        }
+    }
+    for (j, op) in code.iter().enumerate() {
+        if let Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) = op {
+            if let Some(&i) = label_at.get(l) {
+                if i < j {
+                    at[i..=j].iter_mut().for_each(|d| *d += 1);
+                }
+            }
+        }
+    }
+    at
+}
+
+/// One more than the highest label of the code.
+pub fn label_count(code: &[Op]) -> u32 {
+    code.iter().filter_map(|o| if let Op::Label(l) = o { Some(*l + 1) } else { None }).max().unwrap_or(0)
+}
+
 /// The version of the code generator; a new one gives every brand anew.
 pub const CODEGEN: &str = "strike-x64-1";
 
