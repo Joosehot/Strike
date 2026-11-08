@@ -55,6 +55,98 @@ The output goes to `<dir>/strike-out/<profile>/`, the brands to
 `~/.strike/brand/` (or `STRIKE_HOME`). `STRIKE_TIMES=1` shows where Strike's
 own time goes.
 
+## The universal compiler
+
+```
+strike compile <file> [-o EXE] [--explain] [--no-brand]
+```
+
+Strike's own compiler. It does not know any language itself. Every
+language is a description in [languages/](languages/):
+
+- how its text is cut into tokens (comments, strings, a block by braces or
+  by indentation, where a line ends a statement);
+- its operators, with their precedence;
+- its forms, written as patterns. For example, `if ( $expr ) $body [ else
+  $body ]` is C's if, and `for $name in range ( $args ) : $block` is
+  Python's.
+
+Each form says which universal construct it is. A new language is a new
+file, not a new compiler. There are three today: C, Go and Python.
+
+How a file becomes an executable:
+
+1. **HotMotor picks the language.** Every description is a candidate, and
+   the judges in [languages/judges.toml](languages/judges.toml) score each
+   one:
+   - it reads the whole file and knows every name in it;
+   - the file's extension is one the description names;
+   - how far into the file it read.
+
+   A description that could not beat the best score so far is not read at
+   all. A file with the wrong extension is still read in its own language.
+2. **Strike IR.** The file is lowered into one form shared by every
+   language: functions of stack operations on 64-bit integers.
+   - Truth values are followed through variables, parameters and results,
+     because Python prints `True` and Go prints `true` where C prints `1`.
+   - Each division keeps its language's meaning. C and Go round toward
+     zero, Python rounds down.
+3. **Brands per function.** Each function is branded by its IR. A
+   function whose brand already exists is struck instead of compiled, even
+   if the brand came from another language. The same function in C, Go and
+   Python is the same IR.
+4. **Machine code by Strike.** x86-64 is written byte by byte in one pass,
+   with no LLVM and no assembler.
+5. **The executable by Strike.** The PE file, its import table (KERNEL32)
+   and the runtime (printing and the entry point) are written directly,
+   with no linker.
+
+Whatever Strike cannot do yet in the language's own way is refused with
+the line and the reason, never guessed. Examples are a chained comparison
+in Python, `/` on floats, and a function whose value is used but which can
+end without one. Stage one has integers and truth values, functions,
+if/else, while, for, Python's `range`, break and continue, and printing
+(including printf formats). It has no floats, strings as values, arrays,
+structs or libraries yet.
+
+[tests/uc/](tests/uc/) holds the same suite in all three languages.
+Strike's executables print byte for byte what clang, Go and Python print
+for them (the `.out` files were written by those toolchains).
+
+Measured on one program of 2000 functions (each a loop with a branch),
+written in each language, 3 runs, mean:
+
+| compile to an executable | time |
+|---|---|
+| **Strike, C** | **0.12 s** (0.13 s all struck, 0.23 s with empty brands) |
+| **Strike, Go** | **0.12 s** |
+| **Strike, Python** | **0.17 s** |
+| clang -O0 | 0.27 s |
+| go build (standard library already built) | 0.86 s |
+| clang -O2 | 17.4 s |
+
+Strike compiles 2.3 times as fast as clang -O0 and 7 times as fast as
+`go build`. Every executable gives the same answer as clang's, Go's or
+Python's own run.
+
+At this size a brand is slower to read than to compile, so brands do not
+help a compile this fast yet. Reading them from one file instead of one
+file per function is the next step.
+
+Running fib(36), the second and third runs:
+
+| | time |
+|---|---|
+| Strike's code (from C or Python) | 0.12 s |
+| clang -O0 | 0.06 s |
+| go | 0.06 s |
+| clang -O2 | 0.03 s |
+| python | 1.3 s |
+
+Strike's code is still a plain stack machine. It runs 10 times as fast as
+Python, but half as fast as clang -O0 and Go. Keeping values in registers
+is the next step for the code generator.
+
 ## fStrike: downloads
 
 ```
@@ -170,12 +262,14 @@ plugin passes an option the export does not show yet.
 
 ## Next
 
-1. More drivers: C/C++ (clang `-MD`, MSVC `/showIncludes`), CUDA
+1. The universal compiler: values in registers; floats, strings and
+   arrays; more languages as descriptions; brands read from one pack.
+2. More drivers: C/C++ (clang `-MD`, MSVC `/showIncludes`), CUDA
    (`nvcc -MD`), Go, TypeScript; the motor and the lightning do not depend
    on the language.
-2. fStrike for more lockfiles: npm, pip, Gradle and Maven, Go.
-3. The missing Kotlin option, for all 4270 classes.
-4. Function order for the linker (`/ORDER`) from a wave grid like Devil's
+3. fStrike for more lockfiles: npm, pip, Gradle and Maven, Go.
+4. The missing Kotlin option, for all 4270 classes.
+5. Function order for the linker (`/ORDER`) from a wave grid like Devil's
    Clockwork's: every order is correct, only speed changes.
 
 MIT. © 2026 Joose Hotari.

@@ -1,0 +1,125 @@
+# Python, as Strike's universal compiler reads it (the pattern items are
+# explained in c.toml). Top-level statements are the program.
+
+name = "Python"
+extensions = ["py"]
+line_comments = ["#"]
+block_comments = []
+skip_lines = []
+string_quotes = ["\"", "'"]
+char_quotes = []
+blocks = "indent"
+statement_end = "newline"
+scope = "function"
+entry = "toplevel"
+param_name = "first"
+type_words = ["int", "bool"]
+chained_comparisons = "error"
+bool_print = ["True", "False"]
+
+[bool_constants]
+True = 1
+False = 0
+
+[binary]
+"or" = [1, "or_value"]
+"and" = [2, "and_value"]
+"==" = [4, "eq"]
+"!=" = [4, "ne"]
+"<" = [4, "lt"]
+"<=" = [4, "le"]
+">" = [4, "gt"]
+">=" = [4, "ge"]
+"|" = [5, "bor"]
+"^" = [6, "bxor"]
+"&" = [7, "band"]
+"<<" = [8, "shl"]
+">>" = [8, "shr"]
+"+" = [9, "add"]
+"-" = [9, "sub"]
+"*" = [10, "mul"]
+"//" = [10, "div_floor"]
+"%" = [10, "mod_floor"]
+
+[unary]
+"not" = [3, "not"]
+"-" = [11, "neg"]
+"+" = [11, "plus"]
+"~" = [11, "bnot"]
+
+[[form]]
+kind = "function"
+place = "top"
+pattern = "def $name ( $params ) [ -> $type ] : $block"
+
+[[form]]
+kind = "if"
+pattern = "if $expr : $block [ @elif | else : $block ]"
+
+[[form]]
+name = "elif"
+kind = "if"
+place = "sub"
+pattern = "elif $expr : $block [ @elif | else : $block ]"
+
+[[form]]
+kind = "while"
+pattern = "while $expr : $block"
+
+[[form]]
+kind = "for_range"
+pattern = "for $name in range ( $args ) : $block"
+
+[[form]]
+kind = "return"
+pattern = "return [ $expr ] $end"
+
+[[form]]
+kind = "break"
+pattern = "break $end"
+
+[[form]]
+kind = "continue"
+pattern = "continue $end"
+
+[[form]]
+kind = "nothing"
+pattern = "pass $end"
+
+[[form]]
+kind = "print"
+style = "spaced_line"
+pattern = "print ( $args ) $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+pattern = "$name += $expr $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+pattern = "$name -= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mul"
+pattern = "$name *= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "div_floor"
+pattern = "$name //= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mod_floor"
+pattern = "$name %= $expr $end"
+
+[[form]]
+kind = "assign"
+pattern = "$name = $expr $end"
+
+[[form]]
+kind = "expr"
+pattern = "$expr $end"

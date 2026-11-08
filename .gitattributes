@@ -1,0 +1,2 @@
+# the outputs of clang, Go and Python, compared byte for byte
+tests/uc/*.out binary

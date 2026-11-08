@@ -1,0 +1,166 @@
+# C, as Strike's universal compiler reads it.
+#
+# A pattern is the tokens of a form, in order:
+#   $name   a name          $expr    an expression     $end   the end of a statement
+#   $block  a block         $body    a block or one statement
+#   $params a parameter list (to the closing parenthesis)
+#   $args   expressions separated by commas (to the closing parenthesis)
+#   $type   one or more type words        $simple  a statement without its end
+#   $str    a string        @form    the form named so
+#   [ a | b ]  one of a, b, or nothing
+# Every other item is a token as written.
+
+name = "C"
+extensions = ["c", "h"]
+line_comments = ["//"]
+block_comments = [["/*", "*/"]]
+skip_lines = ["#"]
+string_quotes = ["\""]
+char_quotes = ["'"]
+blocks = "braces"
+statement_end = ";"
+scope = "block"
+entry = "main"
+param_name = "last"
+type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "const", "int64_t", "int32_t"]
+chained_comparisons = "allow"
+bool_print = []
+
+[bool_constants]
+true = 1
+false = 0
+
+[binary]
+"||" = [1, "or_bool"]
+"&&" = [2, "and_bool"]
+"|" = [3, "bor"]
+"^" = [4, "bxor"]
+"&" = [5, "band"]
+"==" = [6, "eq"]
+"!=" = [6, "ne"]
+"<" = [7, "lt"]
+"<=" = [7, "le"]
+">" = [7, "gt"]
+">=" = [7, "ge"]
+"<<" = [8, "shl"]
+">>" = [8, "shr"]
+"+" = [9, "add"]
+"-" = [9, "sub"]
+"*" = [10, "mul"]
+"/" = [10, "div_trunc"]
+"%" = [10, "mod_trunc"]
+
+[unary]
+"-" = [11, "neg"]
+"+" = [11, "plus"]
+"!" = [11, "not"]
+"~" = [11, "bnot"]
+
+[[form]]
+kind = "ignore"
+place = "top"
+pattern = "$type $name ( $params ) ;"
+
+[[form]]
+kind = "function"
+place = "top"
+pattern = "$type $name ( $params ) $block"
+
+[[form]]
+kind = "return"
+pattern = "return [ $expr ] $end"
+
+[[form]]
+kind = "if"
+pattern = "if ( $expr ) $body [ else $body ]"
+
+[[form]]
+kind = "while"
+pattern = "while ( $expr ) $body"
+
+[[form]]
+kind = "for"
+pattern = "for ( $simple ; $expr ; $simple ) $body"
+
+[[form]]
+kind = "break"
+pattern = "break $end"
+
+[[form]]
+kind = "continue"
+pattern = "continue $end"
+
+[[form]]
+kind = "print"
+style = "format"
+pattern = "printf ( $args ) $end"
+
+[[form]]
+kind = "print"
+style = "line"
+pattern = "puts ( $args ) $end"
+
+[[form]]
+kind = "var"
+pattern = "$type $name [ = $expr ] $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+pattern = "$name += $expr $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+pattern = "$name -= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mul"
+pattern = "$name *= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "div_trunc"
+pattern = "$name /= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mod_trunc"
+pattern = "$name %= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+value = 1
+pattern = "$name ++ $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+value = 1
+pattern = "$name -- $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+value = 1
+pattern = "++ $name $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+value = 1
+pattern = "-- $name $end"
+
+[[form]]
+kind = "assign"
+pattern = "$name = $expr $end"
+
+[[form]]
+kind = "nothing"
+pattern = ";"
+
+[[form]]
+kind = "expr"
+pattern = "$expr $end"

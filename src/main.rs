@@ -7,6 +7,7 @@
 //!   strike fetch <dir>    fStrike: the packages of a Cargo.lock
 //!   strike fetch <url> <file> [--sha256 HASH]
 //!   strike arc devices|receive|send   ArcStrike: folders to a nearby device
+//!   strike compile <file> [-o EXE]    the universal compiler
 
 mod arc;
 mod builder;
@@ -17,6 +18,7 @@ mod lightning;
 mod manifest;
 mod motor;
 mod times;
+mod uc;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,6 +32,7 @@ const USAGE: &str = "usage:
   strike arc devices
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
+  strike compile <file> [-o EXE] [--explain] [--no-brand]
   strike brand";
 
 fn main() -> ExitCode {
@@ -155,6 +158,46 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "arc" => arc_command(&args[1..]),
+        "compile" => {
+            let mut file = None;
+            let mut out = None;
+            let mut explain = false;
+            let mut brands = true;
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-o" => out = Some(PathBuf::from(it.next().ok_or("-o needs a file")?)),
+                    "--explain" => explain = true,
+                    "--no-brand" => brands = false,
+                    s if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
+                    s if file.is_none() => file = Some(PathBuf::from(s)),
+                    s => return Err(format!("one file only, got also {s}\n{USAGE}")),
+                }
+            }
+            let file = file.ok_or(USAGE)?;
+            let out = out.unwrap_or_else(|| file.with_extension("exe"));
+            let r = uc::compile(&file, &out, brands)?;
+            if explain {
+                for line in &r.explain {
+                    println!("  {line}");
+                }
+            }
+            println!(
+                "strike: {} read as {}; {} functions, {} struck, {} compiled; {:.3} s (read {:.3}, code {:.3}, exe {:.3}); {} ({} bytes)",
+                file.display(),
+                r.lang,
+                r.funcs,
+                r.struck,
+                r.funcs - r.struck,
+                r.seconds,
+                r.read_seconds,
+                r.code_seconds,
+                r.exe_seconds,
+                out.display(),
+                r.exe_bytes
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(USAGE.into()),
     }
 }

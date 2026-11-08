@@ -1,0 +1,15 @@
+fib 75025
+gcd 21
+primes 1229
+collatz 111
+sum6 91
+div -4 1 -4 -1
+lt True False
+min -9223372036854775808
+pairs 567
+or 5 4 True
+down 10
+down 7
+down 4
+down 1
+done

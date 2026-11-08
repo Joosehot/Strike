@@ -1,0 +1,156 @@
+# Go, as Strike's universal compiler reads it (the pattern items are
+# explained in c.toml). A newline ends a statement after a value, as Go's
+# own semicolon rule says.
+
+name = "Go"
+extensions = ["go"]
+line_comments = ["//"]
+block_comments = [["/*", "*/"]]
+skip_lines = []
+string_quotes = ["\""]
+char_quotes = ["'"]
+blocks = "braces"
+statement_end = "newline_after_value"
+end_after = [")", "]", "}", "++", "--", "return", "break", "continue"]
+scope = "block"
+entry = "main"
+param_name = "first"
+type_words = ["int", "int64", "int32", "bool", "uint", "uint64"]
+chained_comparisons = "allow"
+bool_print = ["true", "false"]
+
+[bool_constants]
+true = 1
+false = 0
+
+[binary]
+"||" = [1, "or_bool"]
+"&&" = [2, "and_bool"]
+"==" = [3, "eq"]
+"!=" = [3, "ne"]
+"<" = [3, "lt"]
+"<=" = [3, "le"]
+">" = [3, "gt"]
+">=" = [3, "ge"]
+"+" = [4, "add"]
+"-" = [4, "sub"]
+"|" = [4, "bor"]
+"^" = [4, "bxor"]
+"*" = [5, "mul"]
+"/" = [5, "div_trunc"]
+"%" = [5, "mod_trunc"]
+"<<" = [5, "shl"]
+">>" = [5, "shr"]
+"&" = [5, "band"]
+
+[unary]
+"-" = [6, "neg"]
+"+" = [6, "plus"]
+"!" = [6, "not"]
+"^" = [6, "bnot"]
+
+[[form]]
+kind = "ignore"
+place = "top"
+pattern = "package $name $end"
+
+[[form]]
+kind = "ignore"
+place = "top"
+pattern = "import [ $str | ( $str ) ] $end"
+
+[[form]]
+kind = "function"
+place = "top"
+pattern = "func $name ( $params ) [ $type ] $block"
+
+[[form]]
+kind = "return"
+pattern = "return [ $expr ] $end"
+
+[[form]]
+kind = "if"
+pattern = "if $expr $block [ else $body ]"
+
+[[form]]
+kind = "for"
+pattern = "for $simple ; $expr ; $simple $block"
+
+[[form]]
+kind = "while"
+pattern = "for $expr $block"
+
+[[form]]
+kind = "loop"
+pattern = "for $block"
+
+[[form]]
+kind = "break"
+pattern = "break $end"
+
+[[form]]
+kind = "continue"
+pattern = "continue $end"
+
+[[form]]
+kind = "print"
+style = "spaced_line"
+pattern = "fmt . Println ( $args ) $end"
+
+[[form]]
+kind = "print"
+style = "format"
+pattern = "fmt . Printf ( $args ) $end"
+
+[[form]]
+kind = "var"
+pattern = "var $name [ $type ] [ = $expr ] $end"
+
+[[form]]
+kind = "var"
+pattern = "$name := $expr $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+pattern = "$name += $expr $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+pattern = "$name -= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mul"
+pattern = "$name *= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "div_trunc"
+pattern = "$name /= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "mod_trunc"
+pattern = "$name %= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "add"
+value = 1
+pattern = "$name ++ $end"
+
+[[form]]
+kind = "assign"
+op = "sub"
+value = 1
+pattern = "$name -- $end"
+
+[[form]]
+kind = "assign"
+pattern = "$name = $expr $end"
+
+[[form]]
+kind = "expr"
+pattern = "$expr $end"

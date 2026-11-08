@@ -1,0 +1,11 @@
+# HotMotor's judges for which language a file is written in. Every
+# description in this folder is a candidate; the one scored highest is read.
+# Ties go to the description first in name order.
+
+# the description reads the file whole, to its last token, and every name in
+# it is known
+whole = 10.0
+# the file's extension is one the description names
+extension = 1.0
+# how far into the file the description read before it stopped (0 to 1)
+reach = 1.0
