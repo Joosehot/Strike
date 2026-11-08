@@ -213,8 +213,30 @@ Measured, release builds are as fast as the default here and no faster:
 | Strike | 0.083 s | 0.084 s | 0.022 s |
 | clang -O2 | 0.034 s | 0.101 s | 0.020 s |
 
-What is left between Strike and clang -O2 is recursion (fib is 2.4 times
-as slow). A release build of big.c takes 0.08 s, with all 2000 calls in
+### Calls of a function by itself
+
+[src/uc/tail.rs](src/uc/tail.rs) turns a function's call of itself at a
+return into a jump to its start, in every mode but `--plain`:
+
+- `return f(args)`: the arguments go into the parameters, then back to the
+  start.
+- `return x + f(args)` and `return x * f(args)`: x goes into an
+  accumulator, then the same. Every other return gives the accumulator
+  combined with its own value.
+
+Wrapping addition and multiplication are associative and commutative, so
+the result is the same number. x and the arguments are worked out in the
+same order as before. `fib(n-1) + fib(n-2)` makes half as many calls; the
+function becomes a loop around one call.
+
+The random-program test now also writes four recursive functions per
+program, in every shape a return can call itself in, including shapes that
+must not be changed (`f(n-1) - x`, `x + f(n-1) * 3`). In the 100 programs,
+266 calls became jumps, and all printed what the plain code prints.
+
+fib(36): 0.082 s became **0.043 s**. That is faster than clang -O0
+(0.058 s) and Go (0.059 s). clang -O2 takes 0.033 s; it also leaves the
+saving of registers out of the base case. A release build of big.c takes 0.08 s, with all 2000 calls in
 main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes

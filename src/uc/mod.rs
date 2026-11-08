@@ -13,6 +13,7 @@
 
 mod fold;
 mod inline;
+mod tail;
 pub mod ir;
 mod lang;
 mod lex;
@@ -103,6 +104,8 @@ pub struct Report {
     pub exe_bytes: usize,
     /// calls HotMotor chose to copy the callee into
     pub inlined: usize,
+    /// calls of a function by itself at a return, made jumps
+    pub tail_calls: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -239,6 +242,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         Gen::Plain => "x64-plain".to_string(),
     };
     let mut low = low;
+    let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
     if gen == Gen::Release {
         low.funcs.iter_mut().for_each(|f| {
@@ -291,6 +295,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         seconds: start.elapsed().as_secs_f64(),
         exe_bytes: exe.len(),
         inlined,
+        tail_calls,
     })
 }
 

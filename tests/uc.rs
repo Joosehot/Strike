@@ -161,10 +161,34 @@ impl Gen {
             out += &format!("long f{k}({}) {{\n{body}}}\n", decl.join(", "));
             funcs.push((format!("f{k}"), n));
         }
+        // recursive functions: every shape a return may call itself in
+        let mut recs = Vec::new();
+        for k in 0..4 {
+            let names = vec!["n".to_string(), "a".to_string()];
+            let base = self.expr(&names, &funcs, 2);
+            let x = self.expr(&names, &funcs, 2);
+            let arg = self.expr(&names, &funcs, 2);
+            let (call, depth) = match self.below(6) {
+                0 => (format!("{x} + r{k}(n - 1, {arg})"), 25),
+                1 => (format!("{x} * r{k}(n - 1, {arg})"), 25),
+                2 => (format!("r{k}(n - 1, {arg})"), 25),
+                3 => (format!("r{k}(n - 1, {arg}) - {x}"), 25),
+                4 => (format!("r{k}(n - 1, a) + r{k}(n - 2, {arg})"), 16),
+                _ => (format!("{x} + r{k}(n - 1, {arg}) * 3"), 25),
+            };
+            out += &format!(
+                "long r{k}(long n, long a) {{\n    if (n <= 0) return {base};\n    if ({}) return {x} + a;\n    return {call};\n}}\n",
+                self.expr(&names, &funcs, 1)
+            );
+            recs.push((format!("r{k}"), depth));
+        }
         out += "int main() {\n";
         for (f, n) in &funcs {
             let args: Vec<String> = (0..*n).map(|_| self.constant()).collect();
             out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));
+        }
+        for (f, depth) in &recs {
+            out += &format!("    printf(\"%lld\\n\", {f}({}, {}));\n", self.below(*depth), self.constant());
         }
         out + "    return 0;\n}\n"
     }
