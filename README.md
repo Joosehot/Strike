@@ -58,7 +58,7 @@ own time goes.
 ## The universal compiler
 
 ```
-strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain]
+strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release]
 ```
 
 Strike's own compiler. It does not know any language itself. Every
@@ -182,6 +182,40 @@ Running, the second and third runs:
 - **Recursion (fib, which cannot be inlined):** it is 1.35 times as slow
   as clang -O0, against 1.6 times before direct calls. The first call's
   result still crosses the second call on the stack.
+
+### Release builds
+
+`--release` uses the same generator, plus the work a release build may
+spend more time on. The rules are in the `[release]` part of codegen.toml:
+
+- constant expressions are worked out while compiling
+  ([src/uc/fold.rs](src/uc/fold.rs)), by the machine's own rules
+  (wrapping, a shift's count modulo 64; never a division by zero);
+- calls are copied in more readily (callees of up to 200 operations).
+
+Every function also reserves its call area once, so a call with nothing
+pushed needs no stack adjustment. A frame larger than a page is touched
+page by page as Windows requires: before that, a function with very many
+locals crashed.
+
+Division by a constant as a multiplication by its magic number is written
+and tested. A unit test checks the sequence against real division, and
+the random-program test runs it on 100 programs. It is still off in
+codegen.toml, because on this machine it was slower: 0.095 s against
+0.085 s with `idiv`, on 30 million dependent `% 1000003`. Clang -O2's own
+multiplication took 0.100 s on the same loop.
+
+Measured, release builds are as fast as the default here and no faster:
+
+| | fib(36) | 30 million calls | primes |
+|---|---|---|---|
+| Strike --release | 0.082 s | 0.085 s | 0.023 s |
+| Strike | 0.083 s | 0.084 s | 0.022 s |
+| clang -O2 | 0.034 s | 0.101 s | 0.020 s |
+
+What is left between Strike and clang -O2 is recursion (fib is 2.4 times
+as slow). A release build of big.c takes 0.08 s, with all 2000 calls in
+main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes
 0.07 s, 3 runs. The code part takes 0.004 s when every function is struck

@@ -93,8 +93,21 @@ impl Asm {
     }
     pub(super) fn prologue(&mut self, frame: i32) {
         self.e(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
-        if frame > 0 {
-            self.sub_rsp(frame);
+        // Windows grows the stack one guard page at a time: a frame larger
+        // than a page touches every page on its way down
+        let pages = frame / 4096;
+        if pages > 0 {
+            let top = self.label();
+            self.e(&[0x41, 0xBB]); // mov r11d, pages
+            self.d32(pages);
+            self.bind(top);
+            self.sub_rsp(4096);
+            self.e(&[0x48, 0x85, 0x24, 0x24]); // test [rsp], rsp
+            self.e(&[0x49, 0xFF, 0xCB]); // dec r11
+            self.jcc(5, top);
+        }
+        if frame % 4096 > 0 {
+            self.sub_rsp(frame % 4096);
         }
     }
     pub(super) fn epilogue(&mut self) {

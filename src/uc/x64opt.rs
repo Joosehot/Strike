@@ -23,6 +23,13 @@ pub struct Rules {
     pub save_cost: f64,
     pub beam: usize,
     pub inline: InlineRules,
+    pub release: Release,
+}
+
+#[derive(serde::Deserialize, Clone)]
+pub struct Release {
+    pub magic_division: bool,
+    pub inline: InlineRules,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -33,15 +40,37 @@ pub struct InlineRules {
 }
 
 impl Rules {
+    /// codegen.toml, or the file STRIKE_CODEGEN names instead.
     pub fn read() -> Result<Rules, String> {
-        toml::from_str(RULES).map_err(|e| format!("codegen.toml: {e}"))
+        let (name, text) = match std::env::var_os("STRIKE_CODEGEN") {
+            Some(p) => {
+                let t = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.to_string_lossy()))?;
+                (p.to_string_lossy().to_string(), t)
+            }
+            None => ("codegen.toml".to_string(), RULES.to_string()),
+        };
+        toml::from_str(&text).map_err(|e| format!("{name}: {e}"))
     }
     /// What the rules add to a brand: other numbers give other code.
-    pub fn key(&self) -> String {
+    pub fn key(&self, release: bool) -> String {
+        let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-2 loop={} save={} beam={} inline={},{},{}",
-            self.loop_weight, self.save_cost, self.beam, self.inline.call_cost, self.inline.size_cost, self.inline.max_ops
+            "x64opt-3 release={release} magic={} loop={} save={} beam={} inline={},{},{}",
+            release && self.release.magic_division,
+            self.loop_weight,
+            self.save_cost,
+            self.beam,
+            i.call_cost,
+            i.size_cost,
+            i.max_ops
         )
+    }
+    pub fn inline_for(&self, release: bool) -> &InlineRules {
+        if release {
+            &self.release.inline
+        } else {
+            &self.inline
+        }
     }
 }
 
@@ -122,11 +151,90 @@ fn choose(f: &Func, r: &Rules) -> Vec<bool> {
     beam.swap_remove(0).1
 }
 
+/// The magic number and shift that divide by d with a multiplication
+/// (Hacker's Delight, 10-1), for |d| >= 2.
+pub fn magic(d: i64) -> (i64, u32) {
+    let two63: u64 = 1 << 63;
+    let ad = d.unsigned_abs();
+    let t = two63 + ((d as u64) >> 63);
+    let anc = t - 1 - t % ad;
+    let mut p = 63u32;
+    let (mut q1, mut r1) = (two63 / anc, two63 - (two63 / anc) * anc);
+    let (mut q2, mut r2) = (two63 / ad, two63 - (two63 / ad) * ad);
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 = r1.wrapping_sub(anc);
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= ad {
+            q2 = q2.wrapping_add(1);
+            r2 = r2.wrapping_sub(ad);
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let m = q2.wrapping_add(1) as i64;
+    (if d < 0 { m.wrapping_neg() } else { m }, p - 64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::magic;
+
+    /// The emitted sequence, step by step: q = high(n * m) (+n or -n),
+    /// shifted, plus one if negative.
+    fn divide(n: i64, d: i64) -> i64 {
+        let (m, s) = magic(d);
+        let mut hi = ((n as i128 * m as i128) >> 64) as i64;
+        if d > 0 && m < 0 {
+            hi = hi.wrapping_add(n);
+        } else if d < 0 && m > 0 {
+            hi = hi.wrapping_sub(n);
+        }
+        hi >>= s;
+        hi + ((hi as u64) >> 63) as i64
+    }
+
+    #[test]
+    fn a_magic_multiplication_divides() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as i64
+        };
+        let mut ds = vec![2, 3, 5, 7, 10, 1000003, -2, -3, -7, -1000003, i64::MAX, i64::MIN + 1, 1 << 40, -(1 << 40)];
+        for _ in 0..200 {
+            let d = next() >> (next() as u64 % 63);
+            if d.unsigned_abs() >= 2 && d != i64::MIN {
+                ds.push(d);
+            }
+        }
+        for &d in &ds {
+            let mut ns = vec![0, 1, -1, i64::MAX, i64::MIN, d, -d, d - 1, d + 1];
+            ns.extend((0..200).map(|_| next() >> (next() as u64 % 64)));
+            for n in ns {
+                assert_eq!(divide(n, d), n.wrapping_div(d), "{n} / {d}");
+            }
+        }
+    }
+}
+
 struct G {
     a: Asm,
     v: Vec<V>,
     loc: Vec<Loc>,
     saved: Vec<(u8, i32)>,
+    /// division by a constant as a multiplication (codegen.toml)
+    magic: bool,
 }
 
 impl G {
@@ -356,6 +464,43 @@ impl G {
                     }
                 }
             }
+            BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor
+                if self.magic && matches!(o, Opd::Imm(d) if d.unsigned_abs() >= 2) =>
+            {
+                let Opd::Imm(d) = o else { unreachable!() };
+                let (m, s) = magic(d as i64);
+                self.a.e(&[0x49, 0x89, 0xC0]); // mov r8, rax (n)
+                self.mov_imm(RCX, m);
+                self.a.e(&[0x48, 0xF7, 0xE9]); // imul rcx: rdx = high(n * m)
+                if d > 0 && m < 0 {
+                    self.a.e(&[0x4C, 0x01, 0xC2]); // add rdx, r8
+                } else if d < 0 && m > 0 {
+                    self.a.e(&[0x4C, 0x29, 0xC2]); // sub rdx, r8
+                }
+                if s > 0 {
+                    self.a.e(&[0x48, 0xC1, 0xFA, s as u8]); // sar rdx, s
+                }
+                self.a.e(&[0x48, 0x89, 0xD0, 0x48, 0xC1, 0xE8, 0x3F, 0x48, 0x01, 0xD0]); // rax = q (+1 if negative)
+                if b != BinOp::DivTrunc {
+                    // rdx = n - q * d, rcx = d: as idiv leaves them
+                    self.a.e(&[0x48, 0x89, 0xC2, 0x48, 0x69, 0xD2]); // mov rdx, rax; imul rdx, rdx, d
+                    self.a.d32(d);
+                    self.a.e(&[0x4C, 0x89, 0xC1, 0x48, 0x29, 0xD1, 0x48, 0x89, 0xCA]); // rdx = n - rdx
+                    self.mov_imm(RCX, d as i64);
+                }
+                if matches!(b, BinOp::DivFloor | BinOp::ModFloor) {
+                    let l = done(&mut self.a);
+                    self.a.e(&[0x48, 0x85, 0xD2]);
+                    self.a.jcc(4, l);
+                    self.a.e(&[0x49, 0x89, 0xD0, 0x49, 0x31, 0xC8]);
+                    self.a.jcc(9, l);
+                    self.a.e(&[0x48, 0xFF, 0xC8, 0x48, 0x01, 0xCA]);
+                    self.a.bind(l);
+                }
+                if matches!(b, BinOp::ModTrunc | BinOp::ModFloor) {
+                    self.mov_rr(RAX, 2);
+                }
+            }
             BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor => {
                 self.into_rcx(o);
                 self.a.e(&[0x48, 0x99, 0x48, 0xF7, 0xF9]); // cqo; idiv rcx
@@ -438,11 +583,14 @@ impl G {
         };
         let physical = self.v.iter().filter(|x| **x == V::Stack).count() as u32;
         let k = n.saturating_sub(4) as u32;
-        let mut s = 32 + 8 * k;
-        if (physical + s / 8) % 2 == 1 {
+        // with nothing pushed, the frame's own call area is at rsp, aligned
+        let mut s = if physical == 0 { 0 } else { 32 + 8 * k };
+        if s > 0 && (physical + s / 8) % 2 == 1 {
             s += 8;
         }
-        self.a.sub_rsp(s as i32);
+        if s > 0 {
+            self.a.sub_rsp(s as i32);
+        }
         // no source is an argument register, so the order does not matter
         for (i, x) in args.iter().enumerate() {
             let src = if flags_in_r10 && i == n - 1 { None } else { Some(*x) };
@@ -476,8 +624,20 @@ impl G {
             }
         }
         self.a.call(sym);
-        self.a.add_rsp(s as i32);
+        if s > 0 {
+            self.a.add_rsp(s as i32);
+        }
         self.v.push(V::Rax);
+    }
+
+    /// A call of the runtime whose arguments are already in rcx (and rdx).
+    fn call_runtime(&mut self, sym: &str) {
+        let mut d = self.depth();
+        if d == 0 {
+            self.a.call(sym);
+        } else {
+            call(&mut self.a, sym, 0, &mut d, false);
+        }
     }
 
     fn epilogue(&mut self) {
@@ -488,7 +648,7 @@ impl G {
     }
 }
 
-pub fn compile(f: &Func, rules: &Rules) -> Code {
+pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     let in_reg = choose(f, rules);
     let mut loc = Vec::new();
     let mut saved = Vec::new();
@@ -511,8 +671,20 @@ pub fn compile(f: &Func, rules: &Rules) -> Code {
             (r, -8 * mem)
         })
         .collect();
-    let frame = (mem * 8 + 15) / 16 * 16;
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved };
+    // the call area below the locals: shadow space and the stack arguments
+    // of the widest call, so a call with nothing pushed needs no rsp change
+    let widest = f
+        .code
+        .iter()
+        .map(|o| match o {
+            Op::Call(_, n) => 32 + 8 * n.saturating_sub(4) as i32,
+            Op::PrintInt | Op::PrintStr(_) => 32,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let frame = (mem * 8 + widest + 15) / 16 * 16;
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, magic: release && rules.release.magic_division };
     g.a.prologue(frame);
     for (r, d) in g.saved.clone() {
         g.rm(&[0x89], r, d);
@@ -593,8 +765,7 @@ pub fn compile(f: &Func, rules: &Rules) -> Code {
                 g.need_rax();
                 g.to_reg(x, RCX);
                 g.flush();
-                let mut d = g.depth();
-                call(&mut g.a, "rt.print_int", 0, &mut d, false);
+                g.call_runtime("rt.print_int");
             }
             Op::PrintStr(s) => {
                 g.flush();
@@ -602,8 +773,7 @@ pub fn compile(f: &Func, rules: &Rules) -> Code {
                 g.a.reloc(Target::Data(s.clone()));
                 g.a.e(&[0x48, 0xC7, 0xC2]);
                 g.a.d32(s.len() as i32);
-                let mut d = g.depth();
-                call(&mut g.a, "rt.print_str", 0, &mut d, false);
+                g.call_runtime("rt.print_str");
             }
             Op::Jmp(l) => {
                 g.flush();

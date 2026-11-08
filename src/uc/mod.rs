@@ -11,6 +11,7 @@
 //! The brands are one pack (~/.strike/uc/pack), read whole once per
 //! compile, with new brands added at its end.
 
+mod fold;
 mod inline;
 pub mod ir;
 mod lang;
@@ -33,6 +34,9 @@ use x64::{Code, Target};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Gen {
     Opt,
+    /// --release: the optimizing generator with the work a release build
+    /// may spend more time on (codegen.toml, [release])
+    Release,
     Plain,
 }
 
@@ -230,11 +234,17 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     let t = Instant::now();
     let rules = x64opt::Rules::read()?;
     let generator = match gen {
-        Gen::Opt => rules.key(),
+        Gen::Opt => rules.key(false),
+        Gen::Release => rules.key(true),
         Gen::Plain => "x64-plain".to_string(),
     };
     let mut low = low;
-    let inlined = if gen == Gen::Opt { inline::run(&mut low.funcs, &rules) } else { 0 };
+    let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
+    if gen == Gen::Release {
+        low.funcs.iter_mut().for_each(|f| {
+            fold::run(f);
+        });
+    }
     let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
     let mut funcs: Vec<(String, Code)> = x64::runtime(&low.entry);
     let mut struck = 0;
@@ -250,7 +260,8 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
             }
             None => {
                 let c = match gen {
-                    Gen::Opt => x64opt::compile(f, &rules),
+                    Gen::Opt => x64opt::compile(f, &rules, false),
+                    Gen::Release => x64opt::compile(f, &rules, true),
                     Gen::Plain => x64::compile(f),
                 };
                 if let Some(p) = pack.as_mut() {

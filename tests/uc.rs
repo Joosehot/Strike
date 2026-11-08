@@ -112,7 +112,12 @@ impl Gen {
                 format!("({} {op} {})", self.expr(names, funcs, d), self.expr(names, funcs, d))
             }
             3 => {
-                let mut k = self.below(19) as i64 - 9;
+                let mut k = match self.below(4) {
+                    0 => self.below(19) as i64 - 9,
+                    1 => 1 << self.below(40),
+                    2 => -(self.below(2_000_000) as i64),
+                    _ => self.next() as i64 >> self.below(62),
+                };
                 if k == 0 {
                     k = 7;
                 }
@@ -168,17 +173,26 @@ impl Gen {
 #[test]
 fn the_optimized_code_prints_what_the_plain_code_prints() {
     let r = root("differ");
+    let rules = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("codegen.toml")).unwrap();
+    let magic = r.join("magic.toml");
+    std::fs::write(&magic, rules.replace("magic_division = false", "magic_division = true")).unwrap();
     let mut g = Gen(0x9E37_79B9_7F4A_7C15);
     for n in 0..100 {
         let src = r.join(format!("p{n}.c"));
         std::fs::write(&src, g.program()).unwrap();
         let mut outs = Vec::new();
-        for plain in [false, true] {
-            let exe = r.join(format!("p{n}-{plain}.exe"));
+        for mode in ["--plain", "--opt", "--release", "--release-magic"] {
+            let exe = r.join(format!("p{n}{mode}.exe"));
             let mut c = Command::new(env!("CARGO_BIN_EXE_strike"));
             c.args(["compile", src.to_str().unwrap(), "-o", exe.to_str().unwrap()]).env("STRIKE_HOME", r.join("home"));
-            if plain {
-                c.arg("--plain");
+            match mode {
+                "--opt" => {}
+                "--release-magic" => {
+                    c.arg("--release").env("STRIKE_CODEGEN", &magic);
+                }
+                m => {
+                    c.arg(m);
+                }
             }
             let o = c.output().unwrap();
             assert!(o.status.success(), "p{n}.c: {}", text(&o));
@@ -186,6 +200,31 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
             outs.push((run.status.code(), run.stdout));
         }
         assert_eq!(outs[0], outs[1], "p{n}.c: the optimized and the plain code differ");
+        assert_eq!(outs[0], outs[2], "p{n}.c: the release and the plain code differ");
+        assert_eq!(outs[0], outs[3], "p{n}.c: division by multiplying and the plain code differ");
+    }
+}
+
+#[test]
+fn a_frame_larger_than_a_page_runs_in_every_mode() {
+    let r = root("frame");
+    let mut src = String::from("#include <stdio.h>\nlong f(long a) {\n");
+    for i in 0..1500 {
+        src += &format!("    long v{i} = a + {i};\n");
+    }
+    src += "    return v0 + v1499;\n}\nint main() {\n    printf(\"%lld\\n\", f(1));\n    return 0;\n}\n";
+    let p = r.join("frame.c");
+    std::fs::write(&p, src).unwrap();
+    for mode in ["--plain", "--release"] {
+        let exe = r.join(format!("f{mode}.exe"));
+        let o = Command::new(env!("CARGO_BIN_EXE_strike"))
+            .args(["compile", p.to_str().unwrap(), "-o", exe.to_str().unwrap(), mode])
+            .env("STRIKE_HOME", r.join("home"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", text(&o));
+        let run = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "1501\n", "{mode}: exit {:?}", run.status.code());
     }
 }
 

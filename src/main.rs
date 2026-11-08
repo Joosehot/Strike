@@ -32,7 +32,7 @@ const USAGE: &str = "usage:
   strike arc devices
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
-  strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain]
+  strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release]
   strike brand";
 
 fn main() -> ExitCode {
@@ -171,6 +171,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                     "--explain" => explain = true,
                     "--no-brand" => brands = false,
                     "--plain" => gen = uc::Gen::Plain,
+                    "--release" => gen = uc::Gen::Release,
                     s if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
                     s if file.is_none() => file = Some(PathBuf::from(s)),
                     s => return Err(format!("one file only, got also {s}\n{USAGE}")),

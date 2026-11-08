@@ -23,3 +23,20 @@ call_cost = 12.0
 size_cost = 0.5
 # a function longer than this is never copied
 max_ops = 60
+
+# --release: the same rules, and the work a release build may spend more
+# time on. Division by a constant becomes a multiplication by its magic
+# number, constant expressions are worked out while compiling, and calls
+# are copied in more readily.
+[release]
+# division by a constant as a multiplication by its magic number. Off:
+# measured on this machine (30 million `% 1000003` in a dependent chain),
+# its divider is as fast as the multiplication's chain of seven
+# instructions (0.095 s against 0.085 s with idiv; clang -O2's own
+# multiplication 0.100 s)
+magic_division = false
+
+[release.inline]
+call_cost = 12.0
+size_cost = 0.25
+max_ops = 200

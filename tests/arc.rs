@@ -148,6 +148,12 @@ fn a_cut_transfer_resumes_where_it_stopped() {
     let (mut r, _out) = p.receiver("y\n");
     let cut = p.send(&["--stop-after", "5000000", "--streams", "1"]);
     assert_eq!(cut.status.code(), Some(3), "{}", String::from_utf8_lossy(&cut.stderr));
+    // the receiver first takes in what was already on its way, as it would
+    // when a cable is pulled; only then is it stopped
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while r.try_wait().ok().flatten().is_none() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     r.kill().ok();
     r.wait().ok();
     let rest = p.transfer(&["--streams", "1"]);
