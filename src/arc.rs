@@ -345,11 +345,24 @@ impl Chan {
         let known = peers().contains_key(&remote);
         let ok = known || {
             let _g = PROMPT.lock().unwrap();
-            print!("Pair with {name} ({os})? Code {:03} {:03}. Accept [y/N]: ", code / 1000, code % 1000);
+            print!("Pair with {name} ({os})? Code {:03} {:03}. Accept with y or the code: ", code / 1000, code % 1000);
             std::io::stdout().flush().ok();
             let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line).ok();
-            line.trim().eq_ignore_ascii_case("y")
+            match std::io::stdin().lock().read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    println!();
+                    eprintln!("arc: no answer could be read here (no keyboard input); run strike in a terminal window");
+                    false
+                }
+                Ok(_) => {
+                    let a = line.trim().to_lowercase();
+                    let ok = matches!(a.as_str(), "y" | "yes" | "k" | "kyllä" | "kylla") || a.replace(' ', "") == format!("{code:06}");
+                    if !ok {
+                        eprintln!("arc: declined (read {a:?}); accept with y or the code");
+                    }
+                    ok
+                }
+            }
         };
         c.send(K_APPROVE, &[ok as u8])?;
         let (k, body) = c.recv()?;
