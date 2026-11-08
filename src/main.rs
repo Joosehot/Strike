@@ -186,7 +186,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 }
             }
             println!(
-                "strike: {} read as {}; {} functions, {} struck, {} compiled, {} calls inlined, {} tail calls made jumps; {:.3} s (read {:.3}, code {:.3}, exe {:.3}); {} ({} bytes)",
+                "strike: {} read as {}; {} functions, {} struck, {} compiled, {} calls inlined, {} tail calls made jumps, {} recursive calls unrolled; {:.3} s (read {:.3}, code {:.3}, exe {:.3}); {} ({} bytes)",
                 file.display(),
                 r.lang,
                 r.funcs,
@@ -194,6 +194,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 r.funcs - r.struck,
                 r.inlined,
                 r.tail_calls,
+                r.unrolled,
                 r.seconds,
                 r.read_seconds,
                 r.code_seconds,

@@ -252,10 +252,29 @@ Two more changes went in for calls:
   register: `n = n - 2` is one `sub`, and `acc = x + acc` is one `add`. The
   call's result can then stay in rax.
 
-These took fib(36) only from 0.043 s to 0.041 s; clang -O2 takes 0.033 s.
-Its loop is now nearly instruction for instruction Strike's. What is left
-is the frame: Strike saves registers to memory under an rbp frame, where
-clang pushes and pops them. A release build of big.c takes 0.08 s, with all 2000 calls in
+These took fib(36) only from 0.043 s to 0.041 s.
+
+- **Recursion unrolled.** HotMotor's `[unroll]` rule in codegen.toml
+  copies a function's own body in place of each call of itself, `levels`
+  times, while the function is no longer than `max_ops` operations. The
+  calls inside the copy stay calls, so each call that is left does the
+  work of two levels. This is done before branding, with the same copying
+  as inlining. In the 100 random programs, 213 recursive calls were
+  unrolled, and all printed what the plain code prints.
+
+fib(36), the last four of five runs:
+
+| unrolled levels | time | exe |
+|---|---|---|
+| 0 | 0.040-0.042 s | 1536 bytes |
+| **1 (the rule)** | **0.034-0.037 s** | 2048 bytes |
+| 2 | 0.031-0.039 s | 2048 bytes |
+| 3 | 0.035-0.039 s | 3072 bytes |
+| clang -O2 | 0.031-0.033 s | |
+
+One level takes fib from 0.041 s to 0.035 s, within 10% of clang -O2.
+More levels gave no gain that stands out from the noise, so the rule
+stays at one. A release build of big.c takes 0.08 s, with all 2000 calls in
 main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes

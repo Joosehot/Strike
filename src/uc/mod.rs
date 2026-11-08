@@ -106,6 +106,8 @@ pub struct Report {
     pub inlined: usize,
     /// calls of a function by itself at a return, made jumps
     pub tail_calls: usize,
+    /// calls of a function by itself replaced by a copy of its body
+    pub unrolled: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -243,6 +245,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     };
     let mut low = low;
     let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
+    let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
     if gen == Gen::Release {
         low.funcs.iter_mut().for_each(|f| {
@@ -296,6 +299,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         exe_bytes: exe.len(),
         inlined,
         tail_calls,
+        unrolled,
     })
 }
 

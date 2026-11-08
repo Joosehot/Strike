@@ -24,6 +24,14 @@ size_cost = 0.5
 # a function longer than this is never copied
 max_ops = 60
 
+# HotMotor's rule for a function that calls itself: its own body copied in
+# place of each such call, `levels` times, while it is no longer than
+# `max_ops`. The calls inside a copy stay calls, so each one left does the
+# work of more levels.
+[unroll]
+levels = 1
+max_ops = 80
+
 # --release: the same rules, and the work a release build may spend more
 # time on. Division by a constant becomes a multiplication by its magic
 # number, constant expressions are worked out while compiling, and calls

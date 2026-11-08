@@ -23,7 +23,14 @@ pub struct Rules {
     pub save_cost: f64,
     pub beam: usize,
     pub inline: InlineRules,
+    pub unroll: UnrollRules,
     pub release: Release,
+}
+
+#[derive(serde::Deserialize, Clone)]
+pub struct UnrollRules {
+    pub levels: u32,
+    pub max_ops: usize,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -55,8 +62,10 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-3 release={release} magic={} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-4 release={release} magic={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
+            self.unroll.levels,
+            self.unroll.max_ops,
             self.loop_weight,
             self.save_cost,
             self.beam,

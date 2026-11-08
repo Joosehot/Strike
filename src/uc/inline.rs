@@ -42,36 +42,80 @@ pub fn run(funcs: &mut [Func], r: &Rules, release: bool) -> usize {
                 out.push(op.clone());
                 continue;
             }
-            // the arguments into the callee's slots (the last is on top),
-            // its other slots to zero, as its own prologue would
             f.slots = f.slots.max(base + c.slots);
-            for p in (0..c.params).rev() {
-                out.push(Op::Store(base + p));
-            }
-            for s in c.params..c.slots {
-                out.push(Op::Push(0));
-                out.push(Op::Store(base + s));
-            }
-            let lbase = labels;
-            labels += label_count(&c.code);
-            let end = labels;
-            labels += 1;
-            for o in &c.code {
-                out.push(match o {
-                    Op::Load(s) => Op::Load(s + base),
-                    Op::Store(s) => Op::Store(s + base),
-                    Op::Jmp(l) => Op::Jmp(l + lbase),
-                    Op::Jz(l) => Op::Jz(l + lbase),
-                    Op::Jnz(l) => Op::Jnz(l + lbase),
-                    Op::Label(l) => Op::Label(l + lbase),
-                    Op::Ret => Op::Jmp(end),
-                    o => o.clone(),
-                });
-            }
-            out.push(Op::Label(end));
+            copy(&mut out, c, base, &mut labels);
             copied += 1;
         }
         f.code = out;
     }
     copied
+}
+
+/// The callee's body in place of a call: the arguments into its slots
+/// (the last is on top), its other slots to zero as its own prologue would,
+/// its labels renumbered, and its returns a jump past the copy with the
+/// value on the stack.
+fn copy(out: &mut Vec<Op>, c: &Func, base: u32, labels: &mut u32) {
+    for p in (0..c.params).rev() {
+        out.push(Op::Store(base + p));
+    }
+    for s in c.params..c.slots {
+        out.push(Op::Push(0));
+        out.push(Op::Store(base + s));
+    }
+    let lbase = *labels;
+    *labels += label_count(&c.code);
+    let end = *labels;
+    *labels += 1;
+    for o in &c.code {
+        out.push(match o {
+            Op::Load(s) => Op::Load(s + base),
+            Op::Store(s) => Op::Store(s + base),
+            Op::Jmp(l) => Op::Jmp(l + lbase),
+            Op::Jz(l) => Op::Jz(l + lbase),
+            Op::Jnz(l) => Op::Jnz(l + lbase),
+            Op::Label(l) => Op::Label(l + lbase),
+            Op::Ret => Op::Jmp(end),
+            o => o.clone(),
+        });
+    }
+    out.push(Op::Label(end));
+}
+
+/// HotMotor's unrolling rule (codegen.toml, [unroll]): a function that
+/// calls itself, and is no longer than `max_ops`, gets its own body copied
+/// in place of each such call, `levels` times. The calls inside the copy
+/// stay calls, so every call that is left does the work of more levels:
+/// fewer calls, for code that grows `levels + 1` times per call site.
+pub fn unroll(funcs: &mut [Func], r: &Rules) -> usize {
+    let mut unrolled = 0;
+    for f in funcs.iter_mut() {
+        let me = f.name.clone();
+        let calls = |code: &[Op]| code.iter().filter(|o| matches!(o, Op::Call(s, _) if *s == me)).count();
+        let sites = calls(&f.code);
+        if sites == 0 || f.code.len() > r.unroll.max_ops {
+            continue;
+        }
+        for _ in 0..r.unroll.levels {
+            let original = f.clone();
+            let base = f.slots;
+            let code = std::mem::take(&mut f.code);
+            let mut labels = label_count(&code);
+            let mut out = Vec::with_capacity(code.len() * (sites + 1));
+            for op in &code {
+                match op {
+                    Op::Call(s, _) if *s == me => {
+                        // copies do not overlap: one is done before the next
+                        // starts, and a call inside it has its own frame
+                        f.slots = f.slots.max(base + original.slots);
+                        copy(&mut out, &original, base, &mut labels);
+                        unrolled += 1;
+                    }
+                    o => out.push(o.clone()),
+                }
+            }
+            f.code = out;
+        }
+    }
+    unrolled
 }
