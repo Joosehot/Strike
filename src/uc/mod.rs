@@ -5,7 +5,11 @@
 //! compiled, and the executable is written by Strike itself.
 //!
 //!   text --lex, parse (the description)--> universal syntax
-//!        --lower--> Strike IR --x64--> machine code --pe--> .exe
+//!        --lower--> Strike IR --x64opt (or x64, plain)--> machine code
+//!        --pe--> .exe
+//!
+//! The brands are one pack (~/.strike/uc/pack), read whole once per
+//! compile, with new brands added at its end.
 
 pub mod ir;
 mod lang;
@@ -14,11 +18,72 @@ mod lower;
 mod parse;
 mod pe;
 mod x64;
+mod x64opt;
 
 use lang::Lang;
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use x64::{Code, Target};
+
+/// Which code generator: the optimizing one, or the plain one every
+/// optimized program is checked against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Gen {
+    Opt,
+    Plain,
+}
+
+const PACK_MAGIC: &[u8; 2] = b"SB";
+
+/// The brand pack: every record is SB, a 32-byte key, a length and the
+/// code. A record cut short at the end (a write that did not finish) is
+/// left out.
+struct Pack {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    at: HashMap<[u8; 32], (usize, usize)>,
+    new: Vec<u8>,
+}
+
+impl Pack {
+    fn open(path: PathBuf) -> Pack {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let mut at = HashMap::new();
+        let mut i = 0;
+        while i + 38 <= bytes.len() && &bytes[i..i + 2] == PACK_MAGIC {
+            let key: [u8; 32] = bytes[i + 2..i + 34].try_into().unwrap();
+            let len = u32::from_le_bytes(bytes[i + 34..i + 38].try_into().unwrap()) as usize;
+            if i + 38 + len > bytes.len() {
+                break;
+            }
+            at.insert(key, (i + 38, len));
+            i += 38 + len;
+        }
+        Pack { path, bytes, at, new: Vec::new() }
+    }
+    fn get(&self, key: &[u8; 32]) -> Option<Code> {
+        let &(s, n) = self.at.get(key)?;
+        load(&self.bytes[s..s + n])
+    }
+    fn add(&mut self, key: [u8; 32], c: &Code) {
+        let data = save(c);
+        self.new.extend_from_slice(PACK_MAGIC);
+        self.new.extend_from_slice(&key);
+        self.new.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.new.extend_from_slice(&data);
+    }
+    fn write(self) {
+        if self.new.is_empty() {
+            return;
+        }
+        let _ = std::fs::create_dir_all(self.path.parent().unwrap());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = f.write_all(&self.new);
+        }
+    }
+}
 
 pub struct Report {
     pub lang: String,
@@ -108,7 +173,7 @@ pub fn languages() -> Result<Vec<Lang>, String> {
     Ok(v)
 }
 
-pub fn compile(src: &Path, out: &Path, brands: bool) -> Result<Report, String> {
+pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report, String> {
     let start = Instant::now();
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let langs = languages()?;
@@ -156,33 +221,43 @@ pub fn compile(src: &Path, out: &Path, brands: bool) -> Result<Report, String> {
     };
     let read_seconds = start.elapsed().as_secs_f64();
 
-    // every function: struck from its brand, or compiled and branded
+    // every function: struck from its brand, or compiled and branded. The
+    // brand is the function's IR and everything that decides its code (the
+    // generator and its rules).
     let t = Instant::now();
-    let dir = brand_dir();
+    let rules = x64opt::Rules::read()?;
+    let generator = match gen {
+        Gen::Opt => rules.key(),
+        Gen::Plain => "x64-plain".to_string(),
+    };
+    let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
     let mut funcs: Vec<(String, Code)> = x64::runtime(&low.entry);
     let mut struck = 0;
     for f in &low.funcs {
-        let key = f.brand();
-        let path = dir.join(&key[..2]).join(&key);
-        let kept = if brands { std::fs::read(&path).ok().and_then(|b| load(&b)) } else { None };
-        let code = match kept {
+        let mut h = blake3::Hasher::new();
+        h.update(f.brand().as_bytes());
+        h.update(generator.as_bytes());
+        let key: [u8; 32] = *h.finalize().as_bytes();
+        let code = match pack.as_ref().and_then(|p| p.get(&key)) {
             Some(c) => {
                 struck += 1;
                 c
             }
             None => {
-                let c = x64::compile(f);
-                if brands {
-                    let _ = std::fs::create_dir_all(path.parent().unwrap());
-                    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-                    if std::fs::write(&tmp, save(&c)).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
-                    }
+                let c = match gen {
+                    Gen::Opt => x64opt::compile(f, &rules),
+                    Gen::Plain => x64::compile(f),
+                };
+                if let Some(p) = pack.as_mut() {
+                    p.add(key, &c);
                 }
                 c
             }
         };
         funcs.push((f.name.clone(), code));
+    }
+    if let Some(p) = pack {
+        p.write();
     }
     let code_seconds = t.elapsed().as_secs_f64();
 

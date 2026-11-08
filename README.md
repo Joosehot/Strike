@@ -58,7 +58,7 @@ own time goes.
 ## The universal compiler
 
 ```
-strike compile <file> [-o EXE] [--explain] [--no-brand]
+strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain]
 ```
 
 Strike's own compiler. It does not know any language itself. Every
@@ -129,23 +129,51 @@ Strike compiles 2.3 times as fast as clang -O0 and 7 times as fast as
 `go build`. Every executable gives the same answer as clang's, Go's or
 Python's own run.
 
-At this size a brand is slower to read than to compile, so brands do not
-help a compile this fast yet. Reading them from one file instead of one
-file per function is the next step.
+### The optimizing generator
 
-Running fib(36), the second and third runs:
+[src/uc/x64opt.rs](src/uc/x64opt.rs) is the default. `--plain` selects the
+first generator, which is kept as the reference.
 
-| | time |
-|---|---|
-| Strike's code (from C or Python) | 0.12 s |
-| clang -O0 | 0.06 s |
-| go | 0.06 s |
-| clang -O2 | 0.03 s |
-| python | 1.3 s |
+- **Values stay where they are.** The IR's stack is followed at compile
+  time: a constant, a local or a result in rax stays put until an operation
+  needs it. A comparison followed by a jump becomes one `cmp` and one
+  `jcc`. Only what must cross a call, a jump or a label is pushed.
+- **HotMotor chooses which locals live in registers.** The rule is in
+  [codegen.toml](codegen.toml). Every local offers two variants: one of the
+  seven callee-saved registers, or memory. The judge scores the memory
+  operations a register saves, with a use inside a loop weighted 8 times
+  per level, against the cost of saving the register. The beam keeps the
+  best choices.
+- **Brands live in one pack**, `~/.strike/uc/pack`. It is read whole once
+  per compile, and new brands are added at its end. The brand covers the
+  IR and the generator with its rules, so other rules give other code.
 
-Strike's code is still a plain stack machine. It runs 10 times as fast as
-Python, but half as fast as clang -O0 and Go. Keeping values in registers
-is the next step for the code generator.
+Every optimized program is checked against the plain one. One test writes
+40 random C programs, with up to six parameters, loops, every operator and
+calls between functions. Both generators must give the same output and
+the same exit code. The suites also still print what clang, Go and Python
+print.
+
+Running, the second and third runs:
+
+| | fib(36) | primes below 300 000 |
+|---|---|---|
+| **Strike, optimized** | **0.096 s** | **0.022 s** |
+| Strike, plain | 0.125 s | 0.043 s |
+| clang -O0 | 0.059 s | 0.021 s |
+| go | 0.059 s | 0.028 s |
+| clang -O2 | 0.031 s | 0.021 s |
+| python | 1.3 s | |
+
+In loops, Strike's code is now as fast as clang -O0 and faster than Go.
+Calls still go through the stack, which is why fib is 1.6 times as slow as
+clang -O0. Passing the arguments straight in registers is the next step.
+
+Compiling big.c (2000 functions) with the optimizing generator takes
+0.07 s, 3 runs. The code part takes 0.004 s when every function is struck
+from the pack, against 0.007-0.010 s when compiled. With the pack, a brand
+is now faster to strike than to compile. Most of the remaining time
+(0.04 s) is reading the file.
 
 ## fStrike: downloads
 
@@ -262,8 +290,8 @@ plugin passes an option the export does not show yet.
 
 ## Next
 
-1. The universal compiler: values in registers; floats, strings and
-   arrays; more languages as descriptions; brands read from one pack.
+1. The universal compiler: arguments in registers; floats, strings and
+   arrays; more languages as descriptions.
 2. More drivers: C/C++ (clang `-MD`, MSVC `/showIncludes`), CUDA
    (`nvcc -MD`), Go, TypeScript; the motor and the lightning do not depend
    on the language.

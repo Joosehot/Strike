@@ -1,4 +1,4 @@
-//! Strike IR to x86-64 machine code, written byte by byte (no assembler, no
+﻿//! Strike IR to x86-64 machine code, written byte by byte (no assembler, no
 //! LLVM). One pass over a function: the IR's stack is the machine's stack,
 //! and every slot has its place below rbp. Calls follow the Windows x64
 //! convention (rcx, rdx, r8, r9, 32 bytes of shadow space, rsp aligned to 16
@@ -26,56 +26,56 @@ pub struct Code {
 
 pub const IMPORTS: [&str; 3] = ["GetStdHandle", "WriteFile", "ExitProcess"];
 
-struct Asm {
-    b: Vec<u8>,
+pub(super) struct Asm {
+    pub(super) b: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, u32)>,
     relocs: Vec<(u32, Target)>,
 }
 
 impl Asm {
-    fn new() -> Asm {
+    pub(super) fn new() -> Asm {
         Asm { b: Vec::new(), labels: Vec::new(), fixups: Vec::new(), relocs: Vec::new() }
     }
-    fn e(&mut self, bytes: &[u8]) {
+    pub(super) fn e(&mut self, bytes: &[u8]) {
         self.b.extend_from_slice(bytes);
     }
-    fn d32(&mut self, v: i32) {
+    pub(super) fn d32(&mut self, v: i32) {
         self.b.extend_from_slice(&v.to_le_bytes());
     }
-    fn label(&mut self) -> u32 {
+    pub(super) fn label(&mut self) -> u32 {
         self.labels.push(None);
         self.labels.len() as u32 - 1
     }
-    fn bind(&mut self, l: u32) {
+    pub(super) fn bind(&mut self, l: u32) {
         self.labels[l as usize] = Some(self.b.len() as u32);
     }
     fn to(&mut self, l: u32) {
         self.fixups.push((self.b.len() as u32, l));
         self.d32(0);
     }
-    fn jmp(&mut self, l: u32) {
+    pub(super) fn jmp(&mut self, l: u32) {
         self.e(&[0xE9]);
         self.to(l);
     }
     /// jcc rel32; cc is the condition's low nibble (4 = z, 5 = nz, 9 = ns)
-    fn jcc(&mut self, cc: u8, l: u32) {
+    pub(super) fn jcc(&mut self, cc: u8, l: u32) {
         self.e(&[0x0F, 0x80 | cc]);
         self.to(l);
     }
-    fn reloc(&mut self, t: Target) {
+    pub(super) fn reloc(&mut self, t: Target) {
         self.relocs.push((self.b.len() as u32, t));
         self.d32(0);
     }
-    fn call(&mut self, symbol: &str) {
+    pub(super) fn call(&mut self, symbol: &str) {
         self.e(&[0xE8]);
         self.reloc(Target::Func(symbol.to_string()));
     }
-    fn call_import(&mut self, name: &str) {
+    pub(super) fn call_import(&mut self, name: &str) {
         self.e(&[0xFF, 0x15]);
         self.reloc(Target::Import(name.to_string()));
     }
-    fn finish(mut self) -> Code {
+    pub(super) fn finish(mut self) -> Code {
         for (at, l) in std::mem::take(&mut self.fixups) {
             let target = self.labels[l as usize].expect("every label is placed") as i64;
             let rel = (target - (at as i64 + 4)) as i32;
@@ -83,21 +83,21 @@ impl Asm {
         }
         Code { bytes: self.b, relocs: self.relocs }
     }
-    fn sub_rsp(&mut self, n: i32) {
+    pub(super) fn sub_rsp(&mut self, n: i32) {
         self.e(&[0x48, 0x81, 0xEC]);
         self.d32(n);
     }
-    fn add_rsp(&mut self, n: i32) {
+    pub(super) fn add_rsp(&mut self, n: i32) {
         self.e(&[0x48, 0x81, 0xC4]);
         self.d32(n);
     }
-    fn prologue(&mut self, frame: i32) {
+    pub(super) fn prologue(&mut self, frame: i32) {
         self.e(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
         if frame > 0 {
             self.sub_rsp(frame);
         }
     }
-    fn epilogue(&mut self) {
+    pub(super) fn epilogue(&mut self) {
         self.e(&[0x48, 0x89, 0xEC, 0x5D, 0xC3]); // mov rsp, rbp; pop rbp; ret
     }
 }
@@ -258,7 +258,7 @@ pub fn compile(f: &Func) -> Code {
 
 /// A call with `n` arguments on top of the stack (the first deepest); the
 /// stack is aligned for it and the arguments taken off after it.
-fn call(a: &mut Asm, sym: &str, n: u32, depth: &mut u32, push_result: bool) {
+pub(super) fn call(a: &mut Asm, sym: &str, n: u32, depth: &mut u32, push_result: bool) {
     let k = n.saturating_sub(4);
     let mut s = 32 + 8 * k;
     if (*depth + s / 8) % 2 == 1 {

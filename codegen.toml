@@ -1,0 +1,12 @@
+# HotMotor's rule for Strike's own machine code: which locals live in
+# registers. Every local offers two variants, a register (while one of the
+# seven callee-saved registers is free) or memory; the judge scores the
+# memory operations a register saves, and the beam keeps the best choices.
+
+# a use inside a loop counts this many times a use outside it, per level
+loop_weight = 8.0
+# saving and restoring a callee-saved register costs this many memory
+# operations
+save_cost = 2.0
+# how many partial choices the beam keeps
+beam = 4
