@@ -29,7 +29,7 @@ pub fn registry_dir() -> PathBuf {
     home().join("registry")
 }
 
-fn blob(hash: &str) -> PathBuf {
+pub(crate) fn blob(hash: &str) -> PathBuf {
     store_dir().join(&hash[..2]).join(hash)
 }
 
@@ -54,7 +54,7 @@ pub enum How {
 
 /// Moves a finished file into the store under its hash. A file already
 /// there (the same content) wins and the new one is dropped.
-fn keep(tmp: &Path, hash: &str) -> Result<(), String> {
+pub(crate) fn keep(tmp: &Path, hash: &str) -> Result<(), String> {
     let to = blob(hash);
     if to.exists() {
         let _ = std::fs::remove_file(tmp);
@@ -72,7 +72,7 @@ fn keep(tmp: &Path, hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_only(path: &Path, on: bool) {
+pub(crate) fn read_only(path: &Path, on: bool) {
     if let Ok(m) = std::fs::metadata(path) {
         let mut p = m.permissions();
         if p.readonly() != on {
@@ -98,7 +98,7 @@ pub fn put_bytes(bytes: &[u8]) -> Result<String, String> {
     Ok(hash)
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];

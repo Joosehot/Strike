@@ -80,6 +80,56 @@ again 0.00 s; the package folders deleted and struck back from Nimbus,
 without the network, 0.5 s. All 2002 files are byte for byte Cargo's own,
 and Nuome builds from them with no Cargo downloads at all.
 
+## ArcStrike: big folders to a nearby device
+
+```
+strike arc receive [--into DIR] [--port N]     on the device that takes
+strike arc devices                             who is on the network
+strike arc send <path> --to <device|host:port> [--streams N]
+```
+
+AirDrop for big things: games, engine installs, big projects, sent over the
+local network as fast as it allows, never sending what the receiver has.
+
+How it works:
+
+1. **Discovery.** A receiver announces its name, OS and port by UDP
+   broadcast every second (port 47821); `devices` and `send --to <name>`
+   listen for it.
+2. **Pairing and encryption.** Every connection is a Noise XX handshake
+   (X25519, ChaCha20-Poly1305, BLAKE2s); each device has its own key in
+   `~/.strike/arc/identity.key`. A device seen for the first time is shown on
+   both sides with the same six-digit code, taken from the handshake, and
+   both must accept; the key is then remembered in `peers.json`. A device not
+   accepted gets no file and no list of files.
+3. **Chunks.** The sender cuts every file into content-defined chunks
+   (FastCDC: 64 KiB to 1 MiB, about 256 KiB), each named by its BLAKE3 hash;
+   the file is named by its SHA-256, as everything in Nimbus is. A scan is
+   remembered by file size and time, so a resend reads only what changed.
+4. **Dedup.** The receiver answers the offer with the chunks it lacks. A file
+   already in its Nimbus costs nothing. A changed file takes its unchanged
+   chunks from the old version on the receiver's own disk (Nimbus keeps a
+   chunk index, `nimbus/chunks.idx`, of where each chunk lies), so an
+   insertion in the middle of a file sends only the chunks around it.
+5. **Streams.** The missing chunks go round several encrypted TCP streams
+   (4 by default); the receiver writes each straight to its places in the
+   files being made.
+6. **Resume.** Every chunk that arrives is logged. A cut transfer keeps its
+   files; the same folder sent again asks only for the rest.
+7. **Check and strike.** Every chunk is checked by its BLAKE3 on arrival,
+   every file by its SHA-256 before it enters Nimbus, then struck into the
+   target folder as a hard link (a copy onto another drive) and checked
+   once more.
+
+Struck files are read-only, as in all of Nimbus: a program that writes into
+its own files (a game patching itself) needs a copy, not a strike.
+
+Measured on one machine over 127.0.0.1 (two Nimbus homes, 4 files of 512 MB
+of random bytes): 2147.5 MB in 14.4 s with 4 streams (149 MB/s, more than
+gigabit Ethernet carries), 19.9 s with 1 stream; nothing changed 1.3 s, 0 MB
+sent; 1 MB overwritten in one file 2.5 s, 1.5 MB sent. Between two devices:
+see below when measured.
+
 ## JVM (Java and Kotlin)
 
 ```

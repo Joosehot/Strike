@@ -6,7 +6,9 @@
 //!   strike brand          every branded build
 //!   strike fetch <dir>    fStrike: the packages of a Cargo.lock
 //!   strike fetch <url> <file> [--sha256 HASH]
+//!   strike arc devices|receive|send   ArcStrike: folders to a nearby device
 
+mod arc;
 mod builder;
 mod fstrike;
 mod graph;
@@ -25,6 +27,9 @@ const USAGE: &str = "usage:
   strike jvm <export-dir> <out-dir>
   strike fetch <dir>
   strike fetch <url> <file> [--sha256 HASH]
+  strike arc devices
+  strike arc receive [--into DIR] [--port N] [--once]
+  strike arc send <path> --to <device|host:port> [--streams N]
   strike brand";
 
 fn main() -> ExitCode {
@@ -146,6 +151,51 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 fetched.iter().sum::<u64>() as f64 / 1e6,
                 start.elapsed().as_secs_f64(),
                 fstrike::registry_dir().display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "arc" => arc_command(&args[1..]),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// ArcStrike: `devices`, `receive`, `send`.
+fn arc_command(args: &[String]) -> Result<ExitCode, String> {
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    match args.first().map(String::as_str) {
+        Some("devices") => {
+            let found = arc::devices(std::time::Duration::from_secs(3))?;
+            for (name, (os, addr)) in &found {
+                println!("  {name:<24} {os:<8} {addr}");
+            }
+            println!("  {} devices", found.len());
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("receive") => {
+            let into = flag("--into").map(PathBuf::from).unwrap_or_else(|| {
+                let home = std::env::var_os("USERPROFILE").or(std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
+                home.join("Downloads")
+            });
+            let port = flag("--port").map(|p| p.parse().map_err(|_| "--port needs a number")).transpose()?.unwrap_or(arc::DEFAULT_PORT);
+            arc::receive(&into, port, args.iter().any(|a| a == "--once"))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("send") => {
+            let path = args.get(1).filter(|a| !a.starts_with("--")).ok_or("arc send <path> --to <device>")?;
+            let to = flag("--to").ok_or("arc send <path> --to <device>")?;
+            let streams = flag("--streams").map(|s| s.parse().map_err(|_| "--streams needs a number")).transpose()?.unwrap_or(4);
+            let stop = flag("--stop-after").map(|s| s.parse().map_err(|_| "--stop-after needs bytes")).transpose()?;
+            let r = arc::send(std::path::Path::new(path), &to, streams, stop)?;
+            println!(
+                "  sent {} files ({:.1} MB) to {}: {:.1} MB over the wire in {} chunks, {:.2} s (scan {:.2} s), {:.1} MB/s",
+                r.files,
+                r.bytes as f64 / 1e6,
+                r.peer,
+                r.sent_bytes as f64 / 1e6,
+                r.chunks_sent,
+                r.seconds,
+                r.scan_seconds,
+                r.bytes as f64 / 1e6 / r.seconds
             );
             Ok(ExitCode::SUCCESS)
         }
