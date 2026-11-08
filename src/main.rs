@@ -4,8 +4,11 @@
 //!   strike test  <dir> [--for build|run] [--rules FILE] [--explain]
 //!   strike jvm <export-dir> <out-dir>   a JVM build's compile tasks
 //!   strike brand          every branded build
+//!   strike fetch <dir>    fStrike: the packages of a Cargo.lock
+//!   strike fetch <url> <file> [--sha256 HASH]
 
 mod builder;
+mod fstrike;
 mod graph;
 mod jvm;
 mod lightning;
@@ -20,6 +23,8 @@ const USAGE: &str = "usage:
   strike build <dir> [--for build|run] [--rules FILE] [--explain]
   strike test  <dir> [--for build|run] [--rules FILE] [--explain]
   strike jvm <export-dir> <out-dir>
+  strike fetch <dir>
+  strike fetch <url> <file> [--sha256 HASH]
   strike brand";
 
 fn main() -> ExitCode {
@@ -112,6 +117,46 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             println!("  {} of {} from the brand, {built} built, {:.2} s; out: {}", r.done.len() - built, r.done.len(), r.seconds, r.out.display());
             Ok(ExitCode::SUCCESS)
         }
+        "fetch" => {
+            let start = std::time::Instant::now();
+            let Some(what) = args.get(1) else { return Err(USAGE.into()) };
+            if what.starts_with("https://") || what.starts_with("http://") {
+                let Some(dest) = args.get(2) else { return Err(USAGE.into()) };
+                let want = match args.get(3).map(String::as_str) {
+                    Some("--sha256") => Some(args.get(4).ok_or("--sha256 needs a hash")?.to_lowercase()),
+                    Some(s) => return Err(format!("unknown option {s}\n{USAGE}")),
+                    None => None,
+                };
+                let (hash, how) = fstrike::fetch_url(what, want.as_deref())?;
+                fstrike::strike_to(&hash, std::path::Path::new(dest))?;
+                println!("  {} {dest}  {}  {:.2} s", how_word(how), &hash[..12], start.elapsed().as_secs_f64());
+                return Ok(ExitCode::SUCCESS);
+            }
+            let jobs = 8;
+            let done = fstrike::fetch_lock(std::path::Path::new(what), jobs)?;
+            let fetched: Vec<u64> = done.iter().filter_map(|(_, h)| if let fstrike::How::Fetched(b) = h { Some(*b) } else { None }).collect();
+            for (name, how) in done.iter().filter(|(_, h)| *h != fstrike::How::Struck) {
+                println!("  {} {name}", how_word(*how));
+            }
+            println!(
+                "  {} packages: {} struck, {} fetched ({:.1} MB), {:.2} s; in {}",
+                done.len(),
+                done.len() - fetched.len(),
+                fetched.len(),
+                fetched.iter().sum::<u64>() as f64 / 1e6,
+                start.elapsed().as_secs_f64(),
+                fstrike::registry_dir().display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(USAGE.into()),
+    }
+}
+
+fn how_word(how: fstrike::How) -> &'static str {
+    match how {
+        fstrike::How::Struck => "struck ",
+        fstrike::How::NotModified => "same   ",
+        fstrike::How::Fetched(_) => "fetched",
     }
 }

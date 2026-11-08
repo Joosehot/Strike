@@ -23,7 +23,7 @@ A build system that calls the compiler itself. Two parts decide every build:
 
 Strike builds Rust packages with their dependencies. The versions come from
 Cargo.lock and the sources from the registry folder Cargo already
-downloaded (Strike does not resolve or fetch). Features are unified over
+downloaded, or from fStrike (below); Strike does not resolve. Features are unified over
 the graph. Build scripts are built and run, proc macros are built as
 libraries the compiler loads, and every job of the graph runs as soon as
 what it uses is done, on every core; a library built on another starts as
@@ -54,6 +54,31 @@ strike brand
 The output goes to `<dir>/strike-out/<profile>/`, the brands to
 `~/.strike/brand/` (or `STRIKE_HOME`). `STRIKE_TIMES=1` shows where Strike's
 own time goes.
+
+## fStrike: downloads
+
+```
+strike fetch <dir>                          the packages of <dir>/Cargo.lock
+strike fetch <url> <file> [--sha256 HASH]   one file
+```
+
+Every downloaded file is kept once in **Nimbus** (`~/.strike/nimbus/`),
+named by the hash of its content, read-only, and struck into place as a
+hard link: the same file under a second name, so nothing is copied.
+
+- A file whose hash is known before (Cargo.lock's checksum, or `--sha256`)
+  is struck from Nimbus without the network, and a download with another
+  hash is refused.
+- A plain URL is remembered with the server's version tag (ETag,
+  Last-Modified); the next fetch only asks whether it changed.
+- A package is unpacked file by file into Nimbus, so two versions share
+  every file they have in common, and struck into
+  `~/.strike/registry/<name>-<version>/`, where the build looks first.
+
+Measured on Nuome's 51 crates.io packages: empty Nimbus 3.0 s (6.6 MB);
+again 0.00 s; the package folders deleted and struck back from Nimbus,
+without the network, 0.5 s. All 2002 files are byte for byte Cargo's own,
+and Nuome builds from them with no Cargo downloads at all.
 
 ## JVM (Java and Kotlin)
 
@@ -90,8 +115,9 @@ plugin passes an option the export does not show yet.
 1. More drivers: C/C++ (clang `-MD`, MSVC `/showIncludes`), CUDA
    (`nvcc -MD`), Go, TypeScript; the motor and the lightning do not depend
    on the language.
-2. The missing Kotlin option, for all 4270 classes.
-3. Function order for the linker (`/ORDER`) from a wave grid like Devil's
+2. fStrike for more lockfiles: npm, pip, Gradle and Maven, Go.
+3. The missing Kotlin option, for all 4270 classes.
+4. Function order for the linker (`/ORDER`) from a wave grid like Devil's
    Clockwork's: every order is correct, only speed changes.
 
 MIT. © 2026 Joose Hotari.

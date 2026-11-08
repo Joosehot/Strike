@@ -119,9 +119,11 @@ impl Lightning {
 
     /// A file's content hash. A source file is hashed once per run and kept:
     /// the run does not write it. A file under Strike's own folders (a build
-    /// script's OUT_DIR) is made during the run, so it is hashed every time.
+    /// script's OUT_DIR) is made during the run, so it is hashed every time;
+    /// fStrike's packages are sources, made before the run.
     fn file_hash(&self, path: &Path) -> Option<String> {
-        let made_here = path.starts_with(&self.home) || path.components().any(|c| c.as_os_str() == "strike-out");
+        let made_here = (path.starts_with(&self.home) && !path.starts_with(self.home.join("registry")))
+            || path.components().any(|c| c.as_os_str() == "strike-out");
         if !made_here {
             if let Some(h) = self.hashes.lock().unwrap().get(path) {
                 return Some(h.clone());

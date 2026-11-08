@@ -281,7 +281,8 @@ fn read_lock(dir: &Path) -> Result<Vec<Locked>, String> {
     Ok(out)
 }
 
-/// The folders the registry's sources were unpacked to.
+/// The folders the registry's sources were unpacked to: fStrike's first,
+/// then Cargo's.
 fn registry_dirs() -> Vec<PathBuf> {
     let base = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -291,6 +292,7 @@ fn registry_dirs() -> Vec<PathBuf> {
         .join("src");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(base).into_iter().flatten().flatten().map(|e| e.path()).collect();
     dirs.sort();
+    dirs.insert(0, crate::fstrike::registry_dir());
     dirs
 }
 
@@ -348,7 +350,7 @@ pub fn resolve(root_dir: &Path, target: &Target, with_dev: bool) -> Result<Graph
                 .iter()
                 .map(|r| r.join(format!("{}-{}", l.name, l.version)))
                 .find(|d| d.join("Cargo.toml").exists())
-                .ok_or(format!("{} {} is not downloaded (Strike does not fetch yet; cargo fetch once)", l.name, l.version))?
+                .ok_or(format!("{} {} is not downloaded (strike fetch once)", l.name, l.version))?
         } else {
             dep.path.clone().ok_or(format!("{}: not from the registry and no path", l.name))?
         };
