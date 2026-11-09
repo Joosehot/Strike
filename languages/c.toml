@@ -21,7 +21,7 @@ statement_end = ";"
 scope = "block"
 entry = "main"
 param_name = "last"
-type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "extern", "const", "int64_t", "int32_t", "double", "float"]
+type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "extern", "const", "int64_t", "int32_t", "double", "float", "struct"]
 chained_comparisons = "allow"
 bool_print = []
 # integers as clang makes them on Windows (x86-64): long is 32 bits there.
@@ -47,6 +47,22 @@ strings = "c"
 [float_widths]
 double = 64
 float = 32
+
+# structs: laid out as clang lays them out (each field at the next multiple
+# of its alignment, the whole rounded up to the largest), held in place and
+# copied when assigned, given or returned; p->x through a pointer, &s and
+# *p of a struct; {1, 2} and {.x = 1} give the first values. sizeof and
+# offsetof count as clang counts.
+[records]
+model = "structs"
+type_intro = ["struct"]
+typedef = "typedef"
+arrow = "->"
+address_of = "&"
+deref = "*"
+keyed = "."
+sizeof = "sizeof"
+offsetof = "__builtin_offsetof"
 
 [builtins]
 strlen = "c_strlen"
@@ -75,6 +91,9 @@ predefined = "c-predefined.h"
 #define EOF (-1)
 """
 "string.h" = ""
+"stddef.h" = """
+#define offsetof(t, d) __builtin_offsetof(t, d)
+"""
 "math.h" = ""
 "stdlib.h" = """
 #define EXIT_SUCCESS 0
@@ -162,6 +181,29 @@ pattern = "$type $name ( $params ) ;"
 kind = "function"
 place = "top"
 pattern = "$type $name ( $params ) $block"
+
+[[form]]
+kind = "struct"
+place = "top"
+names = ["tag"]
+pattern = "struct $name { $fields } ;"
+
+[[form]]
+kind = "struct"
+place = "top"
+names = ["tag", "alias"]
+pattern = "typedef struct $name { $fields } $name ;"
+
+[[form]]
+kind = "struct"
+place = "top"
+names = ["alias"]
+pattern = "typedef struct { $fields } $name ;"
+
+[[form]]
+kind = "alias"
+place = "top"
+pattern = "typedef struct $name $name ;"
 
 [[form]]
 kind = "var"

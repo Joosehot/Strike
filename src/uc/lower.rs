@@ -17,7 +17,7 @@ use super::ir::{BinOp, Func, Op, UnOp};
 use super::lang::{FloatPrint, Lang, Strings, Style};
 use super::lex::FloatLit;
 use super::lib::{Elem, FloatElem, Printer, MAX_LEN};
-use super::parse::{Expr, FuncDef, Program, Stmt};
+use super::parse::{Expr, FuncDef, Program, Stmt, TypeDef};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -40,6 +40,12 @@ pub enum Ty {
     Unknown,
     /// a Python or Go string: the address of its length and its bytes
     Str,
+    /// a C or Go struct, by its name: the address of its fields, held in
+    /// place as an array is (Layout says where each field is)
+    Struct(String),
+    /// a Python object of the class: the address of its attributes, shared
+    /// by every name that holds it
+    Obj(String),
 }
 
 impl Ty {
@@ -48,6 +54,7 @@ impl Ty {
     pub fn bytes(&self) -> u64 {
         match self {
             Ty::Arr(e, w, n) => n * size(e, *w),
+            Ty::Struct(s) => layout(s).size,
             _ => 8,
         }
     }
@@ -75,8 +82,14 @@ impl Ty {
         match self {
             Ty::Slice(..) | Ty::Str => true,
             Ty::Arr(e, _, _) => e.zero_is_not_zero(),
+            Ty::Struct(s) => layout(s).fields.iter().any(|f| f.ty.zero_is_not_zero()),
             _ => false,
         }
+    }
+    /// Held where it is kept (an array, a struct): its value is its address,
+    /// and giving it a new home copies its bytes.
+    fn in_place(&self) -> bool {
+        matches!(self, Ty::Arr(..) | Ty::Struct(_))
     }
     fn describe(&self) -> String {
         match self {
@@ -89,8 +102,223 @@ impl Ty {
             Ty::List(..) => "a list".into(),
             Ty::Unknown => "an element not yet known".into(),
             Ty::Str => "a string".into(),
+            Ty::Struct(s) => format!("a struct {s}"),
+            Ty::Obj(c) => format!("an object of class {c}"),
         }
     }
+}
+
+/// A struct as C lays it out (clang on x86-64), and as Strike keeps a Go
+/// struct (Go does not show its layout; a float32 is held as a double).
+#[derive(Debug)]
+pub struct Layout {
+    pub size: u64,
+    pub align: u64,
+    pub fields: Vec<FieldL>,
+    /// Go's own size of it and whether it holds no pointers: what its
+    /// slices' capacities grow by
+    pub go: (i64, bool),
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldL {
+    pub name: String,
+    pub ty: Ty,
+    pub w: u8,
+    pub off: u64,
+}
+
+/// The program's structs: the struct each written type names ("struct P",
+/// C's tag, or "P"), and each one's layout.
+#[derive(Default)]
+struct Types {
+    names: HashMap<String, String>,
+    layouts: HashMap<String, std::rc::Rc<Layout>>,
+}
+
+thread_local! {
+    /// The structs of the program being lowered: a Ty names its struct, and
+    /// its size and fields are found here.
+    static TYPES: std::cell::RefCell<std::rc::Rc<Types>> = std::cell::RefCell::new(std::rc::Rc::new(Types::default()));
+}
+
+fn types() -> std::rc::Rc<Types> {
+    TYPES.with(|t| t.borrow().clone())
+}
+
+fn layout(name: &str) -> std::rc::Rc<Layout> {
+    types().layouts.get(name).cloned().unwrap_or_else(|| panic!("the struct {name} is laid out before it is used"))
+}
+
+/// The structs of the lowering that was going on before this one (the float
+/// library is lowered inside another program's lowering), given back when
+/// this one ends.
+struct Installed(std::rc::Rc<Types>);
+
+impl Drop for Installed {
+    fn drop(&mut self) {
+        let before = self.0.clone();
+        TYPES.with(|t| *t.borrow_mut() = before);
+    }
+}
+
+fn install(t: Types) -> Installed {
+    Installed(TYPES.with(|c| std::mem::replace(&mut *c.borrow_mut(), std::rc::Rc::new(t))))
+}
+
+/// Size and alignment of a value kept in memory: C's for a C struct (a
+/// field's own width), Strike's own for a Go struct.
+fn size_align(t: &Ty, w: u8, done: &HashMap<String, std::rc::Rc<Layout>>) -> (u64, u64) {
+    match t {
+        Ty::Arr(e, ew, n) => {
+            let (s, a) = size_align(e, *ew, done);
+            (s * n, a)
+        }
+        Ty::Struct(s) => {
+            let l = &done[s];
+            (l.size, l.align)
+        }
+        _ => {
+            let s = size(t, w);
+            (s, s)
+        }
+    }
+}
+
+/// Go's own size, alignment, and whether it holds no pointers.
+fn go_layout(t: &Ty, w: u8, done: &HashMap<String, std::rc::Rc<Layout>>) -> (i64, i64, bool) {
+    match t {
+        Ty::Struct(s) => {
+            let l = &done[s];
+            let align = l.fields.iter().map(|f| go_layout(&f.ty, f.w, done).1).max().unwrap_or(1);
+            (l.go.0, align, l.go.1)
+        }
+        Ty::Arr(e, ew, n) => {
+            let (s, a, ns) = go_layout(e, *ew, done);
+            (s * *n as i64, a, ns)
+        }
+        Ty::Str => (16, 8, false),
+        Ty::Slice(..) => (24, 8, false),
+        Ty::Ptr(..) => (8, 8, false),
+        _ => {
+            let (s, ns) = go_size(t, w);
+            (s, s, ns)
+        }
+    }
+}
+
+/// Every struct of the program laid out: its fields' types read as the
+/// language writes them, the fields placed in order, each at the next
+/// multiple of its alignment, the whole rounded up to the largest.
+fn lay_out(p: &Program, l: &Lang) -> Result<Types, E> {
+    let mut t = Types::default();
+    let Some(rec) = &l.records else { return Ok(t) };
+    if rec.classes {
+        return Ok(t);
+    }
+    let c = l.strings == Strings::C;
+    let mut defs: HashMap<String, &TypeDef> = HashMap::new();
+    for d in &p.types {
+        let canon = d.tag.clone().or(d.name.clone()).unwrap_or_default();
+        if defs.insert(canon.clone(), d).is_some() {
+            return Err((d.line, format!("the struct {canon} is defined twice")));
+        }
+        if let Some(g) = &d.tag {
+            t.names.insert(format!("struct {g}"), canon.clone());
+        }
+        if let Some(n) = &d.name {
+            if t.names.insert(n.clone(), canon.clone()).is_some() {
+                return Err((d.line, format!("{n} names two structs")));
+            }
+        }
+    }
+    for (a, b, line) in &p.aliases {
+        let Some(s) = t.names.get(&format!("struct {a}")).cloned() else {
+            return Err((*line, format!("struct {a} is not defined here; a typedef of a struct defined later is not in Strike yet")));
+        };
+        if t.names.insert(b.clone(), s).is_some() {
+            return Err((*line, format!("{b} names two types")));
+        }
+    }
+    // the field types: what each names, read with the struct names known
+    let mut fields: HashMap<String, Vec<(String, Ty, u8, u32)>> = HashMap::new();
+    let names_only = install(Types { names: t.names.clone(), layouts: HashMap::new() });
+    for (canon, d) in &defs {
+        if d.fields.is_empty() {
+            return Err((d.line, format!("a struct without fields ({canon}) is not in Strike yet")));
+        }
+        let mut seen = HashSet::new();
+        let mut v = Vec::new();
+        for f in &d.fields {
+            if !seen.insert(f.name.clone()) {
+                return Err((f.line, format!("{canon} has two fields named {}", f.name)));
+            }
+            let (mut ty, mut w) = type_of(l, &f.ty, l.bool_print.is_some()).map_err(|m| (f.line, m))?;
+            for d in f.dims.iter().rev() {
+                let n = match d.as_ref().and_then(constant) {
+                    Some(n) if n > 0 => n as u64,
+                    _ => return Err((f.line, "a field's array size is a constant of at least 1 in Strike".into())),
+                };
+                ty = Ty::Arr(Box::new(ty), w, n);
+                w = 64;
+            }
+            let (mut inner, mut iw) = (&ty, w);
+            while let Ty::Arr(e, ew, _) = inner {
+                (inner, iw) = (e, *ew);
+            }
+            if c && *inner == Ty::Float && iw == 32 {
+                return Err((f.line, "a float field is not in Strike yet: Strike holds a float as a double, so its 4 bytes are not where clang puts them".into()));
+            }
+            if iw == U8 {
+                return Err((f.line, "a byte field is not in Strike yet".into()));
+            }
+            if matches!(inner, Ty::Ptr(e, _) if !matches!(**e, Ty::Struct(_))) && !c {
+                return Err((f.line, "a pointer field to anything but a struct is not in Strike yet".into()));
+            }
+            v.push((f.name.clone(), ty, w, f.line));
+        }
+        fields.insert(canon.clone(), v);
+    }
+    drop(names_only);
+    // laid out in the order they need each other: a struct after the
+    // structs it holds (not those it only points at)
+    let mut done: HashMap<String, std::rc::Rc<Layout>> = HashMap::new();
+    fn holds(t: &Ty) -> Option<&str> {
+        match t {
+            Ty::Struct(s) => Some(s),
+            Ty::Arr(e, _, _) => holds(e),
+            _ => None,
+        }
+    }
+    let mut order: Vec<String> = fields.keys().cloned().collect();
+    order.sort();
+    while done.len() < fields.len() {
+        let ready = order.iter().find(|n| !done.contains_key(*n) && fields[*n].iter().all(|f| holds(&f.1).is_none_or(|h| done.contains_key(h)))).cloned();
+        let Some(n) = ready else {
+            let n = order.iter().find(|n| !done.contains_key(*n)).unwrap();
+            return Err((defs[n].line, format!("the struct {n} holds itself (only a pointer to it can be its field)")));
+        };
+        let mut off = 0u64;
+        let mut align = 1u64;
+        let mut ls = Vec::new();
+        let (mut go_off, mut go_align, mut noscan) = (0i64, 1i64, true);
+        for (name, ty, w, _) in &fields[&n] {
+            let (s, a) = size_align(ty, *w, &done);
+            off = off.div_ceil(a) * a;
+            ls.push(FieldL { name: name.clone(), ty: ty.clone(), w: *w, off });
+            off += s;
+            align = align.max(a);
+            let (gs, ga, gn) = go_layout(ty, *w, &done);
+            go_off = (go_off + ga - 1) / ga * ga + gs;
+            go_align = go_align.max(ga);
+            noscan &= gn;
+        }
+        let size = off.div_ceil(align) * align;
+        let go = ((go_off + go_align - 1) / go_align * go_align, noscan);
+        done.insert(n.clone(), std::rc::Rc::new(Layout { size, align, fields: ls, go }));
+    }
+    t.layouts = done;
+    Ok(t)
 }
 
 /// The width of Go's byte (uint8): its values are 0 to 255, so a value
@@ -125,7 +353,7 @@ fn size(e: &Ty, w: u8) -> u64 {
 /// in place (its address is its value).
 fn load_of(e: &Ty, w: u8) -> Option<Op> {
     match e {
-        Ty::Arr(..) => None,
+        Ty::Arr(..) | Ty::Struct(_) => None,
         _ => Some(Op::LoadM(size(e, w) as u8)),
     }
 }
@@ -237,7 +465,7 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
                 expr(b, out);
                 a.iter().for_each(|x| expr(x, out));
             }
-            Expr::Un(_, x) | Expr::Cast(_, x, _) => expr(x, out),
+            Expr::Un(_, x) | Expr::Cast(_, x, _) | Expr::Field(x, _, _) | Expr::Addr(x, _) | Expr::Deref(x, _) | Expr::Key(_, x, _) | Expr::SizeOf(x, _) => expr(x, out),
             Expr::Bin(_, a, b) | Expr::Index(a, b, _) => {
                 expr(a, out);
                 expr(b, out);
@@ -247,7 +475,7 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
                 expr(iter, out);
                 cond.iter().for_each(|x| expr(x, out));
             }
-            Expr::Num(..) | Expr::Float(_) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) => {}
+            Expr::Num(..) | Expr::Float(_) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) | Expr::SizeOfType(..) | Expr::OffsetOf(..) => {}
         }
     }
     fn walk(body: &[Stmt], out: &mut HashSet<String>) {
@@ -259,6 +487,10 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
                 }
                 Stmt::Assign { index, value, .. } => {
                     index.iter().for_each(|x| expr(x, out));
+                    expr(value, out);
+                }
+                Stmt::Set { target, value, .. } => {
+                    expr(target, out);
                     expr(value, out);
                 }
                 Stmt::If { cond, then, els } => {
@@ -310,6 +542,7 @@ fn calls_nothing(e: &Expr) -> bool {
 fn changes(body: &[Stmt], name: &str) -> bool {
     body.iter().any(|s| match s {
         Stmt::Assign { name: n, .. } | Stmt::Var { name: n, .. } | Stmt::Read { name: n, .. } if n == name => true,
+        Stmt::Set { target, .. } if target.root() == Some(name) => true,
         Stmt::If { then, els, .. } => changes(then, name) || changes(els, name),
         Stmt::While { body, .. } | Stmt::ForRange { body, .. } | Stmt::ForEach { body, .. } => changes(body, name),
         Stmt::For { init, step, body, .. } => changes(std::slice::from_ref(init), name) || changes(std::slice::from_ref(step), name) || changes(body, name),
@@ -472,6 +705,14 @@ fn width_of(l: &Lang, words: &[String]) -> Result<u8, String> {
 /// the address of elements, as C makes an array parameter). The kind and,
 /// for a number, its width.
 fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> {
+    // Go's *P: a pointer to a struct
+    if l.param_first && words.first().map(String::as_str) == Some("*") {
+        let (inner, _) = type_of(l, &words[1..], bools)?;
+        if !matches!(inner, Ty::Struct(_)) {
+            return Err("a pointer to anything but a struct is not in Strike yet".into());
+        }
+        return Ok((Ty::Ptr(Box::new(inner), 64), 64));
+    }
     if words.first().map(String::as_str) == Some("[") {
         // Go: the brackets, outermost first, then the element
         let close = words.iter().position(|w| w == "]").ok_or("a [ without its ]")?;
@@ -491,6 +732,16 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
     }
     let base_end = words.iter().position(|w| w == "[" || w == "*").unwrap_or(words.len());
     let base = &words[..base_end];
+    // a struct: C's struct P (or its typedef's name), Go's P
+    let named: Vec<&str> = base.iter().map(String::as_str).filter(|s| !matches!(*s, "static" | "const" | "register" | "volatile")).collect();
+    let key = named.join(" ");
+    let ts = types();
+    let strukt = match ts.names.get(&key) {
+        Some(s) => Some(Ty::Struct(s.clone())),
+        None if named.first() == Some(&"struct") => return Err(format!("{key} is not defined here")),
+        None if named.len() == 1 && ts.names.contains_key(&format!("struct {key}")) => return Err(format!("{key} is a struct's tag: C writes it struct {key}")),
+        None => None,
+    };
     if base.len() == 1 && base[0] == "string" && matches!(l.strings, Strings::Bytes | Strings::Ascii) {
         if base_end != words.len() {
             return Err("pointers are not in Strike yet (but arrays are)".into());
@@ -499,6 +750,7 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
     }
     let plain: Vec<&String> = base.iter().filter(|s| !matches!(s.as_str(), "static" | "const" | "register" | "volatile")).collect();
     let (scalar, w) = match base.iter().find_map(|b| l.float_widths.get(b).copied()) {
+        _ if strukt.is_some() => (strukt.unwrap(), 64),
         Some(_) if plain.len() > 1 => return Err(format!("the type {} is not in Strike yet", plain.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))),
         Some(fw) => (Ty::Float, fw),
         None => {
@@ -528,7 +780,7 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
         }
     }
     if !rest.is_empty() || stars > 1 || (stars > 0 && !dims.is_empty()) {
-        return Err("pointers are not in Strike yet (but arrays are)".into());
+        return Err("pointers are not in Strike yet (but arrays are, and a pointer to a struct)".into());
     }
     if stars == 1 {
         return Ok((Ty::Ptr(Box::new(scalar), w), 64));
@@ -559,6 +811,8 @@ fn go_size(t: &Ty, w: u8) -> (i64, bool) {
             let (s, ns) = go_size(e, *ew);
             (s * *n as i64, ns)
         }
+        Ty::Struct(s) => layout(s).go,
+        Ty::Ptr(..) => (8, false),
         _ => (24, false),
     }
 }
@@ -587,6 +841,9 @@ struct Shared<'a> {
     nil_slice: Option<u32>,
     /// the global words a float's digits are made in before they print
     float_buf: Option<u32>,
+    /// Python's classes, and their definitions by name
+    classes: &'a HashMap<String, Class>,
+    defs: &'a HashMap<String, TypeDef>,
 }
 
 struct Fx<'s, 'a> {
@@ -623,6 +880,14 @@ struct Fx<'s, 'a> {
     /// the bytes of the function's own memory (C's arrays, Go's arrays not sliced)
     frame: u32,
     sliced: HashSet<String>,
+    /// this function returns a struct: into the caller's memory, whose
+    /// address is its first parameter (slot 0)
+    sret: bool,
+    /// Go's names whose address is taken: their memory is new each time
+    escapes: HashSet<String>,
+    /// a Python method: the class it is called on and the class it is
+    /// written in
+    class_ctx: Option<(String, String)>,
 }
 
 impl Fx<'_, '_> {
@@ -744,7 +1009,7 @@ impl Fx<'_, '_> {
     }
     /// A variable's value: an array that is a global is its address.
     fn load_var(&mut self, slot: u32, ty: &Ty) {
-        if slot & GLOBAL != 0 && matches!(ty, Ty::Arr(..)) {
+        if slot & GLOBAL != 0 && ty.in_place() {
             self.emit(Op::AddrG(slot & !GLOBAL));
         } else {
             self.load(slot);
@@ -1378,7 +1643,7 @@ impl Fx<'_, '_> {
             // not zero (0.0 and -0.0 are false, NaN is true)
             Ty::Float => self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]),
             Ty::Str if self.sh.l.strings == Strings::Ascii => self.emit(Op::LoadM(8)),
-            Ty::Slice(..) | Ty::Arr(..) | Ty::Ptr(..) | Ty::Str => return self.err(format!("{} is not a condition", t.describe())),
+            Ty::Slice(..) | Ty::Arr(..) | Ty::Ptr(..) | Ty::Str | Ty::Struct(_) | Ty::Obj(_) => return self.err(format!("{} is not a condition in Strike", t.describe())),
             _ => {}
         }
         Ok(())
@@ -1413,7 +1678,7 @@ impl Fx<'_, '_> {
     /// slot `a`: a number cut to the element's width, a float made the
     /// element's kind, an array (held in place) copied in.
     fn put(&mut self, a: u32, t: &Ty, w: u8, vt: &Ty, from: u8) -> Result<(), E> {
-        if let Ty::Arr(..) = t {
+        if t.in_place() {
             let src = self.hidden();
             self.emit(Op::Store(src));
             self.ops(&[Op::Load(a), Op::Load(src), Op::Push(t.bytes() as i64)]);
@@ -1452,6 +1717,14 @@ impl Fx<'_, '_> {
                     Some(op) => self.assign_op(name, *op, value)?,
                     None => self.assign(name, value)?,
                 }
+            }
+            Stmt::Set { target, op, value, line } => {
+                self.line = *line;
+                self.set(target, *op, value)?;
+            }
+            Stmt::Class(c, line) => {
+                self.line = *line;
+                self.class_stmt(c)?;
             }
             Stmt::If { cond, then, els } => {
                 self.cond(cond)?;
@@ -1538,6 +1811,16 @@ impl Fx<'_, '_> {
                         }
                         if !t.scalar() && self.ret_ty.is_none() && self.typed() {
                             return self.err(format!("this function returns a number, not {}", t.describe()));
+                        }
+                        // a struct is returned in the caller's memory (slot 0)
+                        if let Ty::Struct(_) = &t {
+                            if !self.sret {
+                                return self.err(format!("this function returns a number, not {}", t.describe()));
+                            }
+                            let src = self.hidden();
+                            self.ops(&[Op::Store(src), Op::Load(0), Op::Load(src), Op::Push(t.bytes() as i64)]);
+                            self.lib("lib.copy", 3);
+                            self.ops(&[Op::Pop, Op::Load(0)]);
                         }
                         // a Go array is returned in new memory: the function's
                         // own is gone when it returns
@@ -1665,9 +1948,10 @@ impl Fx<'_, '_> {
 
     fn assign(&mut self, name: &str, value: &Expr) -> Result<(), E> {
         let known = self.lookup(name);
-        if let Some((slot, t @ Ty::Arr(..))) = &known {
-            // an array assigned whole: Go copies the elements in
-            if !self.checks() {
+        if let Some((slot, t @ (Ty::Arr(..) | Ty::Struct(_)))) = &known {
+            // an array assigned whole: Go copies the elements in (and a
+            // struct is copied in, in C too)
+            if !self.checks() && matches!(t, Ty::Arr(..)) {
                 return self.err("an array is not assigned whole in C");
             }
             let got = self.expr(value, true)?;
@@ -1773,8 +2057,9 @@ impl Fx<'_, '_> {
         let (mut dt, mut dw) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
         // a C pointer variable: only one given an array or a string to
         // point at (no arithmetic on it, no & or *)
-        if matches!(dt, Ty::Ptr(..)) && (value.is_none() || !dims.is_empty()) {
-            return self.err("pointer variables are not in Strike yet, but one given an array or a string to point at is");
+        let to_struct = matches!(&dt, Ty::Ptr(e, _) if matches!(**e, Ty::Struct(_)));
+        if matches!(dt, Ty::Ptr(..)) && ((value.is_none() && !to_struct) || !dims.is_empty()) {
+            return self.err("pointer variables are not in Strike yet, but one given an array or a string to point at is, and a pointer to a struct");
         }
         // C: int a[3][4]: the sizes after the name, the first outermost
         if !dims.is_empty() {
@@ -1804,6 +2089,15 @@ impl Fx<'_, '_> {
         if let Ty::Arr(..) = &dt {
             return self.var_array(name, dt, value);
         }
+        if let Ty::Struct(_) = &dt {
+            return self.var_struct(name, dt, value);
+        }
+        // Go's p := P{...}: a struct variable of the composite's type
+        if let (true, Some(Expr::Composite(cw, _, _))) = (words.is_empty(), value) {
+            if let Ok((t @ Ty::Struct(_), _)) = type_of(self.sh.l, cw, self.sh.bools) {
+                return self.var_struct(name, t, value);
+            }
+        }
         let twice = if self.globals_here { self.sh.globals.contains_key(name) } else { self.scopes.last().unwrap().contains_key(name) };
         if self.sh.l.block_scope && twice {
             return self.err(format!("{name} is declared twice in one block"));
@@ -1811,6 +2105,24 @@ impl Fx<'_, '_> {
         let ty = match value {
             Some(e) => {
                 let t = self.value(e)?;
+                // a struct given whole: the variable's own copy (a global's
+                // in its own words)
+                if let Ty::Struct(_) = &t {
+                    if self.globals_here {
+                        let src = self.hidden();
+                        self.emit(Op::Store(src));
+                        let words = u32::try_from(t.words()).ok().filter(|w| *w < 1 << 26).ok_or((self.line, "a global struct this large is not in Strike yet".to_string()))?;
+                        if self.sh.globals.contains_key(name) {
+                            return self.err(format!("{name} is declared twice"));
+                        }
+                        let g = self.declare_words(name, t.clone(), words);
+                        let a = self.hidden();
+                        self.ops(&[Op::AddrG(g & !GLOBAL), Op::Store(a), Op::Load(src)]);
+                        return self.put(a, &t, 64, &t, 64);
+                    }
+                    let own = !self.escapes.contains(name);
+                    self.copy_to_new(&t, own)?;
+                }
                 let from = self.last_w;
                 if !words.is_empty() && (!dt.scalar() || !t.scalar()) && unify(&dt, &t).is_none() && !decays(&t, &dt) {
                     return self.err(format!("{name} is {}; it is given {}", dt.describe(), t.describe()));
@@ -1873,9 +2185,7 @@ impl Fx<'_, '_> {
             let a = self.hidden();
             self.emit(Op::AddrG(g & !GLOBAL));
             self.emit(Op::Store(a));
-            if t.zero_is_not_zero() {
-                self.fill_zero(a, &t, words);
-            }
+            self.fix_zero(a, &t)?;
             if let Some(v) = value {
                 self.init_array(a, &t, v)?;
             }
@@ -1884,7 +2194,7 @@ impl Fx<'_, '_> {
         if self.scopes.last().unwrap().contains_key(name) {
             return self.err(format!("{name} is declared twice in one block"));
         }
-        let own = !self.sliced.contains(name);
+        let own = !self.sliced.contains(name) && !self.escapes.contains(name);
         self.memory_for(&t, own)?;
         let slot = self.declare(name, t.clone());
         self.store(slot);
@@ -1893,7 +2203,7 @@ impl Fx<'_, '_> {
         // Go gives zeros every time the declaration runs; C gives them only
         // with an initializer (its other elements are zero)
         if self.checks() || value.is_some() {
-            self.fill_zero(a, &t, words);
+            self.clear(a, &t)?;
         }
         if let Some(v) = value {
             self.init_array(a, &t, v)?;
@@ -1953,6 +2263,8 @@ impl Fx<'_, '_> {
         match (e, x) {
             (Ty::Arr(..), Expr::Brace(..)) => self.init_array(at, e, x),
             (Ty::Arr(..), Expr::Str(_)) if self.sh.l.strings == Strings::C => self.init_array(at, e, x),
+            (Ty::Struct(_), Expr::Brace(..) | Expr::Composite(..)) => self.init_struct(at, e, x),
+            (_, Expr::Key(..)) => self.err("a key in an array's or a slice's elements is not in Strike yet"),
             (Ty::Slice(ie, iw), Expr::Brace(inner, _)) => {
                 let (ie, iw) = ((**ie).clone(), *iw);
                 self.composite_slice(&ie, iw, inner)?;
@@ -1963,7 +2275,7 @@ impl Fx<'_, '_> {
                 let t = self.value(x)?;
                 let from = self.last_w;
                 let numbers = e.scalar() && t.scalar() && (*e == Ty::Float || t == Ty::Float || !self.sh.bools);
-                if unify(e, &t).is_none() && !numbers {
+                if unify(e, &t).is_none() && !numbers && !decays(&t, e) {
                     return self.err(format!("an element is {}, given {}", e.describe(), t.describe()));
                 }
                 self.put(at, e, w, &t, from)
@@ -1980,7 +2292,9 @@ impl Fx<'_, '_> {
         self.emit(Op::Store(h));
         let data = self.hidden();
         self.ops(&[Op::Load(h), Op::LoadM(8), Op::Store(data)]);
-        if e.zero_is_not_zero() {
+        if holds_struct(e) {
+            self.fix_each(data, e, w, &[Op::Push(n)])?;
+        } else if e.zero_is_not_zero() {
             self.fill_zero(data, e, n as u64 * e.words());
         }
         for (i, x) in elems.iter().enumerate() {
@@ -2096,9 +2410,17 @@ impl Fx<'_, '_> {
             None
         };
         let (e, w) = self.elem_addr(&target, last)?;
+        self.store_at(&target, e, w, op, value, early)
+    }
+
+    /// The value (or op= value) stored where the address on top points,
+    /// an element of kind e and width w of the container (whose elements'
+    /// kind Python learns from it); `early`: the value already worked out
+    /// (Python's order), in its slot.
+    fn store_at(&mut self, target: &Expr, e: Ty, w: u8, op: Option<BinOp>, value: &Expr, early: Option<(Ty, u32, u8)>) -> Result<(), E> {
         // a number or an address goes straight to where the address on the
         // stack points
-        if op.is_none() && !matches!(e, Ty::Arr(..)) {
+        if op.is_none() && !e.in_place() {
             let (t, from) = match early {
                 Some((t, v, from)) => {
                     self.emit(Op::Load(v));
@@ -2109,7 +2431,7 @@ impl Fx<'_, '_> {
                     (t, self.last_w)
                 }
             };
-            self.elem_kind(&target, &e, &t)?;
+            self.elem_kind(target, &e, &t)?;
             if e.whole() && t.whole() {
                 if from == 0 {
                     self.narrow(w, from)?;
@@ -2145,7 +2467,7 @@ impl Fx<'_, '_> {
                         (t, self.last_w)
                     }
                 };
-                self.elem_kind(&target, &e, &t)?;
+                self.elem_kind(target, &e, &t)?;
                 self.put(a, &e, w, &t, from)
             }
             Some(op) => {
@@ -2178,12 +2500,27 @@ impl Fx<'_, '_> {
     /// An element of the container `c` is given a value of kind t: Python
     /// learns the container's elements from it.
     fn elem_kind(&mut self, c: &Expr, e: &Ty, t: &Ty) -> Result<(), E> {
-        if unify(e, t).is_some() || (e.scalar() && t.scalar() && !self.sh.bools) {
+        // a typed language converts a number to its element's type (or
+        // refuses it) where it is stored
+        if unify(e, t).is_some() || decays(t, e) || (e.scalar() && t.scalar() && (!self.sh.bools || self.typed())) {
             if let Expr::Var(n, _) = c {
                 if let Some((_, ct @ Ty::List(_))) = self.lookup(n) {
                     let _ = ct;
                     let n = n.clone();
                     self.refine(&n, &Ty::List(Box::new(t.clone())))?;
+                }
+            }
+            // a list an object's attribute holds: the attribute learns it
+            if let (Expr::Field(b, a, _), true) = (c, self.classes()) {
+                let (code, slots, labels) = (self.code.len(), self.slots, self.labels);
+                let bt = self.expr(b, true)?;
+                self.code.truncate(code);
+                (self.slots, self.labels) = (slots, labels);
+                if let Ty::Obj(k) = bt {
+                    let was = self.attr_kind(&k, a);
+                    if let Some(now) = unify(&was, &Ty::List(Box::new(t.clone()))) {
+                        self.saw(Self::attr_key(&k, a), now);
+                    }
                 }
             }
             return Ok(());
@@ -2260,6 +2597,12 @@ impl Fx<'_, '_> {
             self.ops(&[Op::Load(i), Op::Push(size(&e, ew) as i64), Op::Bin(BinOp::Mul), Op::Bin(BinOp::Add)]);
             match load_of(&e, ew) {
                 Some(l) => self.emit(l),
+                // a struct element: the value is a copy of it, the loop's
+                // own (new each time round where Go takes its address)
+                None if matches!(e, Ty::Struct(_)) => {
+                    let own = !value.is_some_and(|v| self.escapes.contains(v));
+                    self.copy_to_new(&e, own)?;
+                }
                 // an array element: the value is a copy of it
                 None => self.copy_new(&e)?,
             }
@@ -2292,6 +2635,11 @@ impl Fx<'_, '_> {
     }
 
     fn print_value(&mut self, e: &Expr) -> Result<(), E> {
+        self.print_value_as(e, false)
+    }
+
+    /// print_value; plus: Go's %+v, a struct's fields by their names.
+    fn print_value_as(&mut self, e: &Expr, plus: bool) -> Result<(), E> {
         if let Expr::Str(s) = e {
             // Python writes its strings in the encoding of where they go,
             // which is not known while compiling
@@ -2317,7 +2665,7 @@ impl Fx<'_, '_> {
                 if !self.checks() {
                     return self.err("C does not print an array");
                 }
-                let f = self.printer(&t);
+                let f = self.printer_plus(&t, plus)?;
                 self.emit(Op::Call(f, 1));
                 self.emit(Op::Pop);
             }
@@ -2325,6 +2673,15 @@ impl Fx<'_, '_> {
                 self.lib("lib.str_print", 1);
                 self.emit(Op::Pop);
             }
+            (_, Ty::Struct(_)) if self.checks() => self.print_struct(&t, plus)?,
+            (_, Ty::Ptr(p, _)) if self.checks() && matches!(**p, Ty::Struct(_)) => self.print_struct(&t, plus)?,
+            (_, Ty::Obj(c)) => {
+                let c = c.clone();
+                self.obj_text(&c, false)?;
+                self.lib("lib.str_print", 1);
+                self.emit(Op::Pop);
+            }
+            (_, Ty::Struct(_)) => return self.err("C does not print a struct"),
             (_, Ty::Ptr(..)) => return self.err("a pointer is not printed"),
             (_, Ty::Float) => {
                 let f32 = self.last_w == 32;
@@ -2336,17 +2693,38 @@ impl Fx<'_, '_> {
     }
 
     /// The library function that prints a list, slice or array of kind t.
-    fn printer(&mut self, t: &Ty) -> String {
-        let name = format!("lib.print.{t:?}");
+    fn printer(&mut self, t: &Ty) -> Result<String, E> {
+        self.printer_plus(t, false)
+    }
+
+    /// printer; plus: its structs print their fields' names (Go's %+v).
+    fn printer_plus(&mut self, t: &Ty, plus: bool) -> Result<String, E> {
+        let name = format!("lib.print.{t:?}{}", if plus { "+" } else { "" });
         if self.sh.printers.contains_key(&name) {
-            return name;
+            return Ok(name);
         }
         let (e, ew) = t.elem().unwrap();
         let elem = match &e {
             Ty::Bool => Elem::Bool,
             Ty::Float => Elem::Float(FloatElem { f32: ew == 32, repr: self.sh.l.float_print == Some(FloatPrint::Repr), buf: self.float_buf() }),
-            Ty::List(_) | Ty::Slice(..) => Elem::Nested(self.printer(&e), false),
-            Ty::Arr(..) => Elem::Nested(self.printer(&e), true),
+            Ty::List(_) | Ty::Slice(..) => Elem::Nested(self.printer_plus(&e, plus)?, false),
+            Ty::Arr(..) => Elem::Nested(self.printer_plus(&e, plus)?, true),
+            Ty::Struct(s) => {
+                self.printed_plainly(s)?;
+                Elem::Nested(self.struct_printer(s, plus)?, true)
+            }
+            // Python shows an object in a list by its __repr__
+            Ty::Obj(c) => {
+                let Some(d) = self.resolve(c, "__repr__") else {
+                    return self.err(format!("a list shows an object of class {c} by its __repr__, and {c} has none: it would print an address, which Strike cannot give as Python does"));
+                };
+                let f = instance(c, &d, "__repr__");
+                if self.sh.sigs.get(&f).is_some_and(|s| s.ret != Ty::Str && s.ret != Ty::Unknown) {
+                    return self.err(format!("{f} returns something other than a string (TypeError)"));
+                }
+                Elem::Repr(symbol(&f))
+            }
+            Ty::Ptr(..) => return self.err("a pointer in a slice prints as its address, which Strike cannot give as Go does"),
             // Python shows a string in a list as its repr, Go as it is
             Ty::Str => Elem::Str(self.sh.l.strings == Strings::Ascii),
             _ => Elem::Int,
@@ -2362,9 +2740,10 @@ impl Fx<'_, '_> {
             sep: sep.into_bytes(),
             close: close.into_bytes(),
             words: self.sh.l.bool_print.clone().map(|(a, b)| (a.into_bytes(), b.into_bytes())),
+            fields: None,
         };
         self.sh.printers.insert(name.clone(), p);
-        name
+        Ok(name)
     }
 
     /// The text whose value is on top printed: a Python or Go string, or
@@ -2385,6 +2764,7 @@ impl Fx<'_, '_> {
     fn unsigned(&self, e: &Expr) -> bool {
         match e {
             Expr::Call(n, _, _) => !self.sh.sigs.contains_key(n) && self.sh.l.builtins.get(n).map(String::as_str) == Some("c_strlen"),
+            Expr::SizeOf(..) | Expr::SizeOfType(..) | Expr::OffsetOf(..) => true,
             Expr::Bin(op, a, b) if !op.is_comparison() && !matches!(op, BinOp::AndBool | BinOp::OrBool) => self.unsigned(a) || self.unsigned(b),
             Expr::Un(UnOp::Neg | UnOp::Plus | UnOp::Bnot, x) => self.unsigned(x),
             _ => false,
@@ -2463,6 +2843,11 @@ impl Fx<'_, '_> {
                         }
                         prec = Some(p);
                     }
+                    // Go's %+v: a struct's fields by their names
+                    let plus = self.sh.l.printf_go == Some(true) && f.get(i) == Some(&b'+') && f.get(i + 1) == Some(&b'v');
+                    if plus {
+                        i += 1;
+                    }
                     let mut sized = false;
                     while matches!(f.get(i), Some(&b'l') | Some(&b'z')) {
                         sized |= f[i] == b'z';
@@ -2493,7 +2878,7 @@ impl Fx<'_, '_> {
                             }
                             self.emit(Op::PrintInt);
                         }
-                        b'v' => self.print_value(a)?,
+                        b'v' => self.print_value_as(a, plus)?,
                         b'f' | b'e' | b'E' | b'g' | b'G' if self.sh.l.printf_go.is_some() => {
                             if matches!(a, Expr::Str(_)) {
                                 return self.err(format!("%{} is given a string", spec as char));
@@ -2521,7 +2906,7 @@ impl Fx<'_, '_> {
                                     inner = &**e;
                                 }
                                 if self.sh.l.strings == Strings::Bytes && t != Ty::Str && *inner == Ty::Str {
-                                    let f = self.printer(&t);
+                                    let f = self.printer(&t)?;
                                     self.emit(Op::Call(f, 1));
                                     self.emit(Op::Pop);
                                 } else {
@@ -2614,7 +2999,11 @@ impl Fx<'_, '_> {
                 self.ops(&[Op::Load(ns), Op::Load(cs), Op::Push(size(&e, ew) as i64)]);
                 self.lib("lib.slice_new", 3);
                 self.emit(Op::Store(h));
-                if e.zero_is_not_zero() {
+                if holds_struct(&e) {
+                    let d = self.hidden();
+                    self.ops(&[Op::Load(h), Op::LoadM(8), Op::Store(d)]);
+                    self.fix_each(d, &e, ew, &[Op::Load(cs)])?;
+                } else if e.zero_is_not_zero() {
                     let (d, all, z) = (self.hidden(), self.hidden(), self.hidden());
                     self.ops(&[Op::Load(h), Op::LoadM(8), Op::Store(d)]);
                     self.ops(&[Op::Load(cs), Op::Push((size(&e, ew) / 8) as i64), Op::Bin(BinOp::Mul), Op::Store(all)]);
@@ -2763,6 +3152,7 @@ impl Fx<'_, '_> {
                         self.emit(Op::Label(end));
                     }
                     t if t.scalar() => self.lib("lib.int_str", 1),
+                    Ty::Obj(c) => self.obj_text(&c, false)?,
                     t => return self.err(format!("str of {} is not in Strike yet", t.describe())),
                 }
                 self.last_w = 64;
@@ -2952,7 +3342,7 @@ impl Fx<'_, '_> {
             }
             Expr::Method(base, name, args, line) => {
                 self.line = *line;
-                self.method(base, name, args)?
+                self.method(base, name, args, used)?
             }
             Expr::List(elems, line) => {
                 self.line = *line;
@@ -2991,9 +3381,18 @@ impl Fx<'_, '_> {
                         self.memory_for(&t, false)?;
                         self.emit(Op::Store(a));
                         if t.zero_is_not_zero() {
-                            self.fill_zero(a, &t, t.words());
+                            self.clear(a, &t)?;
                         }
                         self.init_array(a, &t, e)?;
+                        self.emit(Op::Load(a));
+                    }
+                    // a struct: made in the function's own memory, where
+                    // whatever takes it copies it from
+                    Ty::Struct(_) => {
+                        let a = self.hidden();
+                        self.memory_for(&t, true)?;
+                        self.emit(Op::Store(a));
+                        self.init_struct(a, &t, e)?;
                         self.emit(Op::Load(a));
                     }
                     _ => return self.err("this composite literal is not in Strike yet"),
@@ -3003,7 +3402,45 @@ impl Fx<'_, '_> {
             }
             Expr::Brace(_, line) => {
                 self.line = *line;
-                return self.err("a {...} list is only an array's initializer");
+                return self.err("a {...} list is only an array's or a struct's initializer");
+            }
+            Expr::Field(base, name, line) => {
+                self.line = *line;
+                if self.classes() {
+                    return self.attr_read(base, name);
+                }
+                let (t, w) = self.field_addr(base, name)?;
+                if let Some(l) = load_of(&t, w) {
+                    self.emit(l);
+                }
+                self.last_w = if t.scalar() { w } else { 64 };
+                t
+            }
+            Expr::Addr(x, line) => {
+                self.line = *line;
+                self.addr_of(x)?
+            }
+            Expr::Deref(x, line) => {
+                self.line = *line;
+                let t = self.expr(x, true)?;
+                match t {
+                    Ty::Ptr(e, _) if matches!(*e, Ty::Struct(_)) => {
+                        self.nil_check();
+                        self.last_w = 64;
+                        *e
+                    }
+                    t => return self.err(format!("* of {} is not in Strike yet (only a pointer to a struct is followed)", t.describe())),
+                }
+            }
+            Expr::Key(n, _, line) => {
+                self.line = *line;
+                return self.err(format!("{n}: a field is named so only in a struct's {{...}}"));
+            }
+            Expr::SizeOfType(..) | Expr::SizeOf(..) | Expr::OffsetOf(..) => {
+                let n = self.size_of(e)?;
+                self.emit(Op::Push(n as i64));
+                self.last_w = 64;
+                Ty::Int
             }
             Expr::Type(_, line) => {
                 self.line = *line;
@@ -3067,50 +3504,16 @@ impl Fx<'_, '_> {
                     }
                 }
                 let Some(sig) = self.sh.sigs.get(name).cloned() else {
+                    // Python's P(...): a new object of the class
+                    if self.class(name).is_some() && self.lookup(name).is_none() {
+                        return self.construct(name, args, *line);
+                    }
                     if let Some(what) = self.sh.l.builtins.get(name).cloned() {
                         return self.builtin(&what, name, args);
                     }
                     return self.err(format!("there is no function {name}"));
                 };
-                if sig.params.len() != args.len() {
-                    return self.err(format!("{name} takes {} values, given {}", sig.params.len(), args.len()));
-                }
-                let mut tys = Vec::new();
-                let (pw, rw) = self.sh.fw.get(name).cloned().unwrap_or_default();
-                for (i, a) in args.iter().enumerate() {
-                    // a Go array is copied by the function it is given to
-                    let t = self.expr(a, true)?;
-                    let want = sig.params[i].clone();
-                    if !want.scalar() || !t.scalar() {
-                        if unify(&want, &t).is_none() && !decays(&t, &want) {
-                            return self.err(format!("{name}'s parameter {} is {}, given {}", i + 1, want.describe(), t.describe()));
-                        }
-                        if let (Expr::Var(n, _), Ty::List(_)) = (a, &t) {
-                            let n = n.clone();
-                            self.refine(&n, &want)?;
-                        }
-                    } else {
-                        // an argument is converted to its parameter's type
-                        let from = self.last_w;
-                        let w = pw.get(i).copied().unwrap_or(64);
-                        if want == Ty::Float || t == Ty::Float {
-                            self.convert(&want, w, &t, from)?;
-                        } else {
-                            self.narrow(w, from)?;
-                        }
-                    }
-                    tys.push(t);
-                }
-                let seen = self.sh.args.entry(name.clone()).or_insert_with(|| vec![Vec::new(); args.len()]);
-                for (i, t) in tys.into_iter().enumerate() {
-                    seen[i].push(t);
-                }
-                if used {
-                    self.sh.used.push((name.clone(), *line));
-                }
-                self.emit(Op::Call(symbol(name), args.len() as u32));
-                self.last_w = if rw == 0 || !sig.ret.scalar() { 64 } else { rw };
-                sig.ret
+                self.call_sig(name, &sig, None, args, *line, used)?
             }
             Expr::Un(op, x) => {
                 if *op == UnOp::Not {
@@ -3191,6 +3594,15 @@ impl Fx<'_, '_> {
                     // C's size_t (strlen): divided and shifted unsigned, which
                     // Strike does not do yet; compared unsigned below
                     let uns = self.sh.l.strings == Strings::C && (self.unsigned(a) || self.unsigned(b));
+                    // sizes known while compiling (sizeof a / sizeof a[0]):
+                    // worked out as the unsigned numbers they are
+                    if uns && matches!(op, BinOp::DivTrunc | BinOp::ModTrunc | BinOp::Shr) {
+                        if let Some(v) = self.size_const(e)? {
+                            self.emit(Op::Push(v as i64));
+                            self.last_w = 64;
+                            return Ok(Ty::Int);
+                        }
+                    }
                     if uns && matches!(op, BinOp::DivTrunc | BinOp::ModTrunc | BinOp::Shr) {
                         return self.err("strlen's size is unsigned, and unsigned division and shifts are not in Strike yet (store it in an int first)");
                     }
@@ -3475,15 +3887,25 @@ impl Fx<'_, '_> {
     }
 
     /// x.name(args): Python's list methods.
-    fn method(&mut self, base: &Expr, name: &str, args: &[Expr]) -> Result<Ty, E> {
+    fn method(&mut self, base: &Expr, name: &str, args: &[Expr], used: bool) -> Result<Ty, E> {
+        let line = self.line;
         // Go's package.name(...): a package is not a variable
         if let Expr::Var(pkg, _) = base {
-            if !self.sh.l.qualified.is_empty() && self.lookup(pkg).is_none() {
+            if !self.sh.l.qualified.is_empty() && self.lookup(pkg).is_none() && self.class(pkg).is_none() {
                 let key = format!("{pkg}.{name}");
                 let Some(what) = self.sh.l.qualified.get(&key).cloned() else {
                     return self.err(format!("{key} is not in Strike yet"));
                 };
                 return self.builtin(&what, &key, args);
+            }
+        }
+        // a Go struct's method; a Python object's
+        if self.sh.l.records.is_some() && !self.classes() {
+            return self.struct_method(base, name, args, line, used);
+        }
+        if self.classes() {
+            if let Some(t) = self.obj_method(base, name, args, line, used)? {
+                return Ok(t);
             }
         }
         let Some(what) = self.sh.l.methods.get(name).cloned() else {
@@ -3586,7 +4008,1056 @@ impl Fx<'_, '_> {
     }
 }
 
+/// Go's stop where a nil pointer is followed (exit code 2, as Go's panic).
+const NIL: &[u8] = b"panic: runtime error: invalid memory address or nil pointer dereference\n";
+
+/// A Python class: its base, the attributes its objects are given (by any
+/// method of it or of a base), its own methods and its own attributes.
+#[derive(Debug, Default, Clone)]
+pub struct Class {
+    base: Option<String>,
+    attrs: Vec<String>,
+    methods: HashSet<String>,
+    class_attrs: Vec<String>,
+}
+
+/// The most attributes an object has: which are set is one word of bits.
+const MAX_ATTRS: usize = 63;
+
+/// The name of the method m of class d, called on an object of class r
+/// (d is r or one of its bases): each is lowered for the class it is
+/// called on, so self's attributes are where r keeps them.
+fn instance(r: &str, d: &str, m: &str) -> String {
+    if r == d {
+        format!("{r}.{m}")
+    } else {
+        format!("{r}.{m}@{d}")
+    }
+}
+
+/// Does the kind hold a struct anywhere in itself (not through a pointer)?
+fn holds_struct(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(_) => true,
+        Ty::Arr(e, _, _) => holds_struct(e),
+        _ => false,
+    }
+}
+
+/// The bytes C gives a value of kind t and width w (sizeof): a float its
+/// own 4 where Strike holds it as a double.
+fn c_size(t: &Ty, w: u8) -> u64 {
+    match t {
+        Ty::Float => w as u64 / 8,
+        Ty::Arr(e, ew, n) => n * c_size(e, *ew),
+        Ty::Struct(s) => layout(s).size,
+        Ty::Ptr(..) | Ty::Str => 8,
+        _ => (bits(w) as u64 / 8).max(1),
+    }
+}
+
+/// The names of a Go body whose address is taken (&v, or a method that
+/// wants a pointer called on v, or on an element or field of it): their
+/// memory must outlive the call and be new each time they are declared, as
+/// Go's escape analysis puts them on the heap.
+fn escaping_names(body: &[Stmt], ptr_methods: &HashSet<String>) -> HashSet<String> {
+    fn expr(e: &Expr, pm: &HashSet<String>, out: &mut HashSet<String>) {
+        match e {
+            Expr::Addr(x, _) => {
+                if let Some(n) = x.root() {
+                    out.insert(n.to_string());
+                }
+                expr(x, pm, out);
+            }
+            Expr::Method(b, m, a, _) => {
+                if pm.contains(m) {
+                    if let Some(n) = b.root() {
+                        out.insert(n.to_string());
+                    }
+                }
+                expr(b, pm, out);
+                a.iter().for_each(|x| expr(x, pm, out));
+            }
+            Expr::Call(_, a, _) | Expr::List(a, _) | Expr::Brace(a, _) | Expr::Composite(_, a, _) => a.iter().for_each(|x| expr(x, pm, out)),
+            Expr::Un(_, x) | Expr::Cast(_, x, _) | Expr::Field(x, _, _) | Expr::Deref(x, _) | Expr::Key(_, x, _) | Expr::SizeOf(x, _) => expr(x, pm, out),
+            Expr::Bin(_, a, b) | Expr::Index(a, b, _) => {
+                expr(a, pm, out);
+                expr(b, pm, out);
+            }
+            Expr::Slice(b, lo, hi, _) => {
+                expr(b, pm, out);
+                lo.iter().chain(hi.iter()).for_each(|x| expr(x, pm, out));
+            }
+            Expr::Comp { elem, iter, cond, .. } => {
+                expr(elem, pm, out);
+                expr(iter, pm, out);
+                cond.iter().for_each(|x| expr(x, pm, out));
+            }
+            _ => {}
+        }
+    }
+    fn walk(body: &[Stmt], pm: &HashSet<String>, out: &mut HashSet<String>) {
+        for s in body {
+            match s {
+                Stmt::Var { value, .. } => value.iter().for_each(|x| expr(x, pm, out)),
+                Stmt::Assign { index, value, .. } => {
+                    index.iter().for_each(|x| expr(x, pm, out));
+                    expr(value, pm, out);
+                }
+                Stmt::Set { target, value, .. } => {
+                    expr(target, pm, out);
+                    expr(value, pm, out);
+                }
+                Stmt::If { cond, then, els } => {
+                    expr(cond, pm, out);
+                    walk(then, pm, out);
+                    walk(els, pm, out);
+                }
+                Stmt::While { cond, body } => {
+                    cond.iter().for_each(|x| expr(x, pm, out));
+                    walk(body, pm, out);
+                }
+                Stmt::For { init, cond, step, body } => {
+                    walk(std::slice::from_ref(init), pm, out);
+                    expr(cond, pm, out);
+                    walk(std::slice::from_ref(step), pm, out);
+                    walk(body, pm, out);
+                }
+                Stmt::ForRange { args, body, .. } => {
+                    args.iter().for_each(|x| expr(x, pm, out));
+                    walk(body, pm, out);
+                }
+                Stmt::ForEach { iter, body, .. } => {
+                    expr(iter, pm, out);
+                    walk(body, pm, out);
+                }
+                Stmt::Return(e, _) => e.iter().for_each(|x| expr(x, pm, out)),
+                Stmt::Print { args, .. } => args.iter().for_each(|x| expr(x, pm, out)),
+                Stmt::Expr(e) => expr(e, pm, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(body, ptr_methods, &mut out);
+    out
+}
+
+/// The attributes a method gives self (self.x = ...), in the order written.
+fn self_attrs(f: &FuncDef, out: &mut Vec<String>) {
+    let Some(me) = f.params.first() else { return };
+    fn walk(body: &[Stmt], me: &str, out: &mut Vec<String>) {
+        for s in body {
+            match s {
+                Stmt::Set { target: Expr::Field(b, a, _), .. } if matches!(&**b, Expr::Var(n, _) if n == me) => {
+                    if !out.contains(a) {
+                        out.push(a.clone());
+                    }
+                }
+                Stmt::If { then, els, .. } => {
+                    walk(then, me, out);
+                    walk(els, me, out);
+                }
+                Stmt::While { body, .. } | Stmt::ForRange { body, .. } | Stmt::ForEach { body, .. } => walk(body, me, out),
+                Stmt::For { init, step, body, .. } => {
+                    walk(std::slice::from_ref(init), me, out);
+                    walk(std::slice::from_ref(step), me, out);
+                    walk(body, me, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(&f.body, me, out);
+}
+
+impl Fx<'_, '_> {
+    /// Does the language have Python's classes (objects by reference)?
+    fn classes(&self) -> bool {
+        self.sh.l.records.as_ref().is_some_and(|r| r.classes)
+    }
+
+    /// The address on top checked not to be nil, as Go checks it (C does
+    /// not check, as C does not).
+    fn nil_check(&mut self) {
+        if !self.checks() {
+            return;
+        }
+        let ok = self.label();
+        let code = self.go_fail();
+        self.ops(&[Op::Dup, Op::Jnz(ok), Op::Fail(code, NIL.to_vec()), Op::Label(ok)]);
+    }
+
+    /// The zero of kind t (C's zero bytes, Go's zero value) at the address
+    /// in slot a.
+    fn clear(&mut self, a: u32, t: &Ty) -> Result<(), E> {
+        if !holds_struct(t) {
+            self.fill_zero(a, t, t.words());
+            return Ok(());
+        }
+        self.ops(&[Op::Load(a), Op::Push(t.words() as i64), Op::Push(0)]);
+        self.lib("lib.fill", 3);
+        self.emit(Op::Pop);
+        self.fix_zero(a, t)
+    }
+
+    /// Over zero bytes at the address in slot a, the zeros of kind t that
+    /// are not zero bytes: Go's empty string and empty slice.
+    fn fix_zero(&mut self, a: u32, t: &Ty) -> Result<(), E> {
+        if !t.zero_is_not_zero() {
+            return Ok(());
+        }
+        match t {
+            Ty::Str | Ty::Slice(..) => {
+                self.emit(Op::Load(a));
+                self.zero(t);
+                self.emit(Op::StoreM(8));
+            }
+            Ty::Arr(..) if !holds_struct(t) => self.fill_zero(a, t, t.words()),
+            Ty::Arr(e, w, n) => {
+                let (e, w, n) = ((**e).clone(), *w, *n);
+                self.fix_each(a, &e, w, &[Op::Push(n as i64)])?;
+            }
+            Ty::Struct(s) => {
+                for f in layout(s).fields.iter() {
+                    if f.ty.zero_is_not_zero() {
+                        let at = self.hidden();
+                        self.ops(&[Op::Load(a), Op::Push(f.off as i64), Op::Bin(BinOp::Add), Op::Store(at)]);
+                        self.fix_zero(at, &f.ty)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// fix_zero for each of the elements (kind e, width w) at the address
+    /// in slot a, as many as the code `n` pushes.
+    fn fix_each(&mut self, a: u32, e: &Ty, w: u8, n: &[Op]) -> Result<(), E> {
+        let (i, at) = (self.hidden(), self.hidden());
+        let (top, done) = (self.label(), self.label());
+        self.ops(&[Op::Push(0), Op::Store(i), Op::Label(top), Op::Load(i)]);
+        self.ops(n);
+        self.ops(&[Op::Bin(BinOp::Lt), Op::Jz(done)]);
+        self.ops(&[Op::Load(a), Op::Load(i), Op::Push(size(e, w) as i64), Op::Bin(BinOp::Mul), Op::Bin(BinOp::Add), Op::Store(at)]);
+        self.fix_zero(at, e)?;
+        self.ops(&[Op::Load(i), Op::Push(1), Op::Bin(BinOp::Add), Op::Store(i), Op::Jmp(top), Op::Label(done)]);
+        Ok(())
+    }
+
+    /// The struct whose address is on top copied to memory of its own: the
+    /// function's (own) or new.
+    fn copy_to_new(&mut self, t: &Ty, own: bool) -> Result<(), E> {
+        let src = self.hidden();
+        self.emit(Op::Store(src));
+        let dst = self.hidden();
+        self.memory_for(t, own)?;
+        self.emit(Op::Store(dst));
+        self.ops(&[Op::Load(dst), Op::Load(src), Op::Push(t.bytes() as i64)]);
+        self.lib("lib.copy", 3);
+        self.ops(&[Op::Pop, Op::Load(dst)]);
+        Ok(())
+    }
+
+    /// A struct's fields given their first values at the address in slot
+    /// a: from C's {...} (in order, or .x = v), Go's composite (in order,
+    /// every field, or X: v), or a struct of the same kind (copied). What
+    /// is not given is zero.
+    fn init_struct(&mut self, a: u32, t: &Ty, v: &Expr) -> Result<(), E> {
+        let Ty::Struct(s) = t else { unreachable!() };
+        let elems = match v {
+            Expr::Brace(elems, _) => elems,
+            Expr::Composite(words, elems, _) => {
+                let (ct, _) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+                if ct != *t {
+                    return self.err(format!("{} is given {}", t.describe(), ct.describe()));
+                }
+                elems
+            }
+            other => {
+                let got = self.expr(other, true)?;
+                if got != *t {
+                    return self.err(format!("{} is given {}", t.describe(), got.describe()));
+                }
+                return self.put(a, t, 64, &got, 64);
+            }
+        };
+        let l = layout(s);
+        self.clear(a, t)?;
+        let go = self.checks();
+        let keyed = elems.iter().filter(|e| matches!(e, Expr::Key(..))).count();
+        if go && keyed > 0 && keyed < elems.len() {
+            return self.err("mixture of field:value and value elements in struct literal");
+        }
+        if go && keyed == 0 && !elems.is_empty() && elems.len() < l.fields.len() {
+            return self.err(format!("too few values in struct literal of type {s}"));
+        }
+        let mut next = 0;
+        let mut given = HashSet::new();
+        for x in elems {
+            let (i, x) = match x {
+                Expr::Key(n, v, line) => {
+                    self.line = *line;
+                    match l.fields.iter().position(|f| f.name == *n) {
+                        Some(i) => (i, &**v),
+                        None => return self.err(format!("unknown field {n} in struct literal of type {s}")),
+                    }
+                }
+                x => (next, x),
+            };
+            if i >= l.fields.len() {
+                return self.err(if go { format!("too many values in struct literal of type {s}") } else { format!("excess elements in the initializer of struct {s}") });
+            }
+            if go && !given.insert(i) {
+                return self.err(format!("duplicate field name {} in struct literal", l.fields[i].name));
+            }
+            next = i + 1;
+            let f = &l.fields[i];
+            let at = self.hidden();
+            self.ops(&[Op::Load(a), Op::Push(f.off as i64), Op::Bin(BinOp::Add), Op::Store(at)]);
+            self.elem_value(at, &f.ty, f.w, x)?;
+        }
+        Ok(())
+    }
+
+    /// A C or Go struct variable: its memory (the function's own, unless Go
+    /// takes its address, or a global's), its first value worked out before
+    /// its name is declared (Go's p := P{X: p.Y} reads the p before).
+    fn var_struct(&mut self, name: &str, t: Ty, value: Option<&Expr>) -> Result<(), E> {
+        if self.globals_here {
+            let words = u32::try_from(t.words()).ok().filter(|w| *w < 1 << 26).ok_or((self.line, "a global struct this large is not in Strike yet".to_string()))?;
+            if self.sh.globals.contains_key(name) {
+                return self.err(format!("{name} is declared twice"));
+            }
+            let g = self.declare_words(name, t.clone(), words);
+            let a = self.hidden();
+            self.ops(&[Op::AddrG(g & !GLOBAL), Op::Store(a)]);
+            // a global's bytes are zero before main
+            self.fix_zero(a, &t)?;
+            if let Some(v) = value {
+                self.init_struct(a, &t, v)?;
+            }
+            return Ok(());
+        }
+        if self.sh.l.block_scope && self.scopes.last().unwrap().contains_key(name) {
+            return self.err(format!("{name} is declared twice in one block"));
+        }
+        let own = !self.escapes.contains(name);
+        let a = self.hidden();
+        match value {
+            Some(v @ (Expr::Brace(..) | Expr::Composite(..))) => {
+                self.memory_for(&t, own)?;
+                self.emit(Op::Store(a));
+                self.init_struct(a, &t, v)?;
+            }
+            Some(v) => {
+                let got = self.expr(v, true)?;
+                if got != t {
+                    return self.err(format!("{name} is {}; it is given {}", t.describe(), got.describe()));
+                }
+                self.copy_to_new(&t, own)?;
+                self.emit(Op::Store(a));
+            }
+            None => {
+                self.memory_for(&t, own)?;
+                self.emit(Op::Store(a));
+                // Go gives the zero value every time; C leaves a local's
+                // bytes as they were
+                if self.checks() {
+                    self.clear(a, &t)?;
+                }
+            }
+        }
+        let slot = self.declare(name, t);
+        self.emit(Op::Load(a));
+        self.store(slot);
+        Ok(())
+    }
+
+    /// The struct the value on top is: a struct's address, or a pointer
+    /// Go follows (checked not nil).
+    fn struct_value(&mut self, t: Ty, what: &str) -> Result<String, E> {
+        match t {
+            Ty::Struct(s) => Ok(s),
+            Ty::Ptr(e, _) if matches!(*e, Ty::Struct(_)) => {
+                let Ty::Struct(s) = *e else { unreachable!() };
+                if !self.sh.l.records.as_ref().is_some_and(|r| r.auto_deref) {
+                    return self.err(format!("{what} is a pointer to struct {s}; C reaches its fields with ->"));
+                }
+                self.nil_check();
+                Ok(s)
+            }
+            t => self.err(format!("{what} is {}, which has no fields", t.describe())),
+        }
+    }
+
+    /// base.name's address on the stack; the field's kind and width.
+    fn field_addr(&mut self, base: &Expr, name: &str) -> Result<(Ty, u8), E> {
+        let t = self.expr(base, true)?;
+        let s = self.struct_value(t, "this")?;
+        let l = layout(&s);
+        let Some(f) = l.fields.iter().find(|f| f.name == name) else {
+            return self.err(format!("struct {s} has no field {name}"));
+        };
+        if f.off != 0 {
+            self.ops(&[Op::Push(f.off as i64), Op::Bin(BinOp::Add)]);
+        }
+        Ok((f.ty.clone(), f.w))
+    }
+
+    /// The address of a place on the stack (a field, an element, what a
+    /// pointer points at): its kind and width.
+    fn place(&mut self, target: &Expr) -> Result<(Ty, u8), E> {
+        match target {
+            Expr::Field(b, n, line) => {
+                self.line = *line;
+                self.field_addr(b, n)
+            }
+            Expr::Index(b, i, line) => {
+                self.line = *line;
+                self.elem_addr(b, i)
+            }
+            Expr::Deref(p, line) => {
+                self.line = *line;
+                let t = self.expr(p, true)?;
+                match t {
+                    Ty::Ptr(e, _) if matches!(*e, Ty::Struct(_)) => {
+                        self.nil_check();
+                        Ok((*e, 64))
+                    }
+                    t => self.err(format!("* of {} is not in Strike yet (only a pointer to a struct is followed)", t.describe())),
+                }
+            }
+            _ => self.err("a value is given only to a name, an element or a field"),
+        }
+    }
+
+    /// target = value (or op=) for a target that is a field or what a
+    /// pointer points at.
+    fn set(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr) -> Result<(), E> {
+        if self.classes() {
+            if let Expr::Field(b, n, _) = target {
+                return self.attr_set(b, n, op, value);
+            }
+        }
+        // Python works out the value first, then where it goes
+        let early = if op.is_none() && !self.sh.l.block_scope {
+            let t = self.value(value)?;
+            let from = self.last_w;
+            let v = self.hidden();
+            self.emit(Op::Store(v));
+            Some((t, v, from))
+        } else {
+            None
+        };
+        let (e, w) = self.place(target)?;
+        let container = match target {
+            Expr::Index(b, _, _) => (**b).clone(),
+            t => t.clone(),
+        };
+        self.store_at(&container, e, w, op, value, early)
+    }
+
+    /// &x: the address of a struct (a variable, a field, an element), or
+    /// Go's &P{...}, a new one.
+    fn addr_of(&mut self, x: &Expr) -> Result<Ty, E> {
+        self.last_w = 64;
+        match x {
+            Expr::Composite(words, _, line) => {
+                self.line = *line;
+                let (t, _) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+                if !matches!(t, Ty::Struct(_)) {
+                    return self.err(format!("& of {} is not in Strike yet: only a struct's address is taken", t.describe()));
+                }
+                let a = self.hidden();
+                self.memory_for(&t, false)?;
+                self.emit(Op::Store(a));
+                self.init_struct(a, &t, x)?;
+                self.emit(Op::Load(a));
+                self.last_w = 64;
+                Ok(Ty::Ptr(Box::new(t), 64))
+            }
+            Expr::Var(..) | Expr::Field(..) | Expr::Index(..) | Expr::Deref(..) => {
+                let t = self.expr(x, true)?;
+                self.last_w = 64;
+                match t {
+                    Ty::Struct(_) => Ok(Ty::Ptr(Box::new(t), 64)),
+                    t => self.err(format!("& of {} is not in Strike yet: only a struct's address is taken", t.describe())),
+                }
+            }
+            _ => self.err("& of this is not in Strike yet: only a struct's address is taken"),
+        }
+    }
+
+    /// The type of an expression C's sizeof is given, without its code
+    /// (sizeof does not work its operand out): a variable, a field, an
+    /// element, what a pointer points at.
+    fn type_only(&mut self, x: &Expr) -> Result<(Ty, u8), E> {
+        if x.root().is_none() && !matches!(x, Expr::Deref(..)) {
+            return self.err("sizeof of this expression is not in Strike yet (of a type, a variable, a field or an element it is)");
+        }
+        let (code, slots, labels) = (self.code.len(), self.slots, self.labels);
+        let t = self.expr(x, true)?;
+        let w = self.last_w;
+        self.code.truncate(code);
+        (self.slots, self.labels) = (slots, labels);
+        Ok((t, w))
+    }
+
+    /// The number C's sizeof or offsetof gives, when the expression is
+    /// one (so an unsigned size can be divided: sizeof a / sizeof a[0]).
+    fn size_const(&mut self, e: &Expr) -> Result<Option<u64>, E> {
+        Ok(match e {
+            Expr::SizeOfType(..) | Expr::SizeOf(..) | Expr::OffsetOf(..) => Some(self.size_of(e)?),
+            Expr::Num(v, false) if *v >= 0 => Some(*v as u64),
+            Expr::Bin(op, a, b) => {
+                let (Some(x), Some(y)) = (self.size_const(a)?, self.size_const(b)?) else { return Ok(None) };
+                match op {
+                    BinOp::Add => Some(x.wrapping_add(y)),
+                    BinOp::Sub => Some(x.wrapping_sub(y)),
+                    BinOp::Mul => Some(x.wrapping_mul(y)),
+                    BinOp::DivTrunc if y != 0 => Some(x / y),
+                    BinOp::ModTrunc if y != 0 => Some(x % y),
+                    BinOp::Shr if y < 64 => Some(x >> y),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// sizeof(type), sizeof x, offsetof(type, field): C's bytes, as clang
+    /// counts them.
+    fn size_of(&mut self, e: &Expr) -> Result<u64, E> {
+        match e {
+            Expr::SizeOfType(words, line) => {
+                self.line = *line;
+                if words.iter().all(|w| w == "void") {
+                    return self.err("sizeof(void) is not C's");
+                }
+                let (t, w) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+                Ok(c_size(&t, w))
+            }
+            Expr::SizeOf(x, line) => {
+                self.line = *line;
+                let (t, w) = self.type_only(x)?;
+                Ok(c_size(&t, w))
+            }
+            Expr::OffsetOf(words, f, line) => {
+                self.line = *line;
+                let (t, _) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+                let Ty::Struct(s) = &t else { return self.err(format!("offsetof is given {}, not a struct", t.describe())) };
+                match layout(s).fields.iter().find(|x| x.name == *f) {
+                    Some(x) => Ok(x.off),
+                    None => self.err(format!("struct {s} has no field {f}")),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// x.name(args) on a Go struct or a pointer to one: the method of its
+    /// type, given the value's address. A method that wants a pointer is
+    /// given the value's own address (Go takes it), one that wants a value
+    /// is given the address its copy is made from.
+    fn struct_method(&mut self, base: &Expr, name: &str, args: &[Expr], line: u32, used: bool) -> Result<Ty, E> {
+        let addressable = base.root().is_some() || matches!(base, Expr::Deref(..));
+        let bt = self.expr(base, true)?;
+        let (s, ptr) = match &bt {
+            Ty::Struct(s) => (s.clone(), false),
+            Ty::Ptr(e, _) => match &**e {
+                Ty::Struct(s) => (s.clone(), true),
+                _ => return self.err(format!("{} has no method {name}", bt.describe())),
+            },
+            t => return self.err(format!("{} has no method {name} in Strike", t.describe())),
+        };
+        let key = format!("{s}.{name}");
+        let Some(sig) = self.sh.sigs.get(&key).cloned() else {
+            return self.err(format!("{s} has no method {name}"));
+        };
+        match (matches!(sig.params[0], Ty::Ptr(..)), ptr) {
+            (true, false) if !addressable => return self.err(format!("cannot call pointer method {name} on {s}: the value has no address")),
+            // the value a pointer points at: the method copies it
+            (false, true) => self.nil_check(),
+            _ => {}
+        }
+        let r = self.hidden();
+        self.emit(Op::Store(r));
+        let t = sig.params[0].clone();
+        self.call_sig(&key, &sig, Some((r, t)), args, line, used)
+    }
+
+    /// A call of the function `name` (its signature sig): the struct it
+    /// returns gets the caller's memory first, then the value it is called
+    /// on (a method's, in slot), then the arguments, each converted to its
+    /// parameter's type.
+    fn call_sig(&mut self, name: &str, sig: &Sig, first: Option<(u32, Ty)>, args: &[Expr], line: u32, used: bool) -> Result<Ty, E> {
+        let skip = first.is_some() as usize;
+        if sig.params.len() != args.len() + skip {
+            return self.err(format!("{name} takes {} values, given {}", sig.params.len() - skip, args.len()));
+        }
+        let sret = matches!(sig.ret, Ty::Struct(_));
+        if sret {
+            self.memory_for(&sig.ret, true)?;
+        }
+        let mut tys = Vec::new();
+        if let Some((slot, t)) = first {
+            self.emit(Op::Load(slot));
+            tys.push(t);
+        }
+        let (pw, rw) = self.sh.fw.get(name).cloned().unwrap_or_default();
+        for (k, a) in args.iter().enumerate() {
+            let i = k + skip;
+            // a Go array or a struct is copied by the function it is given to
+            let t = self.expr(a, true)?;
+            let want = sig.params[i].clone();
+            if !want.scalar() || !t.scalar() {
+                if unify(&want, &t).is_none() && !decays(&t, &want) {
+                    return self.err(format!("{name}'s parameter {} is {}, given {}", k + 1, want.describe(), t.describe()));
+                }
+                if let (Expr::Var(n, _), Ty::List(_)) = (a, &t) {
+                    let n = n.clone();
+                    self.refine(&n, &want)?;
+                }
+            } else {
+                // an argument is converted to its parameter's type
+                let from = self.last_w;
+                let w = pw.get(i).copied().unwrap_or(64);
+                if want == Ty::Float || t == Ty::Float {
+                    self.convert(&want, w, &t, from)?;
+                } else {
+                    self.narrow(w, from)?;
+                }
+            }
+            tys.push(t);
+        }
+        let seen = self.sh.args.entry(name.to_string()).or_insert_with(|| vec![Vec::new(); sig.params.len()]);
+        for (i, t) in tys.into_iter().enumerate() {
+            seen[i].push(t);
+        }
+        if used {
+            self.sh.used.push((name.to_string(), line));
+        }
+        self.emit(Op::Call(symbol(name), (sig.params.len() + sret as usize) as u32));
+        self.last_w = if rw == 0 || !sig.ret.scalar() { 64 } else { rw };
+        Ok(sig.ret.clone())
+    }
+
+    /// The struct printer of Go's fmt: {1 2 hi}, and {X:1 Y:2 Name:hi} for
+    /// %+v; a pointer in a struct prints as an address, which Strike cannot
+    /// give as Go gives it, so it is refused.
+    fn struct_printer(&mut self, s: &str, plus: bool) -> Result<String, E> {
+        let name = format!("lib.print.{s}{}", if plus { "+" } else { "" });
+        if self.sh.printers.contains_key(&name) {
+            return Ok(name);
+        }
+        let mut fields = Vec::new();
+        for f in layout(s).fields.iter() {
+            let elem = match &f.ty {
+                Ty::Bool => Elem::Bool,
+                Ty::Float => Elem::Float(FloatElem { f32: f.w == 32, repr: false, buf: self.float_buf() }),
+                Ty::Str => Elem::Str(false),
+                Ty::Struct(inner) => {
+                    self.printed_plainly(inner)?;
+                    Elem::Nested(self.struct_printer(inner, plus)?, true)
+                }
+                Ty::Slice(..) => Elem::Nested(self.printer_plus(&f.ty, plus)?, false),
+                Ty::Arr(..) => Elem::Nested(self.printer_plus(&f.ty, plus)?, true),
+                Ty::Ptr(..) => return self.err(format!("struct {s} holds a pointer ({}), which Go prints as its address; Strike cannot print that as Go does", f.name)),
+                _ => Elem::Int,
+            };
+            let label = if plus { format!("{}:", f.name).into_bytes() } else { Vec::new() };
+            fields.push((f.off, elem, size(&f.ty, f.w) as u8, label));
+        }
+        let p = Printer {
+            array: None,
+            list: false,
+            elem: Elem::Int,
+            stride: 0,
+            width: 0,
+            open: b"{".to_vec(),
+            sep: b" ".to_vec(),
+            close: b"}".to_vec(),
+            words: self.sh.l.bool_print.clone().map(|(a, b)| (a.into_bytes(), b.into_bytes())),
+            fields: Some(fields),
+        };
+        self.sh.printers.insert(name.clone(), p);
+        Ok(name)
+    }
+
+    /// Go's fmt prints a value through its String method (or Error,
+    /// Format, GoString) where its type has one: refused where Strike does
+    /// not do it as fmt does (inside another value, or the others).
+    fn printed_plainly(&self, s: &str) -> Result<(), E> {
+        for m in ["String", "Error", "Format", "GoString"] {
+            if self.sh.sigs.contains_key(&format!("{s}.{m}")) {
+                return self.err(format!("{s} has a {m} method, which Go's fmt calls; Strike prints it so only as the value printed itself (String with a value receiver)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Prints a value as print, Println or %v does; plus: %+v (a struct's
+    /// fields by name).
+    fn print_struct(&mut self, t: &Ty, plus: bool) -> Result<(), E> {
+        let s = match t {
+            Ty::Struct(s) => s.clone(),
+            Ty::Ptr(e, _) => match &**e {
+                Ty::Struct(s) => s.clone(),
+                _ => return self.err("a pointer is not printed"),
+            },
+            _ => unreachable!(),
+        };
+        for m in ["Error", "Format", "GoString"] {
+            if self.sh.sigs.contains_key(&format!("{s}.{m}")) {
+                return self.err(format!("{s} has a {m} method, which Go's fmt calls; that is not in Strike yet"));
+            }
+        }
+        // a String method: what fmt prints (a value's only when it takes a
+        // value; a nil pointer's <nil>, as fmt gives when it would panic)
+        if let Some(sig) = self.sh.sigs.get(&format!("{s}.String")).cloned() {
+            let by_ptr = matches!(sig.params[0], Ty::Ptr(..));
+            let ptr = matches!(t, Ty::Ptr(..));
+            if ptr && by_ptr {
+                return self.err(format!("{s}'s String takes a pointer, and fmt gives a nil one <nil> only where String panics; that is not in Strike yet"));
+            }
+            if !by_ptr {
+                let (h, end) = (self.hidden(), self.label());
+                self.emit(Op::Store(h));
+                if ptr {
+                    let some = self.label();
+                    self.ops(&[Op::Load(h), Op::Jnz(some), Op::PrintStr(b"<nil>".to_vec()), Op::Jmp(end), Op::Label(some)]);
+                }
+                let line = self.line;
+                let r = self.call_sig(&format!("{s}.String"), &sig, Some((h, sig.params[0].clone())), &[], line, true)?;
+                if r != Ty::Str {
+                    return self.err(format!("{s}'s String returns {}, not a string", r.describe()));
+                }
+                self.lib("lib.str_print", 1);
+                self.ops(&[Op::Pop, Op::Label(end)]);
+                return Ok(());
+            }
+        }
+        match t {
+            Ty::Struct(s) => {
+                let f = self.struct_printer(s, plus)?;
+                self.emit(Op::Call(f, 1));
+                self.emit(Op::Pop);
+            }
+            // a pointer to a struct: &{1 2}, or <nil>
+            Ty::Ptr(e, _) => {
+                let Ty::Struct(s) = &**e else { return self.err("a pointer is not printed") };
+                let f = self.struct_printer(s, plus)?;
+                let (h, some, end) = (self.hidden(), self.label(), self.label());
+                self.ops(&[Op::Store(h), Op::Load(h), Op::Jnz(some), Op::PrintStr(b"<nil>".to_vec()), Op::Jmp(end), Op::Label(some), Op::PrintStr(b"&".to_vec()), Op::Load(h)]);
+                self.emit(Op::Call(f, 1));
+                self.ops(&[Op::Pop, Op::Label(end)]);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    // Python's classes
+
+    fn class(&self, c: &str) -> Option<&Class> {
+        self.sh.classes.get(c)
+    }
+    /// The class and its bases, nearest first.
+    fn chain(&self, c: &str) -> Vec<String> {
+        let mut out = vec![c.to_string()];
+        while let Some(b) = self.class(out.last().unwrap()).and_then(|k| k.base.clone()) {
+            out.push(b);
+        }
+        out
+    }
+    /// The class whose method m an object of class c has (c's own, or a base's).
+    fn resolve(&self, c: &str, m: &str) -> Option<String> {
+        self.chain(c).into_iter().find(|k| self.class(k).is_some_and(|x| x.methods.contains(m)))
+    }
+    /// The class of c's chain whose own attribute a is (the global it is).
+    fn class_attr(&self, c: &str, a: &str) -> Option<String> {
+        self.chain(c).into_iter().find(|k| self.class(k).is_some_and(|x| x.class_attrs.iter().any(|y| y == a)))
+    }
+    /// The attributes an object of class c has a word for: those its
+    /// class's methods set, then those set elsewhere (learned as kinds are,
+    /// round by round), each at 8 * (1 + its place).
+    fn obj_attrs(&self, c: &str) -> Vec<String> {
+        let mut v = self.class(c).map(|k| k.attrs.clone()).unwrap_or_default();
+        let key = format!("attrs {c}");
+        let mut extra: Vec<&String> = self.sh.known.keys().filter(|k| k.0 == key).map(|k| &k.1).collect();
+        extra.sort();
+        for e in extra {
+            if !v.contains(e) {
+                v.push(e.clone());
+            }
+        }
+        v
+    }
+    fn attr_key(c: &str, a: &str) -> (String, String) {
+        (format!("class {c}"), a.to_string())
+    }
+    /// What an object's attribute is known to hold so far.
+    fn attr_kind(&self, c: &str, a: &str) -> Ty {
+        let k = Self::attr_key(c, a);
+        match (self.sh.seen.get(&k), self.sh.known.get(&k)) {
+            (Some(x), Some(y)) => unify(x, y).unwrap_or(x.clone()),
+            (Some(x), None) | (None, Some(x)) => x.clone(),
+            (None, None) => Ty::Unknown,
+        }
+    }
+
+    /// P(args): a new object, its attributes not set yet, given to the
+    /// class's __init__ (its own, or a base's).
+    fn construct(&mut self, c: &str, args: &[Expr], line: u32) -> Result<Ty, E> {
+        let n = self.obj_attrs(c).len();
+        if n > MAX_ATTRS {
+            return self.err(format!("{c}'s objects have more than {MAX_ATTRS} attributes, which is not in Strike yet"));
+        }
+        let h = self.hidden();
+        self.emit(Op::Push(8 * (1 + n as i64)));
+        self.lib("lib.bytes", 1);
+        self.emit(Op::Store(h));
+        match self.resolve(c, "__init__") {
+            Some(d) => {
+                let f = instance(c, &d, "__init__");
+                let sig = self.sh.sigs[&f].clone();
+                self.call_sig(&f, &sig, Some((h, Ty::Obj(c.to_string()))), args, line, false)?;
+                self.emit(Op::Pop);
+            }
+            None if args.is_empty() => {}
+            None => return self.err(format!("{c}() takes no arguments")),
+        }
+        self.emit(Op::Load(h));
+        self.last_w = 64;
+        Ok(Ty::Obj(c.to_string()))
+    }
+
+    /// obj.name(args), and super().name(args) in a method: the method the
+    /// object's class has, given the object first.
+    fn obj_method(&mut self, base: &Expr, name: &str, args: &[Expr], line: u32, used: bool) -> Result<Option<Ty>, E> {
+        if let Expr::Call(s, a, _) = base {
+            if s == "super" && a.is_empty() && !self.sh.sigs.contains_key("super") {
+                let Some((r, d)) = self.class_ctx.clone() else { return self.err("super() is used outside a class's method") };
+                let Some(b) = self.class(&d).and_then(|k| k.base.clone()) else {
+                    return self.err(format!("{d} has no base class: super().{name}() is object's, which is not in Strike yet"));
+                };
+                let Some(a) = self.resolve(&b, name) else { return self.err(format!("'super' object has no attribute '{name}'")) };
+                let f = instance(&r, &a, name);
+                let sig = self.sh.sigs[&f].clone();
+                let me = self.hidden();
+                // self: the method's first parameter
+                self.ops(&[Op::Load(0), Op::Store(me)]);
+                return Ok(Some(self.call_sig(&f, &sig, Some((me, Ty::Obj(r.clone()))), args, line, used)?));
+            }
+        }
+        if let Expr::Var(n, _) = base {
+            if self.class(n).is_some() && self.lookup(n).is_none() {
+                return self.err(format!("{n}.{name}(): a method called on its class is not in Strike yet"));
+            }
+        }
+        let start = self.code.len();
+        let (code_at, slots, labels) = (start, self.slots, self.labels);
+        let t = self.expr(base, true)?;
+        let Ty::Obj(c) = t else {
+            // not an object: the base is lowered again as a list's or a string's
+            self.code.truncate(code_at);
+            (self.slots, self.labels) = (slots, labels);
+            return Ok(None);
+        };
+        let Some(d) = self.resolve(&c, name) else {
+            return self.err(format!("'{c}' object has no method {name} in Strike"));
+        };
+        let f = instance(&c, &d, name);
+        let sig = self.sh.sigs[&f].clone();
+        let r = self.hidden();
+        self.emit(Op::Store(r));
+        Ok(Some(self.call_sig(&f, &sig, Some((r, Ty::Obj(c))), args, line, used)?))
+    }
+
+    /// The text of the object on top, by its class's __str__ (or __repr__
+    /// where it has none; repr: only __repr__, as a list shows its
+    /// elements): a string.
+    fn obj_text(&mut self, c: &str, repr: bool) -> Result<(), E> {
+        let d = if repr { None } else { self.resolve(c, "__str__").map(|d| (d, "__str__")) };
+        let Some((d, m)) = d.or(self.resolve(c, "__repr__").map(|d| (d, "__repr__"))) else {
+            return self.err(format!(
+                "an object of class {c} without {} prints as <__main__.{c} object at 0x...>, an address Strike cannot give as Python does",
+                if repr { "__repr__" } else { "__str__ or __repr__" }
+            ));
+        };
+        let f = instance(c, &d, m);
+        let sig = self.sh.sigs[&f].clone();
+        let h = self.hidden();
+        self.emit(Op::Store(h));
+        let t = self.call_sig(&f, &sig, Some((h, Ty::Obj(c.to_string()))), &[], self.line, true)?;
+        // not known yet: the method's own lowering says why, or a later round
+        if t != Ty::Str && t != Ty::Unknown {
+            return self.err(format!("{m} returned {}, not a string (TypeError)", t.describe()));
+        }
+        Ok(())
+    }
+
+    /// obj.a, or the class's own attribute (P.a): the object's where it is
+    /// set, else its class's, else Python's AttributeError.
+    fn attr_read(&mut self, base: &Expr, a: &str) -> Result<Ty, E> {
+        if let Expr::Var(n, _) = base {
+            if self.class(n).is_some() && self.lookup(n).is_none() {
+                let Some(k) = self.class_attr(n, a) else {
+                    return self.err(format!("type object '{n}' has no attribute '{a}'"));
+                };
+                let g = format!("{k}::{a}");
+                let Some((slot, t)) = self.lookup(&g) else { return self.err(format!("{n}.{a} is read before the class is made")) };
+                self.load(slot);
+                self.last_w = 64;
+                return Ok(t);
+            }
+        }
+        let t = self.expr(base, true)?;
+        let Ty::Obj(c) = t else { return self.err(format!("{} has no attribute {a} in Strike", t.describe())) };
+        let attrs = self.obj_attrs(&c);
+        let owner = self.class_attr(&c, a);
+        let missing = format!("AttributeError: '{c}' object has no attribute '{a}'\n").into_bytes();
+        let h = self.hidden();
+        self.emit(Op::Store(h));
+        self.last_w = 64;
+        let Some(i) = attrs.iter().position(|x| x == a) else {
+            // an attribute no method sets: the class's own, or none
+            return match owner {
+                Some(k) => {
+                    let (slot, t) = self.lookup(&format!("{k}::{a}")).ok_or((self.line, format!("{c}.{a} is read before the class is made")))?;
+                    self.load(slot);
+                    Ok(t)
+                }
+                None => {
+                    self.ops(&[Op::Fail(1, missing), Op::Push(0)]);
+                    Ok(Ty::Unknown)
+                }
+            };
+        };
+        let (have, done) = (self.label(), self.label());
+        self.ops(&[Op::Load(h), Op::LoadM(8), Op::Push(1 << i), Op::Bin(BinOp::Band), Op::Jnz(have)]);
+        let mut t = self.attr_kind(&c, a);
+        match &owner {
+            Some(k) => {
+                let (slot, ct) = self.lookup(&format!("{k}::{a}")).ok_or((self.line, format!("{c}.{a} is read before the class is made")))?;
+                t = unify(&t, &ct).ok_or((self.line, format!("{a} holds {} in the class and {} in its objects; Strike keeps one kind per attribute", ct.describe(), t.describe())))?;
+                self.load(slot);
+                self.emit(Op::Jmp(done));
+            }
+            None => self.emit(Op::Fail(1, missing)),
+        }
+        self.ops(&[Op::Label(have), Op::Load(h), Op::Push(8 * (i as i64 + 1)), Op::Bin(BinOp::Add), Op::LoadM(8), Op::Label(done)]);
+        self.last_w = 64;
+        Ok(t)
+    }
+
+    /// obj.a = value (or op=), P.a = value: the attribute set, its kind
+    /// learned as a list's elements are.
+    fn attr_set(&mut self, base: &Expr, a: &str, op: Option<BinOp>, value: &Expr) -> Result<(), E> {
+        if let Expr::Var(n, line) = base {
+            if self.class(n).is_some() && self.lookup(n).is_none() {
+                if !self.class(n).is_some_and(|k| k.class_attrs.iter().any(|x| x == a)) {
+                    return self.err(format!("{n}.{a}: an attribute a class does not make itself is not given to it in Strike"));
+                }
+                let g = format!("{n}::{a}");
+                let v = match op {
+                    None => value.clone(),
+                    Some(op) => Expr::Bin(op, Box::new(Expr::Field(base.clone().into(), a.to_string(), *line)), Box::new(value.clone())),
+                };
+                let _ = line;
+                return self.assign(&g, &v);
+            }
+        }
+        // the value first, then the object (Python's order)
+        let (vt, v) = match op {
+            None => {
+                let vt = self.value(value)?;
+                let v = self.hidden();
+                self.emit(Op::Store(v));
+                (vt, v)
+            }
+            Some(op) => {
+                let bt = self.attr_read(base, a)?;
+                let at = self.code.len();
+                let w = self.last_w;
+                let vt = self.binary(op, bt, w, None, at, value, false)?;
+                let v = self.hidden();
+                self.emit(Op::Store(v));
+                (vt, v)
+            }
+        };
+        let t = self.expr(base, true)?;
+        let Ty::Obj(c) = t else { return self.err(format!("{} has no attribute {a} in Strike", t.describe())) };
+        let attrs = self.obj_attrs(&c);
+        // an attribute given outside the class's methods: the class's
+        // objects get a word for it from the next round on
+        if !self.class(&c).is_some_and(|k| k.attrs.iter().any(|x| x == a)) {
+            self.saw((format!("attrs {c}"), a.to_string()), Ty::Int);
+        }
+        let Some(i) = attrs.iter().position(|x| x == a) else {
+            return self.err(format!("{a} is given to an object of class {c}, which has no word for it yet"));
+        };
+        let was = self.attr_kind(&c, a);
+        let Some(now) = unify(&was, &vt) else {
+            return self.err(format!("the attribute {a} holds {} in one place and {} in another; Strike keeps one kind per attribute", was.describe(), vt.describe()));
+        };
+        if let Some(k) = self.class_attr(&c, a) {
+            let (_, ct) = self.lookup(&format!("{k}::{a}")).unwrap_or((0, Ty::Unknown));
+            if unify(&ct, &now).is_none() {
+                return self.err(format!("{a} holds {} in the class and {} in its objects; Strike keeps one kind per attribute", ct.describe(), now.describe()));
+            }
+        }
+        self.saw(Self::attr_key(&c, a), now);
+        let h = self.hidden();
+        self.emit(Op::Store(h));
+        self.ops(&[Op::Load(h), Op::Push(8 * (i as i64 + 1)), Op::Bin(BinOp::Add), Op::Load(v), Op::StoreM(8)]);
+        self.ops(&[Op::Load(h), Op::Load(h), Op::LoadM(8), Op::Push(1 << i), Op::Bin(BinOp::Bor), Op::StoreM(8)]);
+        Ok(())
+    }
+
+    /// Python's class statement: the class's own attributes given their
+    /// values, as globals of the program (P::a).
+    fn class_stmt(&mut self, c: &str) -> Result<(), E> {
+        let Some(def) = self.sh.defs.get(c).cloned() else { return Ok(()) };
+        // a name the class's body has given so far is the class's own there
+        // (b = a + 1 reads the class's a), others are the module's
+        fn own(e: &Expr, c: &str, given: &HashSet<String>) -> Result<Expr, (u32, String)> {
+            Ok(match e {
+                Expr::Var(n, l) if given.contains(n) => Expr::Var(format!("{c}::{n}"), *l),
+                Expr::Num(..) | Expr::Float(_) | Expr::Str(_) | Expr::Var(..) => e.clone(),
+                Expr::Un(op, x) => Expr::Un(*op, Box::new(own(x, c, given)?)),
+                Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(own(a, c, given)?), Box::new(own(b, c, given)?)),
+                Expr::List(xs, l) => Expr::List(xs.iter().map(|x| own(x, c, given)).collect::<Result<_, _>>()?, *l),
+                Expr::Call(f, xs, l) if !given.contains(f) => Expr::Call(f.clone(), xs.iter().map(|x| own(x, c, given)).collect::<Result<_, _>>()?, *l),
+                _ => return Err((0, format!("this value in the body of class {c} is not in Strike yet (a number, a string, a list, or arithmetic of them and of names, is)"))),
+            })
+        }
+        let mut given = HashSet::new();
+        for s in &def.attrs {
+            match s {
+                Stmt::Assign { name, index, op: None, value, line } if index.is_empty() => {
+                    self.line = *line;
+                    let v = own(value, c, &given).map_err(|(_, m)| (*line, m))?;
+                    self.assign(&format!("{c}::{name}"), &v)?;
+                    given.insert(name.clone());
+                }
+                Stmt::Nothing => {}
+                Stmt::Expr(Expr::Str(_)) => {}
+                _ => return self.err(format!("only methods and attributes (name = value) are in a class's body in Strike ({c})")),
+            }
+        }
+        Ok(())
+    }
+}
+
 fn combine(what: &str, tys: &[Ty], bools: bool) -> Result<Ty, String> {
+    // a value not known yet (a parameter passed on before its own kind is
+    // learned) says nothing: the next round tells
+    if !tys.is_empty() && tys.iter().all(|t| *t == Ty::Unknown) {
+        return Ok(Ty::Unknown);
+    }
     if tys.iter().any(|t| !t.scalar()) {
         let mut u = Ty::Unknown;
         for t in tys {
@@ -3609,9 +5080,87 @@ fn combine(what: &str, tys: &[Ty], bools: bool) -> Result<Ty, String> {
     })
 }
 
+/// Python's classes, each method as a function for every class it is
+/// called on (its own, and each class below it), and where each was
+/// written.
+#[allow(clippy::type_complexity)]
+fn class_table(p: &Program, l: &Lang) -> Result<(HashMap<String, Class>, HashMap<String, TypeDef>, Vec<FuncDef>, HashMap<String, (String, String)>), E> {
+    let (mut cs, mut defs) = (HashMap::new(), HashMap::new());
+    let (mut funcs, mut ctx) = (Vec::new(), HashMap::new());
+    if !l.records.as_ref().is_some_and(|r| r.classes) {
+        return Ok((cs, defs, funcs, ctx));
+    }
+    let mut order = Vec::new();
+    for t in &p.types {
+        let name = t.name.clone().unwrap_or_default();
+        if cs.contains_key(&name) {
+            return Err((t.line, format!("the class {name} is defined twice; Strike keeps one class of a name")));
+        }
+        let base = t.base.clone().filter(|b| b != "object");
+        if let Some(b) = &base {
+            if !cs.contains_key(b) {
+                return Err((t.line, format!("{name}'s base {b} is not a class defined before it in this program")));
+            }
+        }
+        let mut methods = HashSet::new();
+        for m in &t.methods {
+            let short = m.name.strip_prefix(&format!("{name}.")).unwrap_or(&m.name).to_string();
+            if m.params.is_empty() {
+                return Err((m.line, format!("the method {short} takes no self; a static method is not in Strike yet")));
+            }
+            if !methods.insert(short.clone()) {
+                return Err((m.line, format!("{name} defines {short} twice; Strike keeps one method of a name")));
+            }
+        }
+        let class_attrs = t.attrs.iter().filter_map(|s| if let Stmt::Assign { name, .. } = s { Some(name.clone()) } else { None }).collect();
+        cs.insert(name.clone(), Class { base, attrs: Vec::new(), methods, class_attrs });
+        defs.insert(name.clone(), t.clone());
+        order.push(name);
+    }
+    let chain = |c: &str, cs: &HashMap<String, Class>| {
+        let mut out = vec![c.to_string()];
+        while let Some(b) = cs[out.last().unwrap()].base.clone() {
+            out.push(b);
+        }
+        out
+    };
+    for c in &order {
+        let mut attrs = Vec::new();
+        for d in chain(c, &cs).iter().rev() {
+            for m in &defs[d].methods {
+                self_attrs(m, &mut attrs);
+            }
+        }
+        if attrs.len() > MAX_ATTRS {
+            return Err((defs[c].line, format!("{c}'s objects have more than {MAX_ATTRS} attributes, which is not in Strike yet")));
+        }
+        cs.get_mut(c).unwrap().attrs = attrs;
+        for d in chain(c, &cs) {
+            for m in &defs[&d].methods {
+                let short = m.name.strip_prefix(&format!("{d}.")).unwrap_or(&m.name);
+                let name = instance(c, &d, short);
+                ctx.insert(name.clone(), (c.clone(), d.clone()));
+                funcs.push(FuncDef { name, method_of: Some(c.clone()), ..m.clone() });
+            }
+        }
+    }
+    Ok((cs, defs, funcs, ctx))
+}
+
 pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
+    // the program's structs, laid out before anything is lowered
+    let _types = install(lay_out(p, l)?);
+    let (classes, defs, methods, class_ctx) = class_table(p, l)?;
+    let all: Vec<&FuncDef> = p.funcs.iter().chain(methods.iter()).collect();
+    // Go's methods that want a pointer: a value they are called on has its
+    // address taken
+    let ptr_methods: HashSet<String> = all
+        .iter()
+        .filter(|f| f.method_of.is_some() && f.param_types.first().is_some_and(|t| t.first().map(String::as_str) == Some("*")))
+        .map(|f| f.name.rsplit('.').next().unwrap_or("").to_string())
+        .collect();
     let mut table: HashMap<String, &FuncDef> = HashMap::new();
-    for f in &p.funcs {
+    for &f in &all {
         if table.insert(f.name.clone(), f).is_some() {
             return Err((f.line, format!("the function {} is defined twice", f.name)));
         }
@@ -3642,7 +5191,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
     let mut fw: HashMap<String, (Vec<u8>, u8)> = HashMap::new();
     // the kinds a typed language declares that are not numbers: fixed
     let mut declared: HashMap<String, (Vec<Option<Ty>>, Option<Ty>)> = HashMap::new();
-    for f in &p.funcs {
+    for &f in &all {
         let mut ps = Vec::new();
         let mut kinds = Vec::new();
         for t in &f.param_types {
@@ -3650,15 +5199,26 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             ps.push(w);
             kinds.push((typed && (!k.scalar() || k == Ty::Float)).then_some(k));
         }
+        // a method's first parameter: the object, or Go's receiver (a
+        // struct of the method's type, or a pointer to one)
+        if let Some(of) = &f.method_of {
+            if classes.contains_key(of) {
+                kinds[0] = Some(Ty::Obj(of.clone()));
+            } else {
+                let s = Ty::Struct(of.clone());
+                if !matches!(&kinds[0], Some(k) if *k == s || matches!(k, Ty::Ptr(e, _) if **e == s)) {
+                    return Err((f.line, format!("a method of {of}, which is not a struct of this package, is not in Strike yet")));
+                }
+            }
+        }
         let (rk, rw) = type_of(l, &f.ret, bools).map_err(|m| (f.line, m))?;
-        if matches!(rk, Ty::Ptr(..)) {
-            return Err((f.line, "a function that returns a pointer is not in Strike yet".into()));
+        if matches!(&rk, Ty::Ptr(e, _) if !matches!(**e, Ty::Struct(_))) {
+            return Err((f.line, "a function that returns a pointer (but to a struct) is not in Strike yet".into()));
         }
         fw.insert(f.name.clone(), (ps, rw));
         declared.insert(f.name.clone(), (kinds, (typed && (!rk.scalar() || rk == Ty::Float)).then_some(rk)));
     }
-    let mut sigs: HashMap<String, Sig> = p
-        .funcs
+    let mut sigs: HashMap<String, Sig> = all
         .iter()
         .map(|f| {
             // a language that writes no types learns them: not known at first
@@ -3686,6 +5246,8 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             seen: HashMap::new(),
             nil_slice: None,
             float_buf: None,
+            classes: &classes,
+            defs: &defs,
         };
         let mut funcs = Vec::new();
         let mut errors: Vec<E> = Vec::new();
@@ -3696,7 +5258,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
         if l.toplevel_entry || has_init {
             bodies.push((String::new(), 1, Vec::new(), p.top.as_slice(), true));
         }
-        bodies.extend(p.funcs.iter().map(|f| {
+        bodies.extend(all.iter().map(|f| {
             let ps = f.params.iter().cloned().zip(sigs[&f.name].params.iter().cloned()).collect();
             (f.name.clone(), f.line, ps, f.body.as_slice(), false)
         }));
@@ -3724,19 +5286,26 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                 assigned: if top { Default::default() } else { assigned_names(body) },
                 frame: 0,
                 sliced: sliced_names(body),
+                sret: !top && matches!(declared.get(&name), Some((_, Some(Ty::Struct(_))))),
+                escapes: if l.records.is_some() && l.index_error.is_some() { escaping_names(body, &ptr_methods) } else { HashSet::new() },
+                class_ctx: class_ctx.get(&name).cloned(),
             };
+            // a struct returned: the caller's memory for it comes first
+            if fx.sret {
+                fx.slots = 1;
+            }
             let mut arrays = Vec::new();
             for (i, (n, t)) in params.iter().enumerate() {
                 let s = fx.declare(n, t.clone());
                 fx.set_width(s, pw.get(i).copied().unwrap_or(64));
-                if let Ty::Arr(..) = t {
+                if t.in_place() {
                     arrays.push((s, t.clone(), n.clone()));
                 }
             }
             let done = (|| -> Result<(), E> {
-                // a Go array parameter is the function's own copy
+                // a Go array or a struct parameter is the function's own copy
                 for (s, t, n) in arrays {
-                    let own = !fx.sliced.contains(&n);
+                    let own = !fx.sliced.contains(&n) && !fx.escapes.contains(&n);
                     let src = fx.hidden();
                     fx.ops(&[Op::Load(s), Op::Store(src)]);
                     fx.memory_for(&t, own)?;
@@ -3778,7 +5347,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                     (true, false) => TOP.to_string(),
                     _ => symbol(&name),
                 },
-                params.len() as u32,
+                params.len() as u32 + fx.sret as u32,
                 fx.slots,
                 fx.code,
             );
