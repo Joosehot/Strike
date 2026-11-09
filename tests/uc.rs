@@ -137,6 +137,13 @@ fn bitwise_assignments_are_what_clang_go_and_python_make_of_them() {
     }
 }
 
+/// C int recurrences whose cuts are moved to the loop's exits, through
+/// each other, with two ways out, and a chain of late terms.
+#[test]
+fn recurrences_are_what_clang_makes_of_them() {
+    runs_in_every_mode_as_the_real_one("recur.c");
+}
+
 #[test]
 fn c_bool_is_what_clang_makes_of_it() {
     runs_in_every_mode_as_the_real_one("cbool.c");

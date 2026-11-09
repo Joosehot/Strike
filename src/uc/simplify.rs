@@ -575,12 +575,13 @@ impl Region<'_> {
                 rest = var;
             }
         }
+        let alone = rest.len() == 1 && konst != 0;
         for (c, f) in &rest {
             let f: Vec<&A> = f.iter().collect();
             if negative(*c) {
                 items.push((true, self.emit_term(c.wrapping_neg(), &f)));
             } else {
-                items.push((false, self.emit_term(*c, &f)));
+                items.push((false, self.emit_term_lea(*c, &f, alone)));
             }
         }
         // the order is otherwise kept (stable)
@@ -590,7 +591,10 @@ impl Region<'_> {
             let x = items.remove(p);
             items.insert(0, x);
         }
-        let early = items.iter().filter(|(_, p)| p.1 == 0).count();
+        // the constant goes in after what is ready from the start, and at
+        // least after the first term: in a loop where every term is late
+        // (`y = 7y - 2x + 11`), the latest one is still added last
+        let early = items.iter().filter(|(_, p)| p.1 == 0).count().max(1);
         if items.first().is_some_and(|(neg, _)| *neg) && items.len() == rest.len() {
             // nothing added: -(a + b + ...)
             let all: Vec<(i64, &[A])> = rest.iter().map(|(c, f)| (c.wrapping_neg(), *f)).collect();
@@ -622,6 +626,14 @@ impl Region<'_> {
     /// ready first, the larger first; the constant as a shift where it is a
     /// power of two.
     fn emit_term(&self, c: i64, fs: &[&A]) -> P {
+        self.emit_term_lea(c, fs, false)
+    }
+
+    /// emit_term; with lea, (2^k + 1) x of a local is x << k + x even
+    /// where x comes late: a constant is added to it next, and the two
+    /// become one lea [x + x * 2^k + c] (chain.c's 3x + 5: one instruction
+    /// where imul and add are two, and four cycles)
+    fn emit_term_lea(&self, c: i64, fs: &[&A], lea: bool) -> P {
         if fs.is_empty() {
             return (vec![Op::Push(c)], 0);
         }
@@ -649,7 +661,7 @@ impl Region<'_> {
             un(UnOp::Neg, acc)
         } else if c > 0 && c & (c - 1) == 0 {
             bin(BinOp::Shl, acc, (vec![Op::Push(c.trailing_zeros() as i64)], 0))
-        } else if matches!(c, 3 | 5 | 9) && matches!(acc.0[..], [Op::Load(_)]) && acc.1 == 0 {
+        } else if matches!(c, 3 | 5 | 9) && matches!(acc.0[..], [Op::Load(_)]) && (acc.1 == 0 || lea) {
             let x = acc.clone();
             bin(BinOp::Add, bin(BinOp::Shl, acc, (vec![Op::Push((c - 1).trailing_zeros() as i64)], 0)), x)
         } else {
