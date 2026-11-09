@@ -82,6 +82,11 @@ pub struct Done {
 
 fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
     use BinOp::*;
+    // a checked operation that does not fit: the program stops there,
+    // which only the program itself can do
+    if let Some(r) = op.checked_eval(a, b) {
+        return r;
+    }
     let div_ok = b != 0 && !(a == i64::MIN && b == -1);
     Some(match op {
         Add => a.wrapping_add(b),
@@ -171,9 +176,14 @@ pub fn run(funcs: &[Func], entry: &str, lim: &Limits) -> Option<Done> {
                     UnOp::Plus => x,
                     UnOp::Not => (x == 0) as i64,
                     UnOp::Bnot => !x,
+                    UnOp::NegOv => x.checked_neg()?,
                 });
             }
             Op::Dup => stack.push(*stack.last()?),
+            Op::Sext(n) => {
+                let x = stack.pop()?;
+                stack.push(super::ir::sext(x, *n));
+            }
             Op::Pop => {
                 stack.pop()?;
             }

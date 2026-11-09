@@ -35,6 +35,13 @@ pub enum BinOp {
     /// Python's `and`: the left value if it is false, else the right value
     AndValue,
     OrValue,
+    /// Add, Sub, Mul and Shl whose result must fit 64 bits: a language
+    /// whose numbers do not wrap (Python) stops with an error where they
+    /// would, never giving a wrong number
+    AddOv,
+    SubOv,
+    MulOv,
+    ShlOv,
 }
 
 impl BinOp {
@@ -71,6 +78,35 @@ impl BinOp {
         use BinOp::*;
         matches!(self, Eq | Ne | Lt | Le | Gt | Ge)
     }
+
+    /// The operation that stops where the number would not fit, for a
+    /// language whose numbers do not wrap.
+    pub fn checked(self) -> BinOp {
+        match self {
+            BinOp::Add => BinOp::AddOv,
+            BinOp::Sub => BinOp::SubOv,
+            BinOp::Mul => BinOp::MulOv,
+            BinOp::Shl => BinOp::ShlOv,
+            b => b,
+        }
+    }
+
+    /// The result of a checked operation, or None where it does not fit.
+    pub fn checked_eval(self, a: i64, b: i64) -> Option<Option<i64>> {
+        Some(match self {
+            BinOp::AddOv => a.checked_add(b),
+            BinOp::SubOv => a.checked_sub(b),
+            BinOp::MulOv => a.checked_mul(b),
+            BinOp::ShlOv => {
+                if (0..64).contains(&b) && (a << b) >> b == a {
+                    Some(a << b)
+                } else {
+                    None
+                }
+            }
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -80,6 +116,8 @@ pub enum UnOp {
     /// 1 if zero, else 0
     Not,
     Bnot,
+    /// Neg that stops on the lowest number (its negation does not fit)
+    NegOv,
 }
 
 impl UnOp {
@@ -119,6 +157,9 @@ pub enum Op {
     /// pops and prints in decimal
     PrintInt,
     PrintStr(Vec<u8>),
+    /// the top cut to its low n bits and sign-extended back (a C int, a Go
+    /// int32: what a result of that width is)
+    Sext(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +169,12 @@ pub struct Func {
     pub params: u32,
     pub slots: u32,
     pub code: Vec<Op>,
+}
+
+/// v cut to its low n bits and sign-extended back.
+pub fn sext(v: i64, n: u8) -> i64 {
+    let s = 64 - n as u32;
+    v.wrapping_shl(s).wrapping_shr(s)
 }
 
 /// How many loops hold each operation (a loop: the operations between a
@@ -158,7 +205,7 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-1";
+pub const CODEGEN: &str = "strike-x64-2";
 
 impl Func {
     /// The brand of the function's machine code: the hash of everything that
@@ -195,6 +242,7 @@ impl Func {
                     h.update(s);
                     (15, 0)
                 }
+                Op::Sext(n) => (16, *n as i64),
             };
             h.update(&[tag]);
             h.update(&a.to_le_bytes());

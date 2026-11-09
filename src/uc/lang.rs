@@ -41,6 +41,14 @@ struct Raw {
     #[serde(default)]
     bool_print: Vec<String>,
     #[serde(default)]
+    overflow: Option<String>,
+    #[serde(default)]
+    promote: Option<u8>,
+    #[serde(default)]
+    literals: Option<String>,
+    #[serde(default)]
+    int_widths: BTreeMap<String, u8>,
+    #[serde(default)]
     bool_constants: BTreeMap<String, i64>,
     #[serde(default)]
     binary: BTreeMap<String, (u8, String)>,
@@ -161,6 +169,15 @@ pub struct Lang {
     pub param_first: bool,
     pub type_words: HashSet<String>,
     pub chain_error: bool,
+    /// the language's numbers do not wrap (Python): arithmetic that would
+    /// leave 64 bits stops with an error
+    pub checked: bool,
+    /// bits of each integer type (none: every number is 64 bits)
+    pub int_widths: HashMap<String, u8>,
+    /// the narrowest width arithmetic is done at (C: int)
+    pub promote: u8,
+    /// a literal takes the width of what it meets (Go) instead of its own
+    pub untyped_literals: bool,
     pub bool_print: Option<(String, String)>,
     pub bool_constants: HashMap<String, i64>,
     pub binary: HashMap<String, (u8, BinOp)>,
@@ -368,6 +385,18 @@ impl Lang {
                 "error" => true,
                 "allow" => false,
                 c => return Err(err(format!("unknown chained_comparisons {c}"))),
+            },
+            int_widths: r.int_widths.clone().into_iter().collect(),
+            promote: r.promote.unwrap_or(0),
+            untyped_literals: match r.literals.as_deref() {
+                None | Some("typed") => false,
+                Some("untyped") => true,
+                Some(x) => return Err(err(format!("unknown literals {x}"))),
+            },
+            checked: match r.overflow.as_deref() {
+                None | Some("wrap") => false,
+                Some("error") => true,
+                Some(o) => return Err(err(format!("unknown overflow {o}"))),
             },
             string_quotes: one_byte(&r.string_quotes, "a string quote").map_err(err)?,
             char_quotes: one_byte(&r.char_quotes, "a character quote").map_err(err)?,

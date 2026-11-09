@@ -350,6 +350,8 @@ struct G {
     magic_at: Vec<bool>,
     /// the operation being compiled
     op_at: usize,
+    /// where checked operations jump when a number would not fit
+    trap_at: Option<u32>,
     /// division of numbers that fit 32 bits by the 32-bit instruction
     div32: bool,
 }
@@ -618,6 +620,13 @@ impl G {
         }
         self.to_reg(left, RAX);
         let zero = matches!(o, Opd::Imm(0));
+        if matches!(b, BinOp::AddOv | BinOp::SubOv | BinOp::MulOv | BinOp::ShlOv) {
+            self.into_rcx(o);
+            let t = self.trap();
+            super::x64::checked(&mut self.a, Some(b), t);
+            self.v.push(V::Rax);
+            return;
+        }
         match b {
             BinOp::Add | BinOp::Sub | BinOp::Bor | BinOp::Bxor if zero => {}
             BinOp::Add => self.alu(0, RAX, o),
@@ -907,6 +916,29 @@ impl G {
         true
     }
 
+    fn trap(&mut self) -> u32 {
+        match self.trap_at {
+            Some(t) => t,
+            None => {
+                let t = self.a.label();
+                self.trap_at = Some(t);
+                t
+            }
+        }
+    }
+
+    fn sext(&mut self, n: u8) {
+        match self.pop() {
+            V::Imm(c) => self.v.push(V::Imm(super::ir::sext(c, n))),
+            x => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                super::x64::sext_reg(&mut self.a, RAX, n);
+                self.v.push(V::Rax);
+            }
+        }
+    }
+
     fn un(&mut self, u: UnOp) {
         let x = self.pop();
         match (u, x) {
@@ -917,6 +949,13 @@ impl G {
                 self.to_reg(x, RAX);
                 self.a.e(&[0x48, 0x85, 0xC0]);
                 self.v.push(V::Flags(0x94));
+            }
+            (UnOp::NegOv, x) => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                let t = self.trap();
+                super::x64::checked(&mut self.a, None, t);
+                self.v.push(V::Rax);
             }
             (u, x) => {
                 self.need_rax();
@@ -935,6 +974,7 @@ impl G {
                 Op::Load(s) => self.push(V::Slot(*s)),
                 Op::Bin(b) => self.bin(*b, &mut |a: &mut Asm| a.label()),
                 Op::Un(u) => self.un(*u),
+                Op::Sext(n) => self.sext(*n),
                 _ => unreachable!("fast_path takes only plain operations"),
             }
         }
@@ -1066,6 +1106,11 @@ fn fast_path(f: &Func) -> Option<Fast> {
                     st.push(K::Done);
                     ops.push(Op::Un(*u));
                 }
+                Op::Sext(n) => {
+                    st.pop()?;
+                    st.push(K::Done);
+                    ops.push(Op::Sext(*n));
+                }
                 Op::Bin(b) => {
                     use BinOp::*;
                     let r = st.pop()?;
@@ -1149,7 +1194,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, div32: rules.division.bypass_32 };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32 };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9
@@ -1233,7 +1278,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             let after = d + match &code[i] {
                 Op::Push(_) | Op::Load(_) | Op::Dup => 1,
                 Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret => -1,
-                Op::Un(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) => 0,
+                Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) => 0,
                 Op::Call(_, n) => 1 - *n as i32,
             };
             match &code[i] {
@@ -1289,6 +1334,19 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                     continue;
                 }
             }
+            // a narrow result (a C int): worked out in the local's register
+            // and cut there
+            (Op::Bin(b), Some(Op::Sext(n))) => {
+                if let Some(Op::Store(s)) = f.code.get(at + 2) {
+                    if g.bin_into(*b, *s) {
+                        let d = g.slot_reg(*s);
+                        super::x64::sext_reg(&mut g.a, d, *n);
+                        zero[*s as usize] = false;
+                        skip = 2;
+                        continue;
+                    }
+                }
+            }
             _ => {}
         }
         match op {
@@ -1301,6 +1359,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             }
             Op::Bin(b) => g.bin(*b, &mut new_label),
             Op::Un(u) => g.un(*u),
+            Op::Sext(n) => g.sext(*n),
             Op::Dup => match g.v.last().copied() {
                 Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..))) => g.push(x),
                 _ => {
@@ -1409,6 +1468,9 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 live = false;
             }
         }
+    }
+    if let Some(t) = g.trap_at {
+        super::x64::trap(&mut g.a, t);
     }
     g.a.finish()
 }

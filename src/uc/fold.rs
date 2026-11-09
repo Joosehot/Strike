@@ -7,6 +7,11 @@ use super::ir::{BinOp, Func, Op, UnOp};
 
 fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
     use BinOp::*;
+    // a checked operation is folded only where it fits; else the program
+    // must stop there when it runs
+    if let Some(r) = op.checked_eval(a, b) {
+        return r;
+    }
     let div_ok = b != 0 && !(a == i64::MIN && b == -1);
     Some(match op {
         Add => a.wrapping_add(b),
@@ -51,18 +56,18 @@ pub fn run(f: &mut Func) -> usize {
             let n = out.len();
             let folded: Option<(usize, Vec<Op>)> = match &out[..] {
                 [.., Op::Push(a), Op::Push(b), Op::Bin(op)] => bin(*op, *a, *b).map(|v| (3, vec![Op::Push(v)])),
-                [.., Op::Push(a), Op::Un(u)] => Some((
-                    2,
-                    vec![Op::Push(match u {
-                        UnOp::Neg => a.wrapping_neg(),
-                        UnOp::Plus => *a,
-                        UnOp::Not => (*a == 0) as i64,
-                        UnOp::Bnot => !*a,
-                    })],
-                )),
+                [.., Op::Push(a), Op::Un(u)] => match u {
+                    UnOp::Neg => Some(a.wrapping_neg()),
+                    UnOp::Plus => Some(*a),
+                    UnOp::Not => Some((*a == 0) as i64),
+                    UnOp::Bnot => Some(!*a),
+                    UnOp::NegOv => a.checked_neg(),
+                }
+                .map(|v| (2, vec![Op::Push(v)])),
                 [.., Op::Push(a), Op::Jz(l)] => Some((2, if *a == 0 { vec![Op::Jmp(*l)] } else { vec![] })),
                 [.., Op::Push(a), Op::Jnz(l)] => Some((2, if *a != 0 { vec![Op::Jmp(*l)] } else { vec![] })),
                 [.., Op::Push(_), Op::Pop] => Some((2, vec![])),
+                [.., Op::Push(a), Op::Sext(n)] => Some((2, vec![Op::Push(super::ir::sext(*a, *n))])),
                 _ => None,
             };
             match folded {

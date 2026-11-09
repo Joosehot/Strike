@@ -25,6 +25,23 @@ param_name = "last"
 type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "const", "int64_t", "int32_t"]
 chained_comparisons = "allow"
 bool_print = []
+# integers as clang makes them on Windows (x86-64): long is 32 bits there.
+# Arithmetic is done at least as wide as int; a result is cut back to the
+# width of where it goes, as C converts it. unsigned is refused, not
+# guessed: it wraps and compares differently.
+promote = 32
+literals = "typed"
+
+[int_widths]
+int = 32
+long = 32
+"long long" = 64
+short = 16
+char = 8
+int64_t = 64
+int32_t = 32
+bool = 8
+_Bool = 8
 
 [bool_constants]
 true = 1

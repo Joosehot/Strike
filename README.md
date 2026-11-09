@@ -93,8 +93,10 @@ How a file becomes an executable:
      zero, Python rounds down.
 3. **Brands per function.** Each function is branded by its IR. A
    function whose brand already exists is struck instead of compiled, even
-   if the brand came from another language. The same function in C, Go and
-   Python is the same IR.
+   if the brand came from another language. The same work in two languages
+   is the same IR: a C `long long` function and a Go `int` one share their
+   brand. A C `int` one does not, since it wraps at 32 bits, and neither
+   does a Python one, which does not wrap at all.
 4. **Machine code by Strike.** x86-64 is written byte by byte in one pass,
    with no LLVM and no assembler.
 5. **The executable by Strike.** The PE file, its import table (KERNEL32)
@@ -108,6 +110,40 @@ end without one. Stage one has integers and truth values, functions,
 if/else, while, for, Python's `range`, break and continue, and printing
 (including printf formats). It has no floats, strings as values, arrays,
 structs or libraries yet.
+
+### Integers as each language has them
+
+Two places gave a wrong number with no warning. Both are fixed:
+
+- **Python's integers have no upper bound; Strike's are 64 bits.** 25!
+  came out as 7034535277573963776. Now `+`, `-`, `*`, `<<` and unary `-`
+  in Python are checked operations (`overflow = "error"` in
+  python.toml). Where a number would leave 64 bits, the program stops with
+  exit code 1 and says so on standard error. It never goes on with a wrong
+  number. Folding, working out while compiling, LICM and the closed form
+  of sums all leave a checked operation alone where it could stop the
+  program. Before this, the closed form would have wrapped a Python sum
+  without a word.
+- **C's `int` was 64 bits in Strike; clang's is 32.** On Windows clang's
+  `long` is 32 bits too. Now each type has its width (`[int_widths]` in
+  c.toml and go.toml). Arithmetic is done at least as wide as `int`, and a
+  result is cut back to the width of where it goes (`Sext` in the IR),
+  as C converts it. Go's `int32` wraps at 32 bits as Go defines. A Go
+  literal takes the width of what it meets, and one that does not fit is
+  an error, as in Go. `unsigned`, Go's `uint` and pointers are refused,
+  not guessed.
+
+[tests/uc/widths.c](tests/uc/widths.c) prints what clang -O0 prints in
+every mode: int, long, short and char wrapping, a parameter's conversion,
+and `-INT_MIN`. [tests/uc/widths.go](tests/uc/widths.go) prints what Go
+prints. A Python test checks that 20! prints and 25! stops the program,
+in every mode.
+
+The cost: a C `long` loop now cuts its results to 32 bits, as it must.
+Clang -O2 does not cut them, because signed overflow is undefined in C
+and it works in 32-bit registers. On 30 million `(a * 31 + b) % 1000003`
+Strike went from 0.085 s to 0.095 s, still 3.5% faster than clang -O2.
+Proving that no overflow can happen, and so leaving the cut out, is next.
 
 [tests/uc/](tests/uc/) holds the same suite in all three languages.
 Strike's executables print byte for byte what clang, Go and Python print

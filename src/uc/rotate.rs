@@ -24,7 +24,7 @@ pub fn run(f: &mut Func) -> usize {
         for j in 0..code.len().saturating_sub(1) {
             let (Op::Jmp(top), Op::Label(end)) = (&code[j], &code[j + 1]) else { continue };
             let Some(t) = code[..j].iter().rposition(|o| *o == Op::Label(*top)) else { continue };
-            let Some(k) = code[t + 1..j].iter().position(|o| !matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_))) else {
+            let Some(k) = code[t + 1..j].iter().position(|o| !matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_))) else {
                 continue;
             };
             let z = t + 1 + k;

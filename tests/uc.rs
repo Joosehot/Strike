@@ -56,6 +56,51 @@ fn python_prints_what_python_prints() {
 }
 
 #[test]
+fn c_integers_have_clangs_widths_in_every_mode() {
+    let want = std::fs::read(suite("widths.c.out")).unwrap();
+    let r = root("widths-c");
+    for mode in ["--plain", "--opt", "--release", "--release-run"] {
+        let exe = r.join(format!("w{mode}.exe"));
+        let extra: Vec<&str> = match mode {
+            "--opt" => vec![],
+            "--release-run" => vec!["--release", "--no-evaluate"],
+            m => vec![m],
+        };
+        let o = compile_with(&r, &suite("widths.c"), &exe, &extra, None);
+        assert!(o.status.success(), "{}", text(&o));
+        let run = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&want), "{mode}");
+    }
+}
+
+#[test]
+fn go_int32_wraps_as_go_does() {
+    runs_as_the_real_one("widths.go", "Go");
+}
+
+#[test]
+fn a_python_number_that_leaves_64_bits_stops_the_program_instead_of_wrapping() {
+    let r = root("python-overflow");
+    let p = r.join("fact.py");
+    std::fs::write(&p, "def fact(n):\n    f = 1\n    for i in range(1, n + 1):\n        f = f * i\n    return f\nprint(fact(20))\nprint(fact(25))\nprint(\"never\")\nx = 1\nprint(x << 70)\n").unwrap();
+    for mode in ["--plain", "--opt", "--release", "--release-run"] {
+        let exe = r.join(format!("f{mode}.exe"));
+        let extra: Vec<&str> = match mode {
+            "--opt" => vec![],
+            "--release-run" => vec!["--release", "--no-evaluate"],
+            m => vec![m],
+        };
+        let o = compile_with(&r, &p, &exe, &extra, None);
+        assert!(o.status.success(), "{}", text(&o));
+        let run = Command::new(&exe).output().unwrap();
+        // 20! fits; 25! does not, and Python would print it: Strike stops
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "2432902008176640000\n", "{mode}");
+        assert_eq!(run.status.code(), Some(1), "{mode}");
+        assert!(String::from_utf8_lossy(&run.stderr).contains("grew past 64 bits"), "{mode}");
+    }
+}
+
+#[test]
 fn the_language_is_found_without_the_extension() {
     let r = root("noext");
     let src = r.join("program.txt");
@@ -373,6 +418,9 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("undeclared.c", "int main() { return y; }\n", "y is not declared"),
         ("none.py", "def f(x):\n    if x:\n        return 1\nprint(f(0))\n", "can end without returning"),
         ("nolang.txt", "SELECT * FROM t;\n", "no description reads the whole file"),
+        ("unsigned.c", "int main() { unsigned int x = 1; return x; }\n", "unsigned numbers are not in Strike yet"),
+        ("pointer.c", "int f(int *p) { return 0; }\nint main() { return 0; }\n", "pointers and arrays are not in Strike yet"),
+        ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
     ] {
         let p = r.join(name);
         std::fs::write(&p, src).unwrap();

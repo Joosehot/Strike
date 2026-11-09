@@ -61,10 +61,32 @@ fn constant(e: &Expr) -> Option<i64> {
     }
 }
 
+/// The bits of a type the language writes (64 where it writes none, or
+/// where its numbers have no width of their own).
+fn width_of(l: &Lang, words: &[String]) -> Result<u8, String> {
+    if l.int_widths.is_empty() || words.is_empty() {
+        return Ok(64);
+    }
+    let w: Vec<&str> = words.iter().map(String::as_str).filter(|s| !matches!(*s, "static" | "const" | "signed" | "register" | "volatile")).collect();
+    if w.iter().any(|s| *s == "unsigned" || s.starts_with("uint") || *s == "byte") {
+        return Err("unsigned numbers are not in Strike yet: they wrap and compare differently, so they are not guessed at".into());
+    }
+    if w.iter().any(|s| *s == "*" || *s == "[" || *s == "]") {
+        return Err("pointers and arrays are not in Strike yet".into());
+    }
+    let key = if w.len() > 1 && w.last() == Some(&"int") { w[..w.len() - 1].join(" ") } else { w.join(" ") };
+    if key == "void" || key.is_empty() {
+        return Ok(64);
+    }
+    l.int_widths.get(&key).copied().ok_or(format!("the type {key} is not in Strike yet"))
+}
+
 struct Shared<'a> {
     l: &'a Lang,
     bools: bool,
     sigs: &'a HashMap<String, Sig>,
+    /// each function's parameter widths and result width
+    fw: &'a HashMap<String, (Vec<u8>, u8)>,
     /// callee -> the types seen at each parameter
     args: HashMap<String, Vec<Vec<Ty>>>,
     /// calls whose result is used: (callee, line)
@@ -81,6 +103,13 @@ struct Fx<'s, 'a> {
     rets: Vec<(Ty, u32)>,
     top: bool,
     line: u32,
+    /// the bits of each slot's type (64 where not known narrower)
+    widths: HashMap<u32, u8>,
+    /// the width of the value expr just left: the bits it is known to fit,
+    /// sign-extended (0: a literal that takes the width of what it meets)
+    last_w: u8,
+    /// the width of what this function returns
+    ret_w: u8,
 }
 
 impl Fx<'_, '_> {
@@ -114,6 +143,46 @@ impl Fx<'_, '_> {
         self.scopes.last_mut().unwrap().insert(name.to_string(), (slot, ty));
         slot
     }
+    fn width(&self, slot: u32) -> u8 {
+        self.widths.get(&slot).copied().unwrap_or(64)
+    }
+    fn typed(&self) -> bool {
+        !self.sh.l.int_widths.is_empty()
+    }
+    /// A value of width `from` going where `to` bits are kept: cut to them
+    /// and sign-extended back, as C and Go convert.
+    fn narrow(&mut self, to: u8, from: u8) -> Result<(), E> {
+        if !self.typed() || to >= 64 || (from != 0 && from <= to) {
+            return Ok(());
+        }
+        if from == 0 && self.sh.l.untyped_literals {
+            // a constant that does not fit is an error in Go, not a wrap
+            if let Some(Op::Push(c)) = self.code.last() {
+                let (lo, hi) = (-(1i64 << (to - 1)), (1i64 << (to - 1)) - 1);
+                if *c < lo || *c > hi {
+                    return self.err(format!("{c} does not fit {to} bits"));
+                }
+                return Ok(());
+            }
+        }
+        self.emit(Op::Sext(to));
+        Ok(())
+    }
+    /// The width arithmetic on two values is done at.
+    fn arith_width(&self, a: u8, b: u8) -> u8 {
+        if !self.typed() {
+            return 64;
+        }
+        let w = match (a, b) {
+            (0, x) | (x, 0) => x,
+            (x, y) => x.max(y),
+        };
+        if w == 0 {
+            0
+        } else {
+            w.max(self.sh.l.promote)
+        }
+    }
     fn hidden(&mut self) -> u32 {
         self.slots += 1;
         self.slots - 1
@@ -146,10 +215,17 @@ impl Fx<'_, '_> {
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), E> {
         match s {
-            Stmt::Var { name, value, line } => {
+            Stmt::Var { name, ty: words, value, line } => {
                 self.line = *line;
+                let dw = width_of(self.sh.l, words).map_err(|m| (*line, m))?;
                 let ty = match value {
-                    Some(e) => self.expr(e, true)?,
+                    Some(e) => {
+                        let t = self.expr(e, true)?;
+                        let from = self.last_w;
+                        // Go's `x := 5` is an int: the literal's own width
+                        self.narrow(dw, from)?;
+                        t
+                    }
                     None => {
                         self.emit(Op::Push(0));
                         Ty::Int
@@ -163,7 +239,11 @@ impl Fx<'_, '_> {
                         self.same(name, was, ty)?;
                         slot
                     }
-                    _ => self.declare(name, ty),
+                    _ => {
+                        let s = self.declare(name, ty);
+                        self.widths.insert(s, dw);
+                        s
+                    }
                 };
                 self.emit(Op::Store(slot));
             }
@@ -179,11 +259,16 @@ impl Fx<'_, '_> {
                         }
                         self.emit(Op::Load(slot));
                         self.expr(value, true)?;
-                        self.emit(Op::Bin(*op));
+                        let op = if self.sh.l.checked { op.checked() } else { *op };
+                        self.emit(Op::Bin(op));
+                        // done at the promoted width, then put back in the variable's
+                        let w = self.width(slot);
+                        self.narrow(w, 64)?;
                         self.emit(Op::Store(slot));
                     }
                     None => {
                         let ty = self.expr(value, true)?;
+                        let from = self.last_w;
                         let slot = match self.lookup(name) {
                             Some((slot, was)) => {
                                 self.same(name, was, ty)?;
@@ -192,6 +277,8 @@ impl Fx<'_, '_> {
                             None if !self.sh.l.block_scope => self.declare(name, ty),
                             None => return self.err(format!("{name} is not declared")),
                         };
+                        let w = self.width(slot);
+                        self.narrow(w, from)?;
                         self.emit(Op::Store(slot));
                     }
                 }
@@ -322,6 +409,8 @@ impl Fx<'_, '_> {
                 match e {
                     Some(e) => {
                         let t = self.expr(e, true)?;
+                        let (to, from) = (self.ret_w, self.last_w);
+                        self.narrow(to, from)?;
                         self.rets.push((t, *line));
                     }
                     None => self.emit(Op::Push(0)),
@@ -452,9 +541,20 @@ impl Fx<'_, '_> {
     /// Lowers an expression, leaving its value on the stack; `used` is false
     /// only for an expression statement.
     fn expr(&mut self, e: &Expr, used: bool) -> Result<Ty, E> {
+        // every case leaves the width of its value in last_w; a truth
+        // value fits 8 bits
         Ok(match e {
             Expr::Num(v, b) => {
                 self.emit(Op::Push(*v));
+                self.last_w = if *b || !self.typed() {
+                    if *b { 8 } else { 64 }
+                } else if self.sh.l.untyped_literals {
+                    0
+                } else if i32::try_from(*v).is_ok() {
+                    32
+                } else {
+                    64
+                };
                 if *b {
                     self.bool_ty()
                 } else {
@@ -468,6 +568,7 @@ impl Fx<'_, '_> {
                     return self.err(format!("{name} is not declared"));
                 };
                 self.emit(Op::Load(slot));
+                self.last_w = self.width(slot);
                 ty
             }
             Expr::Call(name, args, line) => {
@@ -479,8 +580,12 @@ impl Fx<'_, '_> {
                     return self.err(format!("{name} takes {} values, given {}", sig.params.len(), args.len()));
                 }
                 let mut tys = Vec::new();
-                for a in args {
+                let (pw, rw) = self.sh.fw.get(name).cloned().unwrap_or_default();
+                for (i, a) in args.iter().enumerate() {
                     tys.push(self.expr(a, true)?);
+                    // an argument is converted to its parameter's type
+                    let from = self.last_w;
+                    self.narrow(pw.get(i).copied().unwrap_or(64), from)?;
                 }
                 let seen = self.sh.args.entry(name.clone()).or_insert_with(|| vec![Vec::new(); args.len()]);
                 for (i, t) in tys.into_iter().enumerate() {
@@ -490,18 +595,30 @@ impl Fx<'_, '_> {
                     self.sh.used.push((name.clone(), *line));
                 }
                 self.emit(Op::Call(symbol(name), args.len() as u32));
+                self.last_w = if rw == 0 { 64 } else { rw };
                 sig.ret
             }
             Expr::Un(op, x) => {
                 self.expr(x, true)?;
+                let w = self.arith_width(self.last_w, self.last_w);
                 match op {
-                    UnOp::Plus => Ty::Int,
+                    UnOp::Plus => {
+                        self.last_w = w;
+                        Ty::Int
+                    }
                     UnOp::Not => {
                         self.emit(Op::Un(UnOp::Not));
+                        self.last_w = 8;
                         self.bool_ty()
                     }
                     _ => {
-                        self.emit(Op::Un(*op));
+                        let op = if self.sh.l.checked && *op == UnOp::Neg { UnOp::NegOv } else { *op };
+                        self.emit(Op::Un(op));
+                        // -INT_MIN is INT_MIN again at 32 bits
+                        if op == UnOp::Neg && w > 0 {
+                            self.narrow(w, 64)?;
+                        }
+                        self.last_w = w;
                         Ty::Int
                     }
                 }
@@ -520,6 +637,7 @@ impl Fx<'_, '_> {
                     self.emit(Op::Label(cut));
                     self.emit(Op::Push(short));
                     self.emit(Op::Label(end));
+                    self.last_w = 8;
                     self.bool_ty()
                 }
                 BinOp::AndValue | BinOp::OrValue => {
@@ -533,15 +651,27 @@ impl Fx<'_, '_> {
                     if ta != tb && self.sh.bools {
                         return self.err("and/or between a number and a truth value is not in Strike yet");
                     }
+                    self.last_w = 64;
                     ta
                 }
                 _ => {
                     self.expr(a, true)?;
+                    let wa = self.last_w;
                     self.expr(b, true)?;
-                    self.emit(Op::Bin(*op));
+                    let wb = self.last_w;
+                    let op = if self.sh.l.checked { op.checked() } else { *op };
+                    self.emit(Op::Bin(op));
                     if op.is_comparison() {
+                        self.last_w = 8;
                         self.bool_ty()
                     } else {
+                        // the operation at its width: a result that can leave
+                        // it is cut back, as the machine of that width would
+                        let w = self.arith_width(wa, wb);
+                        if w > 0 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::DivTrunc) {
+                            self.narrow(w, 64)?;
+                        }
+                        self.last_w = if w == 0 { 0 } else { w };
                         Ty::Int
                     }
                 }
@@ -580,11 +710,17 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             None => return Err((1, "there is no main function".into())),
         }
     };
+    let mut fw: HashMap<String, (Vec<u8>, u8)> = HashMap::new();
+    for f in &p.funcs {
+        let ps = f.param_types.iter().map(|t| width_of(l, t)).collect::<Result<Vec<u8>, String>>().map_err(|m| (f.line, m))?;
+        let ret = width_of(l, &f.ret).map_err(|m| (f.line, m))?;
+        fw.insert(f.name.clone(), (ps, ret));
+    }
     let bools = l.bool_print.is_some();
     let mut sigs: HashMap<String, Sig> =
         p.funcs.iter().map(|f| (f.name.clone(), Sig { params: vec![Ty::Int; f.params.len()], ret: Ty::Int })).collect();
     for _round in 0..10 {
-        let mut sh = Shared { l, bools, sigs: &sigs, args: HashMap::new(), used: Vec::new() };
+        let mut sh = Shared { l, bools, sigs: &sigs, fw: &fw, args: HashMap::new(), used: Vec::new() };
         let mut funcs = Vec::new();
         let mut rets: HashMap<String, Vec<(Ty, u32)>> = HashMap::new();
         let mut bodies: Vec<(String, u32, Vec<(String, Ty)>, &[Stmt], bool)> = p
@@ -599,6 +735,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             bodies.push((String::new(), 1, Vec::new(), p.top.as_slice(), true));
         }
         for (name, line, params, body, top) in bodies {
+            let (pw, ret_w) = fw.get(&name).cloned().unwrap_or_default();
             let mut fx = Fx {
                 sh: &mut sh,
                 code: Vec::new(),
@@ -609,9 +746,13 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                 rets: Vec::new(),
                 top,
                 line,
+                widths: HashMap::new(),
+                last_w: 64,
+                ret_w: if top { 64 } else { ret_w },
             };
-            for (n, t) in &params {
-                fx.declare(n, *t);
+            for (i, (n, t)) in params.iter().enumerate() {
+                let s = fx.declare(n, *t);
+                fx.widths.insert(s, pw.get(i).copied().unwrap_or(64));
             }
             fx.push_scope();
             for s in body {

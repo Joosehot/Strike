@@ -1,4 +1,4 @@
-﻿//! Strike IR to x86-64 machine code, written byte by byte (no assembler, no
+//! Strike IR to x86-64 machine code, written byte by byte (no assembler, no
 //! LLVM). One pass over a function: the IR's stack is the machine's stack,
 //! and every slot has its place below rbp. Calls follow the Windows x64
 //! convention (rcx, rdx, r8, r9, 32 bytes of shadow space, rsp aligned to 16
@@ -149,6 +149,8 @@ pub fn compile(f: &Func) -> Code {
     }
 
     let mut depth: u32 = 0;
+    // where checked operations go when a number would not fit
+    let mut trap_at: Option<u32> = None;
     for op in &f.code {
         match op {
             Op::Push(v) => {
@@ -180,6 +182,11 @@ pub fn compile(f: &Func) -> Code {
                 a.e(&[0x48, 0x83, 0xC4, 0x08]);
                 depth -= 1;
             }
+            Op::Sext(n) => {
+                a.e(&[0x58]);
+                sext_reg(&mut a, 0, *n);
+                a.e(&[0x50]);
+            }
             Op::Un(u) => {
                 a.e(&[0x58]);
                 match u {
@@ -187,6 +194,10 @@ pub fn compile(f: &Func) -> Code {
                     UnOp::Bnot => a.e(&[0x48, 0xF7, 0xD0]),
                     UnOp::Not => a.e(&[0x48, 0x85, 0xC0, 0x0F, 0x94, 0xC0, 0x0F, 0xB6, 0xC0]),
                     UnOp::Plus => {}
+                    UnOp::NegOv => {
+                        let t = *trap_at.get_or_insert_with(|| a.label());
+                        checked(&mut a, None, t);
+                    }
                 }
                 a.e(&[0x50]);
             }
@@ -194,6 +205,10 @@ pub fn compile(f: &Func) -> Code {
                 a.e(&[0x59, 0x58]); // pop rcx (right); pop rax (left)
                 let set = |a: &mut Asm, cc: u8| a.e(&[0x48, 0x39, 0xC8, 0x0F, cc, 0xC0, 0x0F, 0xB6, 0xC0]);
                 match b {
+                    BinOp::AddOv | BinOp::SubOv | BinOp::MulOv | BinOp::ShlOv => {
+                        let t = *trap_at.get_or_insert_with(|| a.label());
+                        checked(&mut a, Some(*b), t);
+                    }
                     BinOp::Add => a.e(&[0x48, 0x01, 0xC8]),
                     BinOp::Sub => a.e(&[0x48, 0x29, 0xC8]),
                     BinOp::Mul => a.e(&[0x48, 0x0F, 0xAF, 0xC1]),
@@ -268,6 +283,9 @@ pub fn compile(f: &Func) -> Code {
                 depth = depth.saturating_sub(1);
             }
         }
+    }
+    if let Some(t) = trap_at {
+        trap(&mut a, t);
     }
     a.finish()
 }
@@ -364,7 +382,89 @@ pub fn runtime(entry: &str) -> Vec<(String, Code)> {
     a.e(&[0xCC]);
     let start = a.finish();
 
-    vec![("rt.start".into(), start), ("rt.print_str".into(), print_str), ("rt.print_int".into(), print_int)]
+    vec![
+        ("rt.start".into(), start),
+        ("rt.print_str".into(), print_str),
+        ("rt.print_int".into(), print_int),
+        ("rt.overflow".into(), overflow()),
+    ]
+}
+
+/// movsx r, r (the low n bits of r, sign-extended).
+pub(super) fn sext_reg(a: &mut Asm, r: u8, n: u8) {
+    let rex = 0x48 | ((r >> 3) & 1) << 2 | ((r >> 3) & 1);
+    let modrm = 0xC0 | (r & 7) << 3 | (r & 7);
+    match n {
+        32 => a.e(&[rex, 0x63, modrm]),
+        16 => a.e(&[rex, 0x0F, 0xBF, modrm]),
+        8 => a.e(&[rex, 0x0F, 0xBE, modrm]),
+        _ => unreachable!("widths are 8, 16, 32"),
+    }
+}
+
+/// rax op rcx for the checked operations (or neg rax), jumping to `trap`
+/// where the number would not fit 64 bits. rdx and r8 may be used.
+pub(super) fn checked(a: &mut Asm, op: Option<BinOp>, trap: u32) {
+    const JO: u8 = 0;
+    match op {
+        None => {
+            a.e(&[0x48, 0xF7, 0xD8]); // neg rax
+            a.jcc(JO, trap);
+        }
+        Some(BinOp::AddOv) => {
+            a.e(&[0x48, 0x01, 0xC8]);
+            a.jcc(JO, trap);
+        }
+        Some(BinOp::SubOv) => {
+            a.e(&[0x48, 0x29, 0xC8]);
+            a.jcc(JO, trap);
+        }
+        Some(BinOp::MulOv) => {
+            a.e(&[0x48, 0x0F, 0xAF, 0xC1]);
+            a.jcc(JO, trap);
+        }
+        Some(BinOp::ShlOv) => {
+            // a count of 0..63 whose shift can be undone exactly
+            a.e(&[0x48, 0x83, 0xF9, 0x3F]); // cmp rcx, 63
+            a.jcc(7, trap); // above, unsigned: also a negative count
+            a.e(&[0x48, 0x89, 0xC2, 0x48, 0xD3, 0xE0]); // mov rdx, rax; shl rax, cl
+            a.e(&[0x49, 0x89, 0xC0, 0x49, 0xD3, 0xF8, 0x49, 0x39, 0xD0]); // mov r8, rax; sar r8, cl; cmp r8, rdx
+            a.jcc(5, trap);
+        }
+        Some(b) => unreachable!("{b:?} is not checked"),
+    }
+}
+
+/// Where a function's checked operations jump: the stack aligned, and
+/// rt.overflow, which does not come back.
+pub(super) fn trap(a: &mut Asm, at: u32) {
+    a.bind(at);
+    a.e(&[0x48, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20]); // and rsp, -16; sub rsp, 32
+    a.call("rt.overflow");
+    a.e(&[0xCC]);
+}
+
+/// What rt.overflow says, on standard error, before the program stops
+/// with exit code 1.
+pub const OVERFLOW: &[u8] = b"strike: a number grew past 64 bits here; this language's numbers do not stop there, and Strike has no larger numbers yet, so the program stops\n";
+
+fn overflow() -> Code {
+    let mut a = Asm::new();
+    a.e(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 56
+    a.e(&[0x48, 0xC7, 0xC1, 0xF4, 0xFF, 0xFF, 0xFF]); // mov rcx, -12 (standard error)
+    a.call_import("GetStdHandle");
+    a.e(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+    a.e(&[0x48, 0x8D, 0x15]); // lea rdx, [rip + OVERFLOW]
+    a.reloc(Target::Data(OVERFLOW.to_vec()));
+    a.e(&[0x49, 0xC7, 0xC0]); // mov r8, len
+    a.d32(OVERFLOW.len() as i32);
+    a.e(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9, [rsp+40]
+    a.e(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+32], 0
+    a.call_import("WriteFile");
+    a.e(&[0xB9, 1, 0, 0, 0]); // mov ecx, 1
+    a.call_import("ExitProcess");
+    a.e(&[0xCC]);
+    a.finish()
 }
 
 /// What a baking run prints after the program's own output, before the

@@ -13,7 +13,7 @@
 //! with no label or jump every value's expression is a contiguous run of
 //! operations, found by following the stack.
 
-use super::ir::{label_count, BinOp, Func, Op};
+use super::ir::{label_count, BinOp, Func, Op, UnOp};
 
 /// For every operation that leaves a value, where the run that makes that
 /// value begins; None where it is not a plain expression (a label, a jump,
@@ -28,7 +28,7 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 st.push(Some(i));
                 at[i] = Some(i);
             }
-            Op::Un(_) => {
+            Op::Un(_) | Op::Sext(_) => {
                 let s = pop(&mut st);
                 st.push(s);
                 at[i] = s;
@@ -107,6 +107,8 @@ pub fn simplify(f: &mut Func) -> usize {
 /// or the lowest number by -1.)
 fn cannot_fail(run: &[Op]) -> bool {
     run.iter().enumerate().all(|(i, op)| match op {
+        // a checked operation stops the program where a number would not fit
+        Op::Bin(BinOp::AddOv | BinOp::SubOv | BinOp::MulOv | BinOp::ShlOv) | Op::Un(UnOp::NegOv) => false,
         Op::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor) => {
             matches!(run.get(i.wrapping_sub(1)), Some(Op::Push(d)) if *d != 0 && *d != -1)
         }
@@ -153,11 +155,11 @@ pub fn hoist(f: &mut Func) -> usize {
             let mut best: Option<(usize, usize)> = None;
             for i in t + 1..j {
                 let Some(s) = st[i] else { continue };
-                if s <= t || !matches!(code[i], Op::Bin(_) | Op::Un(_)) {
+                if s <= t || !matches!(code[i], Op::Bin(_) | Op::Un(_) | Op::Sext(_)) {
                     continue;
                 }
                 let run = &code[s..=i];
-                let plain = run.iter().all(|o| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_)));
+                let plain = run.iter().all(|o| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_)));
                 let invariant = run.iter().all(|o| !matches!(o, Op::Load(x) if stored.contains(x)));
                 let has_load = run.iter().any(|o| matches!(o, Op::Load(_)));
                 if plain && invariant && has_load && cannot_fail(run) && best.is_none_or(|(bs, bi)| i - s > bi - bs) {

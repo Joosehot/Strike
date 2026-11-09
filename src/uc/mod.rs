@@ -212,7 +212,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     order.sort_by(|&a, &b| bound(&langs[b]).total_cmp(&bound(&langs[a])).then(a.cmp(&b)));
     let mut explain = Vec::new();
     let mut best: Option<(f64, usize, lower::Lowered)> = None;
-    let mut nearest: Option<(f64, usize, (u32, String))> = None;
+    let mut nearest: Option<(f64, usize, (u32, String, bool))> = None;
     for &i in &order {
         let l = &langs[i];
         if let Some((s, _, _)) = &best {
@@ -233,14 +233,17 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
                 let s = ext_score(l) + j.reach * reach;
                 explain.push(format!("{:<8} {s:.2}  stops at line {line}: {m}", l.name));
                 if nearest.as_ref().is_none_or(|(b, _, _)| s > *b) {
-                    nearest = Some((s, i, (line, m)));
+                    nearest = Some((s, i, (line, m, reach >= 1.0)));
                 }
             }
         }
     }
     let Some((_, chosen, low)) = best else {
-        let (_, i, (line, m)) = nearest.ok_or("there are no languages")?;
-        return Err(format!("{}:{line}: {m} (read as {}; no description reads the whole file)", src.display(), langs[i].name));
+        let (_, i, (line, m, whole)) = nearest.ok_or("there are no languages")?;
+        // read whole but not lowered: the language is known, the program is not
+        // what Strike can compile yet
+        let why = if whole { String::new() } else { "; no description reads the whole file".to_string() };
+        return Err(format!("{}:{line}: {m} (read as {}{why})", src.display(), langs[i].name));
     };
     let read_seconds = start.elapsed().as_secs_f64();
 
@@ -382,12 +385,16 @@ mod tests {
         assert_eq!(load(&save(&c)), Some(c));
     }
 
+    /// The same work in two languages is the same IR and shares its brand;
+    /// a function that means something else in a third does not.
     #[test]
-    fn the_same_function_in_three_languages_is_the_same_ir() {
+    fn the_same_function_is_the_same_ir_and_a_different_one_is_not() {
         let progs = [
-            ("c", "int sq(int x) { return x * x + 1; }\nint main() { return sq(3); }\n"),
+            ("c", "long long sq(long long x) { return x * x + 1; }\nint main() { return sq(3); }\n"),
             ("go", "package main\nfunc sq(x int) int {\n\treturn x*x + 1\n}\nfunc main() {\n\tsq(3)\n}\n"),
+            // Python stops where a C int would wrap at 32 bits and a Go int at 64
             ("python", "def sq(x):\n    return x * x + 1\nsq(3)\n"),
+            ("c", "int sq(int x) { return x * x + 1; }\nint main() { return sq(3); }\n"),
         ];
         let langs = languages().unwrap();
         let mut brands = Vec::new();
@@ -397,7 +404,9 @@ mod tests {
             let f = low.funcs.iter().find(|f| f.name == "u.sq").unwrap();
             brands.push(f.brand());
         }
-        assert_eq!(brands[0], brands[1]);
-        assert_eq!(brands[1], brands[2]);
+        assert_eq!(brands[0], brands[1], "a C long long and a Go int are the same work");
+        assert_ne!(brands[1], brands[2], "a Python int does not wrap");
+        assert_ne!(brands[1], brands[3], "a C int wraps at 32 bits");
+        assert_ne!(brands[2], brands[3]);
     }
 }

@@ -15,6 +15,9 @@ entry = "toplevel"
 param_name = "first"
 type_words = ["int", "bool"]
 chained_comparisons = "error"
+# Python's integers have no upper bound; Strike's are 64 bits, so where a
+# number would not fit the program stops with an error, never wrapping
+overflow = "error"
 bool_print = ["True", "False"]
 
 [bool_constants]

@@ -20,7 +20,8 @@ pub enum Expr {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Var { name: String, value: Option<Expr>, line: u32 },
+    /// ty: the type words written (none where the language writes none)
+    Var { name: String, ty: Vec<String>, value: Option<Expr>, line: u32 },
     Assign { name: String, op: Option<BinOp>, value: Expr, line: u32 },
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
     /// no condition: for ever
@@ -39,6 +40,9 @@ pub enum Stmt {
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<String>,
+    /// each parameter's type words, and the result's
+    pub param_types: Vec<Vec<String>>,
+    pub ret: Vec<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
 }
@@ -66,14 +70,15 @@ struct Caps {
     exprs: Vec<Expr>,
     bodies: Vec<Vec<Stmt>>,
     names: Vec<String>,
-    params: Vec<Vec<String>>,
+    params: Vec<(Vec<String>, Vec<Vec<String>>)>,
     args: Vec<Vec<Expr>>,
     simples: Vec<Stmt>,
     strs: Vec<Vec<u8>>,
+    types: Vec<Vec<String>>,
 }
 
 impl Caps {
-    fn mark(&self) -> [usize; 7] {
+    fn mark(&self) -> [usize; 8] {
         [
             self.exprs.len(),
             self.bodies.len(),
@@ -82,9 +87,10 @@ impl Caps {
             self.args.len(),
             self.simples.len(),
             self.strs.len(),
+            self.types.len(),
         ]
     }
-    fn reset(&mut self, m: [usize; 7]) {
+    fn reset(&mut self, m: [usize; 8]) {
         self.exprs.truncate(m[0]);
         self.bodies.truncate(m[1]);
         self.names.truncate(m[2]);
@@ -92,6 +98,7 @@ impl Caps {
         self.args.truncate(m[4]);
         self.simples.truncate(m[5]);
         self.strs.truncate(m[6]);
+        self.types.truncate(m[7]);
     }
 }
 
@@ -259,7 +266,7 @@ impl<'a> P<'a> {
         }
     }
 
-    fn params(&mut self) -> R<Vec<String>> {
+    fn params(&mut self) -> R<(Vec<String>, Vec<Vec<String>>)> {
         let mut pieces: Vec<Vec<T>> = vec![Vec::new()];
         let mut depth = 0;
         loop {
@@ -281,28 +288,42 @@ impl<'a> P<'a> {
             self.i += 1;
         }
         if pieces.len() == 1 && pieces[0].is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let line = self.line();
         let mut names = Vec::new();
+        let mut types: Vec<Vec<String>> = Vec::new();
         for piece in &pieces {
             let mut found = Vec::new();
+            let mut ty = Vec::new();
             for t in piece {
                 match t {
-                    T::Ident(s) if self.l.type_words.contains(s) => {}
+                    T::Ident(s) if self.l.type_words.contains(s) => ty.push(s.clone()),
                     T::Ident(s) if !self.l.keywords.contains(s) => found.push(s.clone()),
-                    T::Punct(p) if matches!(p.as_str(), "*" | ":" | "[" | "]") => {}
+                    T::Punct(p) if matches!(p.as_str(), "*" | "[" | "]") => ty.push(p.clone()),
+                    T::Punct(p) if p == ":" => {}
                     _ => return self.fatal(line, format!("a parameter like {piece:?} is not in Strike yet (only names and their types)")),
                 }
             }
             let pick = if self.l.param_first { found.first() } else { found.last() };
             match pick {
-                Some(n) => names.push(n.clone()),
+                Some(n) => {
+                    names.push(n.clone());
+                    types.push(ty);
+                }
                 None if pieces.len() == 1 => {} // f(void)
                 None => return self.miss("a parameter name"),
             }
         }
-        Ok(names)
+        // Go's , b int: a name with no type of its own has the next one's
+        if self.l.param_first {
+            for i in (0..types.len().saturating_sub(1)).rev() {
+                if types[i].is_empty() {
+                    types[i] = types[i + 1].clone();
+                }
+            }
+        }
+        Ok((names, types))
     }
 
     fn args(&mut self) -> R<Vec<Expr>> {
@@ -318,10 +339,12 @@ impl<'a> P<'a> {
         }
     }
 
-    fn ty(&mut self) -> R<()> {
+    fn ty(&mut self) -> R<Vec<String>> {
         let start = self.i;
+        let mut words = Vec::new();
         while let Some(s) = self.text() {
             if self.l.type_words.contains(s) || s == "*" {
+                words.push(s.to_string());
                 self.i += 1;
             } else {
                 break;
@@ -330,7 +353,7 @@ impl<'a> P<'a> {
         if self.i == start {
             self.miss("a type")
         } else {
-            Ok(())
+            Ok(words)
         }
     }
 
@@ -372,7 +395,10 @@ impl<'a> P<'a> {
                     let v = self.args()?;
                     caps.args.push(v);
                 }
-                Pat::Cap(Cap::Type) => self.ty()?,
+                Pat::Cap(Cap::Type) => {
+                    let w = self.ty()?;
+                    caps.types.push(w);
+                }
                 Pat::Cap(Cap::End) => {
                     if ctx != Ctx::Simple {
                         self.end()?
@@ -449,15 +475,18 @@ impl<'a> P<'a> {
         let mut names = c.names.drain(..);
         let s = match f.kind {
             Kind::Function => {
+                let (params, param_types) = c.params.pop().unwrap_or_default();
                 return Parsed::Func(FuncDef {
                     name: names.next().unwrap_or_default(),
-                    params: c.params.pop().unwrap_or_default(),
+                    params,
+                    param_types,
+                    ret: c.types.first().cloned().unwrap_or_default(),
                     body: bodies.next().unwrap_or_default(),
                     line,
                 })
             }
             Kind::Ignore => return Parsed::Ignore,
-            Kind::Var => Stmt::Var { name: names.next().unwrap_or_default(), value: exprs.next(), line },
+            Kind::Var => Stmt::Var { name: names.next().unwrap_or_default(), ty: c.types.first().cloned().unwrap_or_default(), value: exprs.next(), line },
             Kind::Assign => {
                 let name = names.next().unwrap_or_default();
                 let value = match f.value {
