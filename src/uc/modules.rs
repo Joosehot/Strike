@@ -24,7 +24,7 @@ use super::ir::BinOp;
 use super::lang::{Lang, Model};
 use super::lex;
 use super::lower::{self, assigned_names};
-use super::parse::{self, Expr, FuncDef, Program, Stmt};
+use super::parse::{self, Expr, FuncDef, Program, Stmt, TypeDef};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -177,6 +177,8 @@ struct Walk<'a> {
     block: bool,
     /// x.name(...) on a value is a method (Python's lists)
     methods: bool,
+    /// a.b of a value is its field (the language has structs or classes)
+    records: bool,
     /// pkg.name of the language's own packages that Strike provides
     /// (strconv.Itoa): left for the lowering
     own: HashSet<String>,
@@ -260,6 +262,24 @@ impl Walk<'_> {
         }
         Ok(n.to_string())
     }
+    /// Is the name before a dot a value (p in p.x: a field), not a module?
+    fn is_value(&self, head: &str) -> bool {
+        self.records && (self.local(head).is_some() || !(self.sp().mods.contains_key(head) || self.sp().standard.contains(head)))
+    }
+    /// a.b.c as the program means it: a's fields (a a value), or a module's
+    /// name and the fields of that.
+    fn dotted(&mut self, n: &str, line: u32) -> Result<Expr, E> {
+        let parts: Vec<&str> = n.split('.').collect();
+        let (mut e, rest) = if self.is_value(parts[0]) {
+            (Expr::Var(self.name(parts[0], line)?, line), &parts[1..])
+        } else {
+            (Expr::Var(self.name(&format!("{}.{}", parts[0], parts[1]), line)?, line), &parts[2..])
+        };
+        for f in rest {
+            e = Expr::Field(Box::new(e), f.to_string(), line);
+        }
+        Ok(e)
+    }
     fn func_name(&self, f: &str) -> String {
         self.sp().funcs.get(f).cloned().unwrap_or_else(|| f.to_string())
     }
@@ -315,6 +335,20 @@ impl Walk<'_> {
                     self.declare(name, None);
                 }
             }
+            // p.x = v, p.a[i] = v: a field, not a name of a module
+            Stmt::Assign { name, index, op, value, line } if name.contains('.') && self.is_value(name.split('.').next().unwrap_or("")) => {
+                let mut target = Expr::Var(std::mem::take(name), *line);
+                for i in index.drain(..) {
+                    target = Expr::Index(Box::new(target), Box::new(i), *line);
+                }
+                *s = Stmt::Set { target, op: *op, value: std::mem::replace(value, Expr::Num(0, false)), line: *line };
+                return self.stmt(s);
+            }
+            Stmt::Set { target, value, .. } => {
+                self.expr(target)?;
+                self.expr(value)?;
+            }
+            Stmt::Class(..) => {}
             Stmt::Assign { name, index, value, line, .. } => {
                 for i in index.iter_mut() {
                     self.expr(i)?;
@@ -422,7 +456,13 @@ impl Walk<'_> {
         }
         let mut call = None;
         match e {
+            Expr::Var(n, line) if n.contains('.') => {
+                let (n, line) = (n.clone(), *line);
+                *e = self.dotted(&n, line)?;
+            }
             Expr::Var(n, line) => *n = self.name(n, *line)?,
+            Expr::Field(x, _, _) | Expr::Addr(x, _) | Expr::Deref(x, _) | Expr::SizeOf(x, _) | Expr::Key(_, x, _) => self.expr(x)?,
+            Expr::SizeOfType(..) | Expr::OffsetOf(..) => {}
             Expr::Call(f, args, _) => {
                 for a in args.iter_mut() {
                     self.expr(a)?;
@@ -459,7 +499,7 @@ impl Walk<'_> {
                         };
                         call = Some(Expr::Call(q, std::mem::take(args), *line));
                     }
-                    None if !self.methods => return Err((*line, format!(".{m}(...) after a value: methods are not in Strike yet"))),
+                    None if !self.methods && !self.records => return Err((*line, format!(".{m}(...) after a value: methods are not in Strike yet"))),
                     None => self.expr(base)?,
                 }
             }
@@ -524,6 +564,7 @@ fn walker<'a>(spaces: &'a [Space], me: usize, l: &Lang) -> Walk<'a> {
         me,
         block: l.block_scope,
         methods: !l.methods.is_empty(),
+        records: l.records.is_some(),
         own: l.qualified.keys().cloned().collect(),
         scopes: Vec::new(),
         locals: HashSet::new(),
@@ -543,6 +584,17 @@ fn rename(spaces: &[Space], me: usize, l: &Lang, p: &mut Program) -> Result<(Vec
     }
     for f in p.funcs.iter_mut() {
         rename_func(&mut w, f)?;
+    }
+    // a class's methods, and the values of its attributes
+    for t in p.types.iter_mut() {
+        for m in t.methods.iter_mut() {
+            rename_func(&mut w, m)?;
+        }
+        for a in t.attrs.iter_mut() {
+            if let Stmt::Assign { value, .. } = a {
+                w.expr(value)?;
+            }
+        }
     }
     Ok((w.hoisted, w.used))
 }
@@ -573,6 +625,12 @@ fn rename_func(w: &mut Walk, f: &mut FuncDef) -> Result<(), E> {
     }
     f.name = w.func_name(&f.name);
     Ok(())
+}
+
+/// What a struct is, without where it is written.
+fn shape(t: &TypeDef) -> String {
+    let fields: Vec<String> = t.fields.iter().map(|f| format!("{} {:?} {:?}", f.name, f.ty, f.dims)).collect();
+    fields.join(";")
 }
 
 fn has(words: &[String], w: &str) -> bool {
@@ -654,6 +712,22 @@ fn link_units(r: &mut Reader, units: &[PathBuf]) -> Result<Program, Fail> {
         hoisted.extend(h);
         all.funcs.extend(p.funcs);
         all.top.extend(p.top);
+        // a struct is each file's own, and a header gives every file that
+        // includes it the same one: one struct of the program, unless two
+        // files make two of one name
+        for t in p.types {
+            let same = |u: &TypeDef| u.name == t.name && u.tag == t.tag;
+            match all.types.iter().find(|u| same(u)) {
+                Some(u) if shape(u) == shape(&t) => {}
+                Some(_) => return Err(r.fail((t.line, format!("struct {} is defined differently in two files; Strike keeps one struct of a name", t.tag.clone().or(t.name.clone()).unwrap_or_default())), 1.0)),
+                None => all.types.push(t),
+            }
+        }
+        for a in p.aliases {
+            if !all.aliases.iter().any(|b| b.0 == a.0 && b.1 == a.1) {
+                all.aliases.push(a);
+            }
+        }
     }
     all.top.extend(hoisted);
     Ok(all)
@@ -747,7 +821,14 @@ fn link_packages(r: &mut Reader, units: &[PathBuf]) -> Result<Program, Fail> {
     let pkgs = std::mem::take(&mut g.pkgs);
     for (pi, p) in pkgs.into_iter().enumerate() {
         for (fi, (_, mut prog)) in p.files.into_iter().enumerate() {
+            if p.path != "main" {
+                let line = prog.types.first().map(|t| t.line).or(prog.funcs.iter().find(|f| f.method_of.is_some()).map(|f| f.line));
+                if let Some(line) = line {
+                    return Err(r.fail((line, "a type of a package other than main is not in Strike yet".into()), 1.0));
+                }
+            }
             let (_, used) = rename(&spaces, first[pi] + fi, r.l, &mut prog).map_err(|e| r.fail(e, 1.0))?;
+            all.types.extend(std::mem::take(&mut prog.types));
             for im in &p.imports[fi] {
                 if im.pkg.is_some() && !used.contains(&im.name) {
                     return Err(r.fail((im.line, format!("\"{}\" imported and not used", im.path)), 1.0));
@@ -910,8 +991,14 @@ fn link_modules(r: &mut Reader, units: &[PathBuf]) -> Result<Program, Fail> {
     let mut all = Program::default();
     for (k, x) in m.mods.iter_mut().enumerate() {
         let mut p = std::mem::take(&mut x.prog);
+        if spaces[k].name != "__main__" {
+            if let Some(t) = p.types.first() {
+                return Err(r.fail((t.line, "a class of a module other than the main one is not in Strike yet".into()), 1.0));
+            }
+        }
         rename(&spaces, k, r.l, &mut p).map_err(|e| r.fail(e, 1.0))?;
         all.funcs.extend(std::mem::take(&mut p.funcs));
+        all.types.extend(std::mem::take(&mut p.types));
         progs.push(p);
     }
     // the code that runs: the main file's, with each module's run where it

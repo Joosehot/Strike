@@ -118,6 +118,45 @@ struct Raw {
     preprocessor: Option<RawPre>,
     #[serde(default)]
     program: Option<RawProgram>,
+    #[serde(default)]
+    records: Option<RawRecords>,
+}
+
+/// Structs and classes: how a value's fields are reached, and the words
+/// that make or take addresses.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRecords {
+    /// "structs" (C, Go: values held in place, copied) or "classes"
+    /// (Python: objects on the heap, reached by reference)
+    model: String,
+    /// the words after which a name is a type's own (C's struct, Go's
+    /// type, Python's class), found before the file is read
+    #[serde(default)]
+    type_intro: Vec<String>,
+    /// the word whose declaration names a type by its last name (C's typedef)
+    #[serde(default)]
+    typedef: Option<String>,
+    /// p->x: a field through a pointer
+    #[serde(default)]
+    arrow: Option<String>,
+    /// &x and *p
+    #[serde(default)]
+    address_of: Option<String>,
+    #[serde(default)]
+    deref: Option<String>,
+    /// p.x through a pointer (Go)
+    #[serde(default)]
+    auto_deref: bool,
+    /// {.x = 1} (C) or P{X: 1} (Go): an element given to a field by name
+    #[serde(default)]
+    keyed: Option<String>,
+    /// sizeof(type), sizeof x
+    #[serde(default)]
+    sizeof: Option<String>,
+    /// offsetof(type, field), the name the header's macro gives it
+    #[serde(default)]
+    offsetof: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +240,13 @@ pub enum Kind {
     ImportFrom,
     /// Go's package clause
     Package,
+    /// a struct or a class: its name (and a second name, C's typedef or
+    /// Python's base class), its fields or members
+    Struct,
+    /// typedef struct P Q: a second name for a struct
+    Alias,
+    /// Go's func (p *P) Move(...): a function of a type's values
+    Method,
 }
 
 /// What a $name of a for_each form is.
@@ -208,6 +254,11 @@ pub enum Kind {
 pub enum Role {
     Index,
     Value,
+    /// a struct's: C's tag (written after struct), its name alone, Python's
+    /// base class
+    Tag,
+    Alias,
+    Base,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -269,6 +320,10 @@ pub enum Cap {
     Place,
     /// zero or more [size] after a declared name (C's arrays)
     Dims,
+    /// a struct's fields, to the closing brace
+    Fields,
+    /// a class's block: its methods and its attributes
+    Members,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +403,24 @@ pub struct Lang {
     pub keywords: HashSet<String>,
     pub preprocessor: Option<Preprocessor>,
     pub program: ProgramRule,
+    pub records: Option<Records>,
+}
+
+/// How a language's structs or classes are written ([records]).
+pub struct Records {
+    /// objects on the heap, reached by reference (Python's classes); else
+    /// values held in place and copied (C's and Go's structs)
+    pub classes: bool,
+    pub type_intro: Vec<String>,
+    pub typedef: Option<String>,
+    pub arrow: Option<String>,
+    pub address_of: Option<String>,
+    pub deref: Option<String>,
+    pub auto_deref: bool,
+    /// "." before the name (C's designators) or ":" after it (Go's keys)
+    pub keyed: Option<String>,
+    pub sizeof: Option<String>,
+    pub offsetof: Option<String>,
 }
 
 /// C's preprocessor, as the description gives it.
@@ -438,6 +511,8 @@ fn compile_seq(words: &[&str], i: &mut usize) -> Result<Vec<Pat>, String> {
                 "str" => Cap::Str,
                 "place" => Cap::Place,
                 "dims" => Cap::Dims,
+                "fields" => Cap::Fields,
+                "members" => Cap::Members,
                 _ => return Err(format!("unknown capture ${c}")),
             })
         } else if let Some(n) = w.strip_prefix('@') {
@@ -488,6 +563,9 @@ impl Lang {
                 "import" => Kind::Import,
                 "import_from" => Kind::ImportFrom,
                 "package" => Kind::Package,
+                "struct" => Kind::Struct,
+                "alias" => Kind::Alias,
+                "method" => Kind::Method,
                 k => return Err(err(format!("unknown kind {k}"))),
             };
             let names = match &f.names {
@@ -497,6 +575,9 @@ impl Lang {
                     .map(|n| match n.as_str() {
                         "index" => Ok(Role::Index),
                         "value" => Ok(Role::Value),
+                        "tag" => Ok(Role::Tag),
+                        "alias" => Ok(Role::Alias),
+                        "base" => Ok(Role::Base),
                         x => Err(err(format!("unknown name role {x}"))),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -572,11 +653,19 @@ impl Lang {
         if r.composite_literals || r.list_literals {
             puncts.push(":".into()); // a[i:j]
         }
+        // p.x, p->x, &x, *p: a struct's fields and addresses
+        if let Some(rec) = &r.records {
+            puncts.push(".".into());
+            puncts.extend(rec.arrow.iter().chain(rec.address_of.iter()).chain(rec.deref.iter()).cloned());
+        }
         puncts.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         puncts.dedup();
         let mut keywords: HashSet<String> = tokens.into_iter().filter(|t| is_word(t)).collect();
         keywords.extend(r.type_words.iter().cloned());
         keywords.extend(r.bool_constants.keys().cloned());
+        if let Some(rec) = &r.records {
+            keywords.extend(rec.sizeof.iter().chain(rec.offsetof.iter()).cloned());
+        }
 
         let strings = match r.strings.as_deref() {
             None => Strings::None,
@@ -626,7 +715,27 @@ impl Lang {
                 found_first: p.found_first,
             },
         };
+        let records = match r.records {
+            None => None,
+            Some(x) => Some(Records {
+                classes: match x.model.as_str() {
+                    "structs" => false,
+                    "classes" => true,
+                    m => return Err(err(format!("unknown records model {m}"))),
+                },
+                type_intro: x.type_intro,
+                typedef: x.typedef,
+                arrow: x.arrow,
+                address_of: x.address_of,
+                deref: x.deref,
+                auto_deref: x.auto_deref,
+                keyed: x.keyed,
+                sizeof: x.sizeof,
+                offsetof: x.offsetof,
+            }),
+        };
         Ok(Lang {
+            records,
             preprocessor,
             program,
             indent: match r.blocks.as_str() {
