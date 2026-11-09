@@ -13,6 +13,7 @@
 
 mod eval;
 mod fold;
+pub mod hot;
 mod inline;
 mod tail;
 pub mod ir;
@@ -96,6 +97,7 @@ impl Pack {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub lang: String,
     /// how the judges scored each description
@@ -190,8 +192,14 @@ fn load(b: &[u8]) -> Option<Code> {
     (i == b.len()).then_some(Code { bytes, relocs })
 }
 
-/// One description's reading of the file: the IR, or how far it got.
+/// One description's reading of the file: the IR, or how far it got. In
+/// the daemon, from its memory (hot.rs).
 fn front(text: &str, l: &Lang) -> Result<lower::Lowered, (u32, String, f64)> {
+    hot::front(text, l, read_front)
+}
+
+/// The reading itself: a function of the text and the description only.
+fn read_front(text: &str, l: &Lang) -> Result<lower::Lowered, (u32, String, f64)> {
     let toks = lex::lex(text, l).map_err(|(line, m)| (line, m, 0.0))?;
     let prog = parse::parse(&toks, l).map_err(|f| (f.line, f.message, f.reach))?;
     lower::lower(&prog, l).map_err(|(line, m)| (line, m, 1.0))
@@ -272,7 +280,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine)));
     let evaluate = evaluate && !reads;
     if gen == Gen::Release && evaluate {
-        if let Some(d) = eval::run(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {
+        if let Some(d) = hot::eval(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {
             let mut code = Vec::new();
             if !d.output.is_empty() {
                 code.push(ir::Op::PrintStr(d.output));
@@ -340,8 +348,9 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
         baking[0] = ("rt.start".to_string(), x64::bake_start(&low.entry));
         // a path with its folder: a bare name would be looked for on PATH
         let path = std::path::absolute(out.with_extension(format!("bake{}.exe", std::process::id()))).map_err(|e| e.to_string())?;
-        if std::fs::write(&path, pe::link(&baking, "rt.start", bss)?).is_ok() {
-            let result = eval::bake(&path, &rules.release.evaluate);
+        let baked = pe::link(&baking, "rt.start", bss)?;
+        if std::fs::write(&path, &baked).is_ok() {
+            let result = hot::bake(&baked, &path, &rules.release.evaluate);
             let _ = std::fs::remove_file(&path);
             if let Some((output, returned)) = result {
                 let mut code = Vec::new();
