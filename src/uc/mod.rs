@@ -292,6 +292,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
             fold::run(f);
             simplified += opt::simplify(f);
             hoisted += opt::hoist(f);
+            simplified += opt::counters(f);
             closed += scev::run(f);
             fold::run(f);
             rotate::run(f);

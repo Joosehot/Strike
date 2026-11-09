@@ -1405,6 +1405,26 @@ impl Fx<'_, '_> {
             None
         };
         let (e, w) = self.elem_addr(&target, last)?;
+        // a number or an address goes straight to where the address on the
+        // stack points
+        if op.is_none() && !matches!(e, Ty::Arr(..)) {
+            let (t, from) = match early {
+                Some((t, v, from)) => {
+                    self.emit(Op::Load(v));
+                    (t, from)
+                }
+                None => {
+                    let t = self.value(value)?;
+                    (t, self.last_w)
+                }
+            };
+            self.elem_kind(&target, &e, &t)?;
+            if e.scalar() && from == 0 {
+                self.narrow(w, from)?;
+            }
+            self.emit(Op::StoreM(size(&e, w) as u8));
+            return Ok(());
+        }
         let a = self.hidden();
         self.emit(Op::Store(a));
         match op {
@@ -1427,7 +1447,10 @@ impl Fx<'_, '_> {
                     return self.err(format!("an element that is {} is not worked on with arithmetic", e.describe()));
                 }
                 let n = size(&e, w) as u8;
-                self.ops(&[Op::Load(a), Op::Load(a), Op::LoadM(n)]);
+                // the element first, as it was, then the value: the old
+                // element waits in a slot, not under the value on the stack
+                let old = self.hidden();
+                self.ops(&[Op::Load(a), Op::LoadM(n), Op::Store(old), Op::Load(a), Op::Load(old)]);
                 self.int_expr(value)?;
                 let op = if self.sh.l.checked { op.checked() } else { op };
                 self.emit(Op::Bin(op));

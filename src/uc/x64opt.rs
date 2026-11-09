@@ -673,8 +673,13 @@ impl G {
                 return;
             }
         }
-        let right = self.pop();
-        let left = self.pop();
+        let mut right = self.pop();
+        let mut left = self.pop();
+        // a result already in rax stays there: these operations do not mind
+        // the order
+        if right == V::Rax && left != V::Rax && matches!(b, BinOp::Add | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor) {
+            std::mem::swap(&mut left, &mut right);
+        }
         self.need_rax();
         let o = self.operand(right);
         if b.is_comparison() {
