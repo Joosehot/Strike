@@ -117,6 +117,47 @@ fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
 }
 
 #[test]
+fn structs_and_classes_are_what_clang_go_and_python_make_of_them() {
+    for file in ["structs.c", "structs.go", "classes.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+/// 160 structs of random fields (tools/struct_layouts.py): every sizeof
+/// and offsetof Strike's executable prints is what clang's printed.
+#[test]
+fn c_structs_are_laid_out_as_clang_lays_them_out() {
+    runs_in_every_mode_as_the_real_one("layouts.c");
+}
+
+/// Go stops where a nil pointer is followed (exit code 2), Python where an
+/// attribute is read that the object has not been given (AttributeError,
+/// exit code 1), with what was printed before and nothing after.
+#[test]
+fn a_nil_pointer_and_a_missing_attribute_stop_the_program_as_go_and_python_stop_it() {
+    let r = root("struct-stops");
+    for (name, src, code, says) in [
+        ("nil.go", "package main\nimport \"fmt\"\ntype P struct {\n\tX int\n}\nfunc main() {\n\tvar p *P\n\tfmt.Println(1)\n\tfmt.Println(p.X)\n}\n", 2, "nil pointer dereference"),
+        ("nil_method.go", "package main\nimport \"fmt\"\ntype P struct {\n\tX int\n}\nfunc (p P) Get() int {\n\treturn p.X\n}\nfunc main() {\n\tvar p *P\n\tfmt.Println(1)\n\tfmt.Println(p.Get())\n}\n", 2, "nil pointer dereference"),
+        ("nil_set.go", "package main\nimport \"fmt\"\ntype N struct {\n\tV int\n\tNext *N\n}\nfunc main() {\n\tn := &N{V: 1}\n\tfmt.Println(n.V)\n\tn.Next.V = 2\n}\n", 2, "nil pointer dereference"),
+        ("attr.py", "class P:\n    def __init__(self):\n        self.x = 1\n\n    def later(self):\n        self.y = 2\n\n\np = P()\nprint(p.x)\nprint(p.y)\n", 1, "AttributeError: 'P' object has no attribute 'y'"),
+        ("attr_order.py", "class P:\n    def __init__(self):\n        print(1)\n        print(self.x)\n        self.x = 2\n\n\nP()\n", 1, "AttributeError"),
+    ] {
+        let p = r.join(name);
+        std::fs::write(&p, src).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"]] {
+            let exe = r.join("a.exe");
+            let o = compile_with(&r, &p, &exe, &mode, None);
+            assert!(o.status.success(), "{name}: {}", text(&o));
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(got.status.code(), Some(code), "{name} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout), "1\n", "{name} {mode:?}");
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+        }
+    }
+}
+
+#[test]
 fn floats_are_what_clang_go_and_python_make_of_them() {
     for file in ["floats.c", "floats.go", "floats.py"] {
         runs_in_every_mode_as_the_real_one(file);
@@ -466,6 +507,55 @@ impl Gen {
         }
     }
 
+    /// C structs: nested, with arrays of them and arrays in them, given
+    /// and returned by value (copies), changed through a pointer, copied
+    /// whole and element by element. Their code, and main's calls of them.
+    fn structs(&mut self) -> (String, String) {
+        let mut out = String::new();
+        out += "struct G0 {\n    long long a;\n    int b;\n    char c;\n    short d[3];\n};\nstruct G1 {\n    struct G0 in;\n    long long e;\n    struct G0 arr[2];\n};\n";
+        let n = ["n".to_string()];
+        let fields = ["s.a", "s.b", "s.c", "s.d[0]", "s.d[2]", "n"].map(String::from);
+        out += &format!(
+            "struct G0 gmk(long long n) {{\n    struct G0 s = {{{}, {}, {}, {{{}, {}}}}};\n    s.d[2] = {};\n    return s;\n}}\n",
+            self.expr(&n, &[], 2),
+            self.expr(&n, &[], 2),
+            self.expr(&n, &[], 1),
+            self.expr(&n, &[], 1),
+            self.expr(&n, &[], 1),
+            self.expr(&fields, &[], 2)
+        );
+        out += &format!(
+            "long long gsum(struct G0 s) {{\n    s.a += {};\n    s.d[1] = {};\n    return s.a + s.b * 3 + s.c + s.d[0] + s.d[1] + s.d[2];\n}}\n",
+            self.expr(&fields[..5], &[], 2),
+            self.expr(&fields[..5], &[], 2)
+        );
+        let bump: Vec<String> = ["k", "p->in.a", "p->arr[0].c", "p->e", "p->arr[1].d[1]"].iter().map(|s| s.to_string()).collect();
+        out += &format!(
+            "void gbump(struct G1 *p, long long k) {{\n    p->in.a += k;\n    p->arr[k & 1].b = {};\n    p->e = {};\n}}\n",
+            self.expr(&bump[..3], &[], 2),
+            self.expr(&bump, &[], 2)
+        );
+        let mut structs = Vec::new();
+        for k in 0..3 {
+            let outer: Vec<String> = ["n", "x.in.a", "x.e", "y.arr[1].b", "y.in.d[1]"].iter().map(|s| s.to_string()).collect();
+            let inner: Vec<String> = ["n", "i", "list[i].a", "list[(i + 1) & 3].c", "x.arr[i & 1].d[2]"].iter().map(|s| s.to_string()).collect();
+            out += &format!(
+                "long long st{k}(long long n) {{\n    struct G1 x = {{gmk(n), {}, {{gmk(n + 1), gmk(n - 1)}}}};\n    struct G1 y = x;\n    y.arr[0].a = {};\n    gbump(&y, n & 7);\n    struct G0 list[4] = {{{{0}}}};\n    for (long long i = 0; i < 4; i++) {{\n        list[i] = gmk(i * n);\n        list[i].d[i % 3] += {};\n    }}\n    list[n & 3] = y.arr[1];\n    y.arr[0] = list[{}];\n    return gsum(x.in) + gsum(y.in) * 7 + x.arr[0].a - y.arr[0].a + gsum(list[(n + 1) & 3]) + y.e + x.e + {};\n}}\n",
+                self.expr(&outer[..1], &[], 2),
+                self.expr(&outer, &[], 2),
+                self.expr(&inner, &[], 2),
+                self.below(4),
+                self.expr(&outer, &[], 3)
+            );
+            structs.push(format!("st{k}"));
+        }
+        let mut calls = String::new();
+        for f in &structs {
+            calls += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
+        }
+        (out, calls)
+    }
+
     fn program(&mut self) -> String {
         let mut out = String::from("#include <stdio.h>\n#include <string.h>\n");
         // two globals every function may read and change
@@ -630,7 +720,12 @@ impl Gen {
             );
             rings.push(format!("q{k}"));
         }
+        // structs, from a generator of their own: the rest of each program
+        // is what it was before them
+        let (code, calls) = Gen(self.0 ^ 0xA076_1D64_78BD_642F).structs();
+        out += &code;
         out += "int main() {\n";
+        out += &calls;
         for f in &floats {
             let c = |g: &mut Gen| ["1.5", "-0.0", "1e308", "3", "0.1", "-2.5e-300"][g.below(6) as usize];
             out += &format!("    printf(\"%.17g %e %g\\n\", {f}({}, {}, {}), {f}(2, -1, 5), {f}({}, 0.5, -3));\n", c(self), c(self), self.constant(), c(self));
@@ -815,6 +910,31 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("nolang.txt", "SELECT * FROM t;\n", "no description reads the whole file"),
         ("unsigned.c", "int main() { unsigned int x = 1; return x; }\n", "unsigned numbers are not in Strike yet"),
         ("pointer.c", "int main() { int *p; return 0; }\n", "pointer variables are not in Strike yet"),
+        // structs and classes: what is not exact yet
+        ("float_field.c", "struct P { float f; };\nint main() { return 0; }\n", "a float field is not in Strike yet"),
+        ("holds_itself.c", "struct P { int a; struct P b; };\nint main() { return 0; }\n", "holds itself"),
+        ("struct_math.c", "struct P { int a; };\nint main() { struct P s; struct P *p = &s; p = p + 1; return 0; }\n", "this operator on a pointer"),
+        ("addr_int.c", "int main() { int x = 1; int *p = &x; return 0; }\n", "& of a number is not in Strike yet"),
+        ("struct_d.c", "#include <stdio.h>\nstruct P { int a; };\nint main() { struct P s = {1}; printf(\"%d\", s); return 0; }\n", "%d is given a struct P"),
+        ("tag.c", "struct P { int a; };\nint main() { P s; return 0; }\n", "P is a struct's tag: C writes it struct P"),
+        ("excess.c", "struct P { int a; };\nint main() { struct P s = {1, 2}; return s.a; }\n", "excess elements"),
+        ("arrow.c", "struct P { int a; };\nint main() { struct P s; struct P *p = &s; return p.a; }\n", "C reaches its fields with ->"),
+        ("sizeof_expr.c", "int main() { int a = 1; return sizeof(a + 1); }\n", "sizeof of this expression is not in Strike yet"),
+        ("ptr_print.go", "package main\nimport \"fmt\"\ntype N struct {\n\tV int\n\tNext *N\n}\nfunc main() {\n\tfmt.Println(N{})\n}\n", "which Go prints as its address"),
+        ("ptr_method.go", "package main\nimport \"fmt\"\ntype C struct {\n\tn int\n}\nfunc (c *C) Inc() {\n\tc.n++\n}\nfunc mk() C {\n\treturn C{}\n}\nfunc main() {\n\tmk().Inc()\n\tfmt.Println(1)\n}\n", "the value has no address"),
+        ("few.go", "package main\nimport \"fmt\"\ntype C struct {\n\tA, B int\n}\nfunc main() {\n\tfmt.Println(C{1})\n}\n", "too few values in struct literal"),
+        ("struct_eq.go", "package main\nimport \"fmt\"\ntype C struct {\n\tA int\n}\nfunc main() {\n\tfmt.Println(C{1} == C{1})\n}\n", "this operator on a struct C and a struct C"),
+        ("error_method.go", "package main\nimport \"fmt\"\ntype E struct {\n\tA int\n}\nfunc (e E) Error() string {\n\treturn \"e\"\n}\nfunc main() {\n\tfmt.Println(E{1})\n}\n", "has a Error method"),
+        ("nested_string.go", "package main\nimport \"fmt\"\ntype M struct {\n\tA int\n}\nfunc (m M) String() string {\n\treturn \"m\"\n}\nfunc main() {\n\tfmt.Println([]M{{1}})\n}\n", "has a String method"),
+        ("byte_field.go", "package main\nimport \"fmt\"\ntype B struct {\n\tX byte\n}\nfunc main() {\n\tfmt.Println(B{1})\n}\n", "a byte field is not in Strike yet"),
+        ("no_repr.py", "class P:\n    pass\n\n\nprint(P())\n", "an address Strike cannot give as Python does"),
+        ("str_list.py", "class P:\n    def __str__(self):\n        return \"p\"\n\n\nprint([P()])\n", "by its __repr__, and P has none"),
+        ("static.py", "class P:\n    def f():\n        return 1\n\n\nprint(1)\n", "a static method is not in Strike yet"),
+        ("isinstance.py", "class P:\n    pass\n\n\nprint(isinstance(P(), P))\n", "there is no function isinstance"),
+        ("obj_eq.py", "class P:\n    pass\n\n\nprint(P() == P())\n", "this operator on an object of class P"),
+        ("obj_kinds.py", "class P:\n    def __init__(self, x):\n        self.x = x\n\n\na = P(1)\nb = P(1.5)\nprint(a.x, b.x)\n", "a float in one place and a whole number in another"),
+        ("class_call.py", "class P:\n    def f(self):\n        return 1\n\n\nprint(P.f(P()))\n", "a method called on its class is not in Strike yet"),
+        ("obj_cond.py", "class P:\n    pass\n\n\nif P():\n    print(1)\n", "is not a condition"),
         ("vla.c", "int main() { int n = 3; int a[n]; return 0; }\n", "no variable-length arrays"),
         ("mixed.py", "a = [1, True]\nprint(a)\n", "one kind per list"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
