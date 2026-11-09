@@ -37,6 +37,8 @@ fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
         Le => (a <= b) as i64,
         Gt => (a > b) as i64,
         Ge => (a >= b) as i64,
+        Ult => ((a as u64) < b as u64) as i64,
+        Ule => ((a as u64) <= b as u64) as i64,
         Band => a & b,
         Bor => a | b,
         Bxor => a ^ b,

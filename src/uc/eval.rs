@@ -10,7 +10,7 @@
 //! by zero (which must fail when the program runs, as it would): the
 //! program is compiled as it is.
 
-use super::ir::{label_count, BinOp, Func, Op, UnOp};
+use super::ir::{label_count, BinOp, Func, Op, UnOp, ALLOC};
 use std::collections::HashMap;
 
 #[derive(serde::Deserialize, Clone)]
@@ -112,6 +112,8 @@ fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
         Le => (a <= b) as i64,
         Gt => (a > b) as i64,
         Ge => (a >= b) as i64,
+        Ult => ((a as u64) < b as u64) as i64,
+        Ule => ((a as u64) <= b as u64) as i64,
         Band => a & b,
         Bor => a | b,
         Bxor => a ^ b,
@@ -125,6 +127,40 @@ struct Frame {
     func: usize,
     pc: usize,
     base: usize,
+    /// where the function's own memory begins in the frames' memory
+    mem: usize,
+}
+
+/// The program's memory as the runner keeps it: the globals, the heap and
+/// the functions' own memory, each a region of addresses of its own.
+struct Memory {
+    regions: [Vec<u8>; 3],
+}
+
+const REGION: u32 = 44;
+/// the most the heap may grow to here
+const MAX_HEAP: usize = 1 << 28;
+
+impl Memory {
+    fn place(&mut self, addr: i64, n: usize) -> Option<&mut [u8]> {
+        let r = (addr as u64 >> REGION).checked_sub(1)? as usize;
+        let at = (addr as u64 & ((1 << REGION) - 1)) as usize;
+        self.regions.get_mut(r)?.get_mut(at..at.checked_add(n)?)
+    }
+    fn load(&mut self, addr: i64, w: u8) -> Option<i64> {
+        let b = self.place(addr, w as usize)?;
+        let mut v = [0u8; 8];
+        v[..w as usize].copy_from_slice(b);
+        Some(super::ir::sext(i64::from_le_bytes(v), w * 8))
+    }
+    fn store(&mut self, addr: i64, w: u8, v: i64) -> Option<()> {
+        let b = self.place(addr, w as usize)?;
+        b.copy_from_slice(&v.to_le_bytes()[..w as usize]);
+        Some(())
+    }
+    fn address(region: usize, at: usize) -> i64 {
+        (((region as u64 + 1) << REGION) | at as u64) as i64
+    }
 }
 
 /// Runs the program from its entry; None when it cannot be finished here.
@@ -147,9 +183,9 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
         return None;
     }
     let mut locals: Vec<i64> = vec![0; funcs[first].slots as usize];
-    let mut frames = vec![Frame { func: first, pc: 0, base: 0 }];
+    let mut frames = vec![Frame { func: first, pc: 0, base: 0, mem: 0 }];
     let mut stack: Vec<i64> = Vec::new();
-    let mut global = vec![0i64; globals as usize];
+    let mut m = Memory { regions: [vec![0u8; globals as usize * 8], Vec::new(), vec![0u8; funcs[first].frame as usize]] };
     let mut output = Vec::new();
     let mut steps = 0u64;
     loop {
@@ -181,11 +217,26 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 });
             }
             Op::Dup => stack.push(*stack.last()?),
-            // what the program reads is not known here; a global is not kept
             // what the program reads is not known here
             Op::ReadToken | Op::ReadLine => return None,
-            Op::LoadG(g) => stack.push(global[*g as usize]),
-            Op::StoreG(g) => global[*g as usize] = stack.pop()?,
+            Op::LoadG(g) => stack.push(m.load(Memory::address(0, *g as usize * 8), 8)?),
+            Op::StoreG(g) => {
+                let v = stack.pop()?;
+                m.store(Memory::address(0, *g as usize * 8), 8, v)?;
+            }
+            Op::AddrG(g) => stack.push(Memory::address(0, *g as usize * 8)),
+            Op::Frame(n) => stack.push(Memory::address(2, fr.mem + *n as usize)),
+            Op::LoadM(w) => {
+                let a = stack.pop()?;
+                stack.push(m.load(a, *w)?);
+            }
+            Op::StoreM(w) => {
+                let v = stack.pop()?;
+                let a = stack.pop()?;
+                m.store(a, *w, v)?;
+            }
+            // a program that stops so must stop so when it runs
+            Op::Fail(..) => return None,
             Op::Sext(n) => {
                 let x = stack.pop()?;
                 stack.push(super::ir::sext(x, *n));
@@ -210,6 +261,15 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 output.extend_from_slice(v.to_string().as_bytes());
             }
             Op::PrintStr(s) => output.extend_from_slice(s),
+            Op::Call(sym, 1) if sym == ALLOC => {
+                let n = usize::try_from(stack.pop()?).ok()?.checked_add(15)? & !15;
+                let heap = &mut m.regions[1];
+                if heap.len() + n > MAX_HEAP {
+                    return None;
+                }
+                stack.push(Memory::address(1, heap.len()));
+                heap.resize(heap.len() + n, 0);
+            }
             Op::Call(sym, n) => {
                 if frames.len() >= lim.max_depth {
                     return None;
@@ -222,12 +282,15 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 let args = stack.len().checked_sub(n)?;
                 locals[base..base + n].copy_from_slice(&stack[args..]);
                 stack.truncate(args);
-                frames.push(Frame { func: callee, pc: 0, base });
+                let mem = m.regions[2].len();
+                m.regions[2].resize(mem + c.frame as usize, 0);
+                frames.push(Frame { func: callee, pc: 0, base, mem });
             }
             Op::Ret => {
                 let v = stack.pop()?;
                 let done = frames.pop()?;
                 locals.truncate(done.base);
+                m.regions[2].truncate(done.mem);
                 if frames.is_empty() {
                     return Some(Done { output, returned: v, steps });
                 }

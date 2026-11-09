@@ -16,13 +16,34 @@ pub enum Expr {
     Call(String, Vec<Expr>, u32),
     Un(UnOp, Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
+    /// a[i]
+    Index(Box<Expr>, Box<Expr>, u32),
+    /// a[i:j], either side left out
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>, u32),
+    /// a.name(args)
+    Method(Box<Expr>, String, Vec<Expr>, u32),
+    /// Python's [a, b]
+    List(Vec<Expr>, u32),
+    /// Python's [elem for name in iter if cond]
+    Comp { elem: Box<Expr>, name: String, iter: Box<Expr>, cond: Option<Box<Expr>>, line: u32 },
+    /// {a, b}: C's initializer, an element of a Go composite whose type is
+    /// the composite's own
+    Brace(Vec<Expr>, u32),
+    /// Go's []int{a, b}: the type's words and the elements
+    Composite(Vec<String>, Vec<Expr>, u32),
+    /// a type given as a value (Go's make([]int, n))
+    Type(Vec<String>, u32),
 }
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    /// ty: the type words written (none where the language writes none)
-    Var { name: String, ty: Vec<String>, value: Option<Expr>, line: u32 },
-    Assign { name: String, op: Option<BinOp>, value: Expr, line: u32 },
+    /// ty: the type words written (none where the language writes none);
+    /// dims: C's array sizes after the name
+    Var { name: String, ty: Vec<String>, dims: Vec<Option<Expr>>, value: Option<Expr>, line: u32 },
+    /// name, or an element of it (index: the subscripts in order)
+    Assign { name: String, index: Vec<Expr>, op: Option<BinOp>, value: Expr, line: u32 },
+    /// for over the elements: their index, their value, or both
+    ForEach { index: Option<String>, value: Option<String>, iter: Expr, body: Vec<Stmt>, line: u32 },
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
     /// no condition: for ever
     While { cond: Option<Expr>, body: Vec<Stmt> },
@@ -78,10 +99,12 @@ struct Caps {
     simples: Vec<Stmt>,
     strs: Vec<Vec<u8>>,
     types: Vec<Vec<String>>,
+    places: Vec<(String, Vec<Expr>)>,
+    dims: Vec<Vec<Option<Expr>>>,
 }
 
 impl Caps {
-    fn mark(&self) -> [usize; 8] {
+    fn mark(&self) -> [usize; 10] {
         [
             self.exprs.len(),
             self.bodies.len(),
@@ -91,9 +114,13 @@ impl Caps {
             self.simples.len(),
             self.strs.len(),
             self.types.len(),
+            self.places.len(),
+            self.dims.len(),
         ]
     }
-    fn reset(&mut self, m: [usize; 8]) {
+    fn reset(&mut self, m: [usize; 10]) {
+        self.places.truncate(m[8]);
+        self.dims.truncate(m[9]);
         self.exprs.truncate(m[0]);
         self.bodies.truncate(m[1]);
         self.names.truncate(m[2]);
@@ -304,6 +331,8 @@ impl<'a> P<'a> {
                     T::Ident(s) if self.l.type_words.contains(s) => ty.push(s.clone()),
                     T::Ident(s) if !self.l.keywords.contains(s) => found.push(s.clone()),
                     T::Punct(p) if matches!(p.as_str(), "*" | "[" | "]") => ty.push(p.clone()),
+                    // an array's size, in C after the name, in Go before the type
+                    T::Num(n) if ty.last().is_some_and(|w| w == "[") => ty.push(n.to_string()),
                     T::Punct(p) if p == ":" => {}
                     _ => return self.fatal(line, format!("a parameter like {piece:?} is not in Strike yet (only names and their types)")),
                 }
@@ -345,12 +374,33 @@ impl<'a> P<'a> {
     fn ty(&mut self) -> R<Vec<String>> {
         let start = self.i;
         let mut words = Vec::new();
-        while let Some(s) = self.text() {
-            if self.l.type_words.contains(s) || s == "*" {
-                words.push(s.to_string());
+        loop {
+            // Go's []T and [n]T: the brackets before the element's type
+            if self.l.composite_literals && self.text() == Some("[") {
+                let at = self.i;
                 self.i += 1;
-            } else {
-                break;
+                let size = match self.peek().clone() {
+                    T::Num(n) => {
+                        self.i += 1;
+                        Some(n.to_string())
+                    }
+                    _ => None,
+                };
+                if !self.eat("]") {
+                    self.i = at;
+                    break;
+                }
+                words.push("[".into());
+                words.extend(size);
+                words.push("]".into());
+                continue;
+            }
+            match self.text() {
+                Some(s) if self.l.type_words.contains(s) || s == "*" => {
+                    words.push(s.to_string());
+                    self.i += 1;
+                }
+                _ => break,
             }
         }
         if self.i == start {
@@ -411,6 +461,27 @@ impl<'a> P<'a> {
                     Parsed::Stmt(s) => caps.simples.push(s),
                     _ => return self.miss("a simple statement"),
                 },
+                Pat::Cap(Cap::Place) => {
+                    let n = self.name()?;
+                    let mut index = Vec::new();
+                    while self.eat("[") {
+                        index.push(self.expr(0)?.0);
+                        self.expect("]")?;
+                    }
+                    caps.places.push((n, index));
+                }
+                Pat::Cap(Cap::Dims) => {
+                    let mut dims = Vec::new();
+                    while self.eat("[") {
+                        if self.eat("]") {
+                            dims.push(None);
+                            continue;
+                        }
+                        dims.push(Some(self.expr(0)?.0));
+                        self.expect("]")?;
+                    }
+                    caps.dims.push(dims);
+                }
                 Pat::Cap(Cap::Str) => match self.peek().clone() {
                     T::Str(s) => {
                         self.i += 1;
@@ -489,14 +560,34 @@ impl<'a> P<'a> {
                 })
             }
             Kind::Ignore => return Parsed::Ignore,
-            Kind::Var => Stmt::Var { name: names.next().unwrap_or_default(), ty: c.types.first().cloned().unwrap_or_default(), value: exprs.next(), line },
+            Kind::Var => Stmt::Var {
+                name: names.next().unwrap_or_default(),
+                ty: c.types.first().cloned().unwrap_or_default(),
+                dims: c.dims.pop().unwrap_or_default(),
+                value: exprs.next(),
+                line,
+            },
             Kind::Assign => {
-                let name = names.next().unwrap_or_default();
+                let (name, index) = match c.places.pop() {
+                    Some(p) => p,
+                    None => (names.next().unwrap_or_default(), Vec::new()),
+                };
                 let value = match f.value {
                     Some(v) => Expr::Num(v, false),
                     None => exprs.next().unwrap_or(Expr::Num(0, false)),
                 };
-                Stmt::Assign { name, op: f.op, value, line }
+                Stmt::Assign { name, index, op: f.op, value, line }
+            }
+            Kind::ForEach => {
+                let (mut index, mut value) = (None, None);
+                for role in &f.names {
+                    let n = names.next().filter(|n| n != "_");
+                    match role {
+                        super::lang::Role::Index => index = n,
+                        super::lang::Role::Value => value = n,
+                    }
+                }
+                Stmt::ForEach { index, value, iter: exprs.next().unwrap_or(Expr::Num(0, false)), body: bodies.next().unwrap_or_default(), line }
             }
             Kind::If => Stmt::If {
                 cond: exprs.next().unwrap_or(Expr::Num(0, false)),
@@ -534,6 +625,102 @@ impl<'a> P<'a> {
         Parsed::Stmt(s)
     }
 
+    /// What follows a value and binds tighter than any operator: [i],
+    /// [i:j], .name(args).
+    fn postfix(&mut self, mut e: Expr) -> R<Expr> {
+        loop {
+            let line = self.line();
+            if self.eat("[") {
+                let lo = if self.text() == Some(":") { None } else { Some(Box::new(self.expr(0)?.0)) };
+                if self.eat(":") {
+                    let hi = if self.text() == Some("]") { None } else { Some(Box::new(self.expr(0)?.0)) };
+                    self.expect("]")?;
+                    e = Expr::Slice(Box::new(e), lo, hi, line);
+                } else {
+                    self.expect("]")?;
+                    let Some(i) = lo else { return self.miss("an index") };
+                    e = Expr::Index(Box::new(e), i, line);
+                }
+            } else if !self.l.methods.is_empty() && self.text() == Some(".") {
+                self.i += 1;
+                let name = match self.peek().clone() {
+                    T::Ident(s) => {
+                        self.i += 1;
+                        s
+                    }
+                    _ => return self.miss("a method's name"),
+                };
+                self.expect("(")?;
+                let a = self.args()?;
+                self.expect(")")?;
+                e = Expr::Method(Box::new(e), name, a, line);
+            } else {
+                return Ok(e);
+            }
+        }
+    }
+
+    /// Python's list after its `[`: the elements, or a comprehension.
+    fn list(&mut self, line: u32) -> R<Expr> {
+        if self.eat("]") {
+            return Ok(Expr::List(Vec::new(), line));
+        }
+        let first = self.expr(0)?.0;
+        if self.l.comprehensions && self.eat("for") {
+            let name = self.name()?;
+            self.expect("in")?;
+            // range is a word of the for form, so its call is read here
+            let at = self.line();
+            let iter = if self.eat("range") {
+                self.expect("(")?;
+                let a = self.args()?;
+                self.expect(")")?;
+                Expr::Call("range".into(), a, at)
+            } else {
+                self.expr(0)?.0
+            };
+            let cond = if self.eat("if") { Some(Box::new(self.expr(0)?.0)) } else { None };
+            self.expect("]")?;
+            return Ok(Expr::Comp { elem: Box::new(first), name, iter: Box::new(iter), cond, line });
+        }
+        let mut elems = vec![first];
+        while self.eat(",") {
+            if self.text() == Some("]") {
+                break;
+            }
+            elems.push(self.expr(0)?.0);
+        }
+        self.expect("]")?;
+        Ok(Expr::List(elems, line))
+    }
+
+    /// { a, b, {c, d} }: the elements of an initializer or a composite.
+    fn braces(&mut self) -> R<Vec<Expr>> {
+        self.expect("{")?;
+        let mut elems = Vec::new();
+        loop {
+            while matches!(self.peek(), T::End) {
+                self.i += 1;
+            }
+            if self.eat("}") {
+                return Ok(elems);
+            }
+            let line = self.line();
+            let e = if self.text() == Some("{") { Expr::Brace(self.braces()?, line) } else { self.expr(0)?.0 };
+            elems.push(e);
+            while matches!(self.peek(), T::End) {
+                self.i += 1;
+            }
+            if !self.eat(",") {
+                while matches!(self.peek(), T::End) {
+                    self.i += 1;
+                }
+                self.expect("}")?;
+                return Ok(elems);
+            }
+        }
+    }
+
     /// An expression whose operators bind at least as tight as `min`. The
     /// flag says it is a comparison not in parentheses (for languages where
     /// a < b < c is not what C makes of it).
@@ -553,7 +740,25 @@ impl<'a> P<'a> {
                 self.i += 1;
                 let e = self.expr(0)?.0;
                 self.expect(")")?;
-                (e, false)
+                (self.postfix(e)?, false)
+            }
+            T::Punct(p) if p == "[" && l.list_literals => {
+                self.i += 1;
+                let e = self.list(line)?;
+                (self.postfix(e)?, false)
+            }
+            T::Punct(p) if p == "[" && l.composite_literals => {
+                let ty = self.ty()?;
+                if self.text() == Some("{") {
+                    let elems = self.braces()?;
+                    (self.postfix(Expr::Composite(ty, elems, line))?, false)
+                } else {
+                    (Expr::Type(ty, line), false)
+                }
+            }
+            T::Punct(p) if p == "{" && l.brace_lists => {
+                let elems = self.braces()?;
+                (Expr::Brace(elems, line), false)
             }
             t => {
                 let word = match &t {
@@ -573,13 +778,14 @@ impl<'a> P<'a> {
                         || (l.type_words.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "(")))
                 {
                     self.i += 1;
-                    if self.eat("(") {
+                    let e = if self.eat("(") {
                         let a = self.args()?;
                         self.expect(")")?;
-                        (Expr::Call(word, a, line), false)
+                        Expr::Call(word, a, line)
                     } else {
-                        (Expr::Var(word, line), false)
-                    }
+                        Expr::Var(word, line)
+                    };
+                    (self.postfix(e)?, false)
                 } else {
                     return self.miss("an expression");
                 }

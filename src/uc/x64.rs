@@ -26,7 +26,7 @@ pub struct Code {
     pub relocs: Vec<(u32, Target)>,
 }
 
-pub const IMPORTS: [&str; 4] = ["GetStdHandle", "WriteFile", "ExitProcess", "ReadFile"];
+pub const IMPORTS: [&str; 5] = ["GetStdHandle", "WriteFile", "ExitProcess", "ReadFile", "VirtualAlloc"];
 
 pub(super) struct Asm {
     pub(super) b: Vec<u8>,
@@ -130,7 +130,9 @@ pub fn compile(f: &Func) -> Code {
     let labels = f.code.iter().filter_map(|o| if let Op::Label(l) = o { Some(*l + 1) } else { None }).max().unwrap_or(0);
     let labels_of: Vec<u32> = (0..labels).map(|_| a.label()).collect();
     let mut depth_at: Vec<Option<u32>> = vec![None; labels as usize];
-    let frame = ((f.slots as i32 * 8) + 15) / 16 * 16;
+    // the slots below rbp, then the function's own memory below them
+    let memory = -(f.slots as i32 * 8 + (f.frame as i32 + 7) / 8 * 8);
+    let frame = (-memory + 15) / 16 * 16;
     a.prologue(frame);
     // the parameters into their slots; every other slot starts at zero
     const STORE: [[u8; 3]; 4] = [[0x48, 0x89, 0x8D], [0x48, 0x89, 0x95], [0x4C, 0x89, 0x85], [0x4C, 0x89, 0x8D]];
@@ -208,6 +210,41 @@ pub fn compile(f: &Func) -> Code {
             Op::ReadLine => {
                 call(&mut a, "rt.read_line", 0, &mut depth, true);
             }
+            Op::LoadM(w) => {
+                a.e(&[0x58]);
+                a.e(match w {
+                    1 => &[0x48, 0x0F, 0xBE, 0x00], // movsx rax, byte [rax]
+                    2 => &[0x48, 0x0F, 0xBF, 0x00],
+                    4 => &[0x48, 0x63, 0x00], // movsxd rax, dword [rax]
+                    _ => &[0x48, 0x8B, 0x00],
+                });
+                a.e(&[0x50]);
+            }
+            Op::StoreM(w) => {
+                a.e(&[0x59, 0x58]); // pop rcx (the value); pop rax (the address)
+                a.e(match w {
+                    1 => &[0x88, 0x08], // mov [rax], cl
+                    2 => &[0x66, 0x89, 0x08],
+                    4 => &[0x89, 0x08],
+                    _ => &[0x48, 0x89, 0x08],
+                });
+                depth -= 2;
+            }
+            Op::Frame(n) => {
+                a.e(&[0x48, 0x8D, 0x85]); // lea rax, [rbp + d]
+                a.d32(memory + *n as i32);
+                a.e(&[0x50]);
+                depth += 1;
+            }
+            Op::AddrG(g) => {
+                a.e(&[0x48, 0x8D, 0x05]); // lea rax, [global]
+                a.reloc(global(*g));
+                a.e(&[0x50]);
+                depth += 1;
+            }
+            Op::Fail(code, m) => {
+                fail_here(&mut a, *code, m);
+            }
             Op::Un(u) => {
                 a.e(&[0x58]);
                 match u {
@@ -259,6 +296,8 @@ pub fn compile(f: &Func) -> Code {
                     BinOp::Le => set(&mut a, 0x9E),
                     BinOp::Gt => set(&mut a, 0x9F),
                     BinOp::Ge => set(&mut a, 0x9D),
+                    BinOp::Ult => set(&mut a, 0x92),
+                    BinOp::Ule => set(&mut a, 0x96),
                     BinOp::AndBool | BinOp::OrBool | BinOp::AndValue | BinOp::OrValue => {
                         unreachable!("logic operators are lowered to jumps")
                     }
@@ -412,6 +451,7 @@ pub fn runtime(entry: &str) -> Vec<(String, Code)> {
         ("rt.getc".into(), getc()),
         ("rt.read_token".into(), read_token()),
         ("rt.read_line".into(), read_line()),
+        (super::ir::ALLOC.into(), alloc()),
     ]
 }
 
@@ -481,41 +521,107 @@ const BUF: u32 = 0;
 const BUF_SIZE: i32 = 4096;
 const POS: u32 = 4096;
 const LEN: u32 = 4104;
-pub const GLOBALS: u32 = 4112;
+/// the allocator's next free byte and the end of its chunk
+const HEAP: u32 = 4112;
+const HEAP_END: u32 = 4120;
+pub const GLOBALS: u32 = 4128;
 
 /// The place of global g in the zeros.
 pub fn global(g: u32) -> Target {
     Target::Writable(GLOBALS + 8 * g)
 }
 
-/// rt.fail(rcx = message, rdx = its length): the message on standard
-/// error, then exit code 1.
+/// rt.fail(rcx = message, rdx = its length, r8 = exit code): the message
+/// on standard error, then the program stops with that code.
 fn fail() -> Code {
     let mut a = Asm::new();
-    a.e(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 56
+    a.e(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
     a.e(&[0x48, 0x89, 0x4C, 0x24, 0x28]); // mov [rsp+40], rcx
     a.e(&[0x48, 0x89, 0x54, 0x24, 0x30]); // mov [rsp+48], rdx
+    a.e(&[0x4C, 0x89, 0x44, 0x24, 0x38]); // mov [rsp+56], r8
     a.e(&[0x48, 0xC7, 0xC1, 0xF4, 0xFF, 0xFF, 0xFF]); // mov rcx, -12 (standard error)
     a.call_import("GetStdHandle");
     a.e(&[0x48, 0x89, 0xC1]); // mov rcx, rax
     a.e(&[0x48, 0x8B, 0x54, 0x24, 0x28]); // mov rdx, [rsp+40]
     a.e(&[0x4C, 0x8B, 0x44, 0x24, 0x30]); // mov r8, [rsp+48]
-    a.e(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9, [rsp+40]
+    a.e(&[0x4C, 0x8D, 0x4C, 0x24, 0x40]); // lea r9, [rsp+64]
     a.e(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+32], 0
     a.call_import("WriteFile");
-    a.e(&[0xB9, 1, 0, 0, 0]); // mov ecx, 1
+    a.e(&[0x8B, 0x4C, 0x24, 0x38]); // mov ecx, [rsp+56]
     a.call_import("ExitProcess");
     a.e(&[0xCC]);
     a.finish()
 }
 
-/// Calls rt.fail with a message (the stack aligned for a call).
+/// Calls rt.fail with a message and exit code 1 (the stack aligned for a
+/// call).
 fn fail_with(a: &mut Asm, msg: &[u8]) {
     a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [rip + msg]
     a.reloc(Target::Data(msg.to_vec()));
     a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, len
     a.d32(msg.len() as i32);
+    a.e(&[0x41, 0xB8, 1, 0, 0, 0]); // mov r8d, 1
     a.call("rt.fail");
+}
+
+/// Op::Fail wherever the stack is: aligned, then rt.fail, which does not
+/// come back.
+pub(super) fn fail_here(a: &mut Asm, code: u8, msg: &[u8]) {
+    a.e(&[0x48, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20]); // and rsp, -16; sub rsp, 32
+    a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [rip + msg]
+    a.reloc(Target::Data(msg.to_vec()));
+    a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, len
+    a.d32(msg.len() as i32);
+    a.e(&[0x41, 0xB8, code, 0, 0, 0]); // mov r8d, code
+    a.call("rt.fail");
+    a.e(&[0xCC]);
+}
+
+const OUT_OF_MEMORY: &[u8] = b"strike: out of memory (or a size that is not one), so the program stops\n";
+/// what the allocator takes from Windows at a time
+const CHUNK: i32 = 64 << 20;
+
+/// rt.alloc(rcx = bytes): the address of that many new zero bytes, 16-aligned.
+/// Bump allocation in chunks Windows gives zeroed (VirtualAlloc); nothing
+/// is given back in this stage.
+fn alloc() -> Code {
+    let mut a = Asm::new();
+    let (more, bad) = (a.label(), a.label());
+    a.e(&[0x48, 0x85, 0xC9]); // test rcx, rcx
+    a.jcc(8, bad); // js: a negative size
+    a.e(&[0x48, 0x83, 0xC1, 0x0F, 0x48, 0x83, 0xE1, 0xF0]); // add rcx, 15; and rcx, -16
+    a.jcc(8, bad); // past 2^63
+    a.e(&[0x48, 0x8B, 0x05]); // mov rax, [heap]
+    a.reloc(Target::Writable(HEAP));
+    a.e(&[0x48, 0x8D, 0x14, 0x08]); // lea rdx, [rax + rcx]
+    a.e(&[0x48, 0x3B, 0x15]); // cmp rdx, [heap_end]
+    a.reloc(Target::Writable(HEAP_END));
+    a.jcc(7, more); // ja
+    a.e(&[0x48, 0x89, 0x15]); // mov [heap], rdx
+    a.reloc(Target::Writable(HEAP));
+    a.e(&[0xC3]);
+    a.bind(more);
+    a.e(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 56
+    a.e(&[0x48, 0x89, 0x4C, 0x24, 0x28]); // mov [rsp+40], rcx
+    a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, CHUNK
+    a.d32(CHUNK);
+    a.e(&[0x48, 0x39, 0xD1, 0x48, 0x0F, 0x47, 0xD1]); // cmp rcx, rdx; cmova rdx, rcx
+    a.e(&[0x48, 0x89, 0x54, 0x24, 0x30]); // mov [rsp+48], rdx
+    a.e(&[0x31, 0xC9]); // xor ecx, ecx
+    a.e(&[0x41, 0xB8, 0x00, 0x30, 0, 0, 0x41, 0xB9, 4, 0, 0, 0]); // mov r8d, MEM_COMMIT | MEM_RESERVE; mov r9d, PAGE_READWRITE
+    a.call_import("VirtualAlloc");
+    a.e(&[0x48, 0x85, 0xC0]); // test rax, rax
+    a.jcc(4, bad);
+    a.e(&[0x48, 0x8B, 0x4C, 0x24, 0x28, 0x48, 0x8D, 0x14, 0x08]); // mov rcx, [rsp+40]; lea rdx, [rax + rcx]
+    a.e(&[0x48, 0x89, 0x15]); // mov [heap], rdx
+    a.reloc(Target::Writable(HEAP));
+    a.e(&[0x48, 0x8B, 0x54, 0x24, 0x30, 0x48, 0x01, 0xC2]); // mov rdx, [rsp+48]; add rdx, rax
+    a.e(&[0x48, 0x89, 0x15]); // mov [heap_end], rdx
+    a.reloc(Target::Writable(HEAP_END));
+    a.e(&[0x48, 0x83, 0xC4, 0x38, 0xC3]); // add rsp, 56; ret
+    a.bind(bad);
+    fail_here(&mut a, 1, OUT_OF_MEMORY);
+    a.finish()
 }
 
 fn overflow() -> Code {

@@ -21,6 +21,20 @@ overflow = "error"
 # int(input()): a line read from standard input as a whole number
 read_line = ["int", "input"]
 bool_print = ["True", "False"]
+# lists: [a, b], [e for x in xs], a[-1] the last; an index out of range
+# stops the program as Python's IndexError does
+list_literals = true
+comprehensions = true
+negative_index = true
+index_error = [1, "IndexError: list index out of range\n"]
+list_print = ["[", ", ", "]"]
+
+[builtins]
+len = "len"
+
+[methods]
+append = "list_append"
+pop = "list_pop"
 
 [bool_constants]
 True = 1
@@ -76,6 +90,10 @@ kind = "for_range"
 pattern = "for $name in range ( $args ) : $block"
 
 [[form]]
+kind = "for_each"
+pattern = "for $name in $expr : $block"
+
+[[form]]
 kind = "return"
 pattern = "return [ $expr ] $end"
 
@@ -103,31 +121,31 @@ pattern = "print ( $args ) $end"
 [[form]]
 kind = "assign"
 op = "add"
-pattern = "$name += $expr $end"
+pattern = "$place += $expr $end"
 
 [[form]]
 kind = "assign"
 op = "sub"
-pattern = "$name -= $expr $end"
+pattern = "$place -= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "mul"
-pattern = "$name *= $expr $end"
+pattern = "$place *= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "div_floor"
-pattern = "$name //= $expr $end"
+pattern = "$place //= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "mod_floor"
-pattern = "$name %= $expr $end"
+pattern = "$place %= $expr $end"
 
 [[form]]
 kind = "assign"
-pattern = "$name = $expr $end"
+pattern = "$place = $expr $end"
 
 [[form]]
 kind = "expr"

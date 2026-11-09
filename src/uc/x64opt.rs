@@ -112,6 +112,20 @@ enum V {
     /// a local held in a register, plus a constant: not worked out until it
     /// is needed, and then one `lea` into wherever it goes
     Lea(u32, i32),
+    /// a local held in a register, shifted left by 0 to 3 (an index times
+    /// its element's size)
+    Scaled(u32, u8),
+    /// base + index << k + d, both locals in registers: an element's
+    /// address, used where it is as [base + index * size + d]
+    Index(u32, u32, u8, i32),
+}
+
+/// Where memory is: a register plus a displacement, or base + index << k
+/// + displacement (no base: None).
+#[derive(Clone, Copy)]
+enum Addr {
+    Base(u8, i32),
+    Index(Option<u8>, u8, u8, i32),
 }
 
 #[derive(Clone, Copy)]
@@ -354,6 +368,8 @@ struct G {
     trap_at: Option<u32>,
     /// division of numbers that fit 32 bits by the 32-bit instruction
     div32: bool,
+    /// the frame offset of the function's own memory (Op::Frame)
+    memory: i32,
 }
 
 impl G {
@@ -397,7 +413,46 @@ impl G {
     }
     /// Is any value still to be worked out from slot s?
     fn reads(&self, s: u32) -> Option<usize> {
-        self.v.iter().rposition(|y| matches!(y, V::Slot(t) | V::Lea(t, _) if *t == s))
+        self.v.iter().rposition(|y| match y {
+            V::Slot(t) | V::Lea(t, _) | V::Scaled(t, _) => *t == s,
+            V::Index(b, i, _, _) => *b == s || *i == s,
+            _ => false,
+        })
+    }
+    /// Is this local in a register?
+    fn in_reg(&self, s: u32) -> bool {
+        matches!(self.loc[s as usize], Loc::Reg(_))
+    }
+    /// op r, [address]: the operand size by `prefix` (0x66 for 16 bits) and
+    /// REX.W (`wide`).
+    fn mem(&mut self, prefix: bool, wide: bool, op: &[u8], r: u8, at: Addr) {
+        if prefix {
+            self.a.e(&[0x66]);
+        }
+        let (b, x) = match at {
+            Addr::Base(b, _) => (b, 0),
+            Addr::Index(b, i, _, _) => (b.unwrap_or(0), i),
+        };
+        self.a.e(&[0x40 | (wide as u8) << 3 | ((r >> 3) & 1) << 2 | ((x >> 3) & 1) << 1 | ((b >> 3) & 1)]);
+        self.a.e(op);
+        match at {
+            Addr::Base(b, d) => {
+                self.a.e(&[0x80 | (r & 7) << 3 | (b & 7)]);
+                if b & 7 == 4 {
+                    self.a.e(&[0x24]);
+                }
+                self.a.d32(d);
+            }
+            Addr::Index(Some(b), i, k, d) => {
+                self.a.e(&[0x84 | (r & 7) << 3, k << 6 | (i & 7) << 3 | (b & 7)]);
+                self.a.d32(d);
+            }
+            Addr::Index(None, i, k, d) => {
+                // no base: mod 00 with base 101 is a 32-bit displacement
+                self.a.e(&[0x04 | (r & 7) << 3, k << 6 | (i & 7) << 3 | 5]);
+                self.a.d32(d);
+            }
+        }
     }
     fn mov_imm(&mut self, r: u8, v: i64) {
         if let Ok(i) = i32::try_from(v) {
@@ -450,6 +505,18 @@ impl G {
                 let y = self.slot_reg(s);
                 self.lea(r, y, c)
             }
+            V::Scaled(s, 0) => {
+                let y = self.slot_reg(s);
+                self.mov_rr(r, y)
+            }
+            V::Scaled(s, k) => {
+                let y = self.slot_reg(s);
+                self.mem(false, true, &[0x8D], r, Addr::Index(None, y, k, 0));
+            }
+            V::Index(b, i, k, d) => {
+                let (yb, yi) = (self.slot_reg(b), self.slot_reg(i));
+                self.mem(false, true, &[0x8D], r, Addr::Index(Some(yb), yi, k, d));
+            }
         }
     }
 
@@ -477,7 +544,7 @@ impl G {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
             }
-            V::Lea(..) => {
+            V::Lea(..) | V::Scaled(..) | V::Index(..) => {
                 self.to_reg(x, R11);
                 self.push_r(R11);
             }
@@ -584,6 +651,28 @@ impl G {
                 }
             }
         }
+        // an element's address: index << k, then base + that, waits to be
+        // used as [base + index * size]
+        if n >= 2 {
+            let (l, r) = (self.v[n - 2], self.v[n - 1]);
+            let reg = |s: u32| matches!(self.loc[s as usize], Loc::Reg(_));
+            let lazy = match (b, l, r) {
+                (BinOp::Shl, V::Slot(s), V::Imm(k @ 0..=3)) if reg(s) => Some(V::Scaled(s, k as u8)),
+                (BinOp::Add, V::Slot(base), V::Scaled(i, k)) | (BinOp::Add, V::Scaled(i, k), V::Slot(base)) if reg(base) => Some(V::Index(base, i, k, 0)),
+                (BinOp::Add, V::Slot(base), V::Slot(i)) if reg(base) && reg(i) && base != i => Some(V::Index(base, i, 0, 0)),
+                (BinOp::Add, V::Lea(base, d), V::Scaled(i, k)) | (BinOp::Add, V::Scaled(i, k), V::Lea(base, d)) => Some(V::Index(base, i, k, d)),
+                (BinOp::Add | BinOp::Sub, V::Index(base, i, k, d), V::Imm(c)) => {
+                    let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                    c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).map(|d| V::Index(base, i, k, d))
+                }
+                _ => None,
+            };
+            if let Some(x) = lazy {
+                self.v.truncate(n - 2);
+                self.v.push(x);
+                return;
+            }
+        }
         let right = self.pop();
         let left = self.pop();
         self.need_rax();
@@ -613,6 +702,8 @@ impl G {
                 BinOp::Lt => 0x9C,
                 BinOp::Le => 0x9E,
                 BinOp::Gt => 0x9F,
+                BinOp::Ult => 0x92,
+                BinOp::Ule => 0x96,
                 _ => 0x9D,
             };
             self.v.push(V::Flags(cc));
@@ -916,6 +1007,86 @@ impl G {
         true
     }
 
+    /// An address: locals in registers (plus a constant, or base + index
+    /// times a size) are used where they are, anything else is worked out
+    /// into rax.
+    fn address(&mut self, x: V) -> Addr {
+        match x {
+            V::Lea(s, c) => Addr::Base(self.slot_reg(s), c),
+            V::Slot(s) if self.in_reg(s) => Addr::Base(self.slot_reg(s), 0),
+            V::Scaled(s, k) => Addr::Index(None, self.slot_reg(s), k, 0),
+            V::Index(b, i, k, d) => Addr::Index(Some(self.slot_reg(b)), self.slot_reg(i), k, d),
+            x => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                Addr::Base(RAX, 0)
+            }
+        }
+    }
+
+    /// The w bytes at the address on top, sign-extended into rax.
+    fn load_mem(&mut self, w: u8) {
+        let x = self.pop();
+        let at = self.address(x);
+        self.need_rax();
+        let op: &[u8] = match w {
+            1 => &[0x0F, 0xBE],
+            2 => &[0x0F, 0xBF],
+            4 => &[0x63],
+            _ => &[0x8B],
+        };
+        self.mem(false, true, op, RAX, at);
+        self.v.push(V::Rax);
+    }
+
+    fn store_mem(&mut self, w: u8) {
+        let x = self.pop();
+        let a = self.pop();
+        let imm = match x {
+            V::Imm(c) => i32::try_from(c).ok(),
+            _ => None,
+        };
+        let mut held = false;
+        if a == V::Stack {
+            // the address is popped first, so every later address counts
+            // what is really pushed; a value in rax waits in r11
+            if imm.is_none() && matches!(x, V::Rax | V::Flags(_) | V::Stack) {
+                self.to_reg(x, R11);
+                held = true;
+            }
+        } else if imm.is_none() {
+            self.to_reg(x, R11);
+            held = true;
+        }
+        let at = self.address(a);
+        match imm {
+            Some(c) => {
+                match w {
+                    1 => self.mem(false, false, &[0xC6], 0, at),
+                    2 => self.mem(true, false, &[0xC7], 0, at),
+                    4 => self.mem(false, false, &[0xC7], 0, at),
+                    _ => self.mem(false, true, &[0xC7], 0, at),
+                }
+                match w {
+                    1 => self.a.e(&[c as u8]),
+                    2 => self.a.e(&(c as i16).to_le_bytes()),
+                    _ => self.a.d32(c),
+                }
+            }
+            None => {
+                if !held {
+                    self.to_reg(x, R11);
+                }
+                match w {
+                    1 => self.mem(false, false, &[0x88], R11, at),
+                    2 => self.mem(true, false, &[0x89], R11, at),
+                    4 => self.mem(false, false, &[0x89], R11, at),
+                    _ => self.mem(false, true, &[0x89], R11, at),
+                }
+            }
+        }
+    }
+
     fn trap(&mut self) -> u32 {
         match self.trap_at {
             Some(t) => t,
@@ -1202,11 +1373,13 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     // rsp is 8 past a multiple of 16 at the entry: the pushes and the frame
     // bring it back to one
     let pushed = saved.len() as i32;
-    let mut frame = widest + 8 * mem;
+    // the function's own memory above its locals
+    let memory = widest + 8 * mem;
+    let mut frame = memory + (f.frame as i32 + 7) / 8 * 8;
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32 };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9
@@ -1287,22 +1460,14 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 continue;
             }
             at[i] = Some(d);
-            let after = d + match &code[i] {
-                Op::Push(_) | Op::Load(_) | Op::Dup => 1,
-                Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret => -1,
-                Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) => 0,
-                Op::LoadG(_) | Op::ReadLine => 1,
-                Op::StoreG(_) => -1,
-                Op::ReadToken => 2,
-                Op::Call(_, n) => 1 - *n as i32,
-            };
+            let Some(effect) = super::ir::stack_effect(&code[i]) else { continue }; // a return or a stop
+            let after = d + effect;
             match &code[i] {
                 Op::Jmp(l) => work.push((pos[*l as usize], after)),
                 Op::Jz(l) | Op::Jnz(l) => {
                     work.push((pos[*l as usize], after));
                     work.push((i + 1, after));
                 }
-                Op::Ret => {}
                 _ => work.push((i + 1, after)),
             }
         }
@@ -1400,8 +1565,27 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 g.call_runtime("rt.read_line");
                 g.v.push(V::Rax);
             }
+            Op::LoadM(w) => g.load_mem(*w),
+            Op::StoreM(w) => g.store_mem(*w),
+            Op::Frame(n) => {
+                g.fresh_rax();
+                let d = g.at(g.memory + *n as i32);
+                g.a.e(&[0x48, 0x8D, 0x84, 0x24]); // lea rax, [rsp + d]
+                g.a.d32(d);
+                g.v.push(V::Rax);
+            }
+            Op::AddrG(gl) => {
+                g.fresh_rax();
+                g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [global]
+                g.a.reloc(super::x64::global(*gl));
+                g.v.push(V::Rax);
+            }
+            Op::Fail(code, m) => {
+                super::x64::fail_here(&mut g.a, *code, m);
+                live = false;
+            }
             Op::Dup => match g.v.last().copied() {
-                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..))) => g.push(x),
+                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..))) => g.push(x),
                 _ => {
                     g.flush();
                     g.a.e(&[0xFF, 0x34, 0x24]);

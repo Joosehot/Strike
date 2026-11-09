@@ -28,7 +28,7 @@ fn u64le(b: &mut Vec<u8>, v: u64) {
 
 /// Lays out the functions (in the order given), fills every distance, and
 /// returns the bytes of the executable that starts at `entry`.
-pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
+pub fn link(funcs: &[(String, Code)], entry: &str, bss_min: u32) -> Result<Vec<u8>, String> {
     let mut text = Vec::new();
     let mut at: HashMap<&str, u32> = HashMap::new();
     for (name, code) in funcs {
@@ -93,13 +93,15 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     rdata.extend(hint_names);
     rdata.extend_from_slice(b"KERNEL32.dll\0");
     let rdata_len = rdata.len() as u32;
-    // .bss: as far as the furthest place written (8 bytes each)
+    // .bss: as far as the furthest place written (8 bytes each), and at
+    // least as far as the globals go (an array's elements past its start)
     let bss_len = funcs
         .iter()
         .flat_map(|(_, c)| c.relocs.iter())
         .filter_map(|(_, t)| if let Target::Writable(o) = t { Some(o + 8) } else { None })
         .max()
         .unwrap_or(0)
+        .max(bss_min)
         .max(8);
     let bss_rva = rdata_rva + align(rdata_len, SECTION);
 

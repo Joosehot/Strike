@@ -31,6 +31,9 @@ bool_print = []
 # guessed: it wraps and compares differently.
 promote = 32
 literals = "typed"
+# {1, 2, 3} gives an array its first values; an index is not checked,
+# as C does not check it
+brace_lists = true
 
 [int_widths]
 int = 32
@@ -86,7 +89,7 @@ pattern = "$type $name ( $params ) $block"
 [[form]]
 kind = "var"
 place = "top"
-pattern = "$type $name [ = $expr ] ;"
+pattern = "$type $name $dims [ = $expr ] ;"
 
 [[form]]
 kind = "read"
@@ -128,60 +131,60 @@ pattern = "puts ( $args ) $end"
 
 [[form]]
 kind = "var"
-pattern = "$type $name [ = $expr ] $end"
+pattern = "$type $name $dims [ = $expr ] $end"
 
 [[form]]
 kind = "assign"
 op = "add"
-pattern = "$name += $expr $end"
+pattern = "$place += $expr $end"
 
 [[form]]
 kind = "assign"
 op = "sub"
-pattern = "$name -= $expr $end"
+pattern = "$place -= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "mul"
-pattern = "$name *= $expr $end"
+pattern = "$place *= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "div_trunc"
-pattern = "$name /= $expr $end"
+pattern = "$place /= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "mod_trunc"
-pattern = "$name %= $expr $end"
+pattern = "$place %= $expr $end"
 
 [[form]]
 kind = "assign"
 op = "add"
 value = 1
-pattern = "$name ++ $end"
+pattern = "$place ++ $end"
 
 [[form]]
 kind = "assign"
 op = "sub"
 value = 1
-pattern = "$name -- $end"
+pattern = "$place -- $end"
 
 [[form]]
 kind = "assign"
 op = "add"
 value = 1
-pattern = "++ $name $end"
+pattern = "++ $place $end"
 
 [[form]]
 kind = "assign"
 op = "sub"
 value = 1
-pattern = "-- $name $end"
+pattern = "-- $place $end"
 
 [[form]]
 kind = "assign"
-pattern = "$name = $expr $end"
+pattern = "$place = $expr $end"
 
 [[form]]
 kind = "nothing"

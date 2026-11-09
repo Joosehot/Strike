@@ -24,6 +24,7 @@ pub fn run(funcs: &mut [Func], r: &Rules, release: bool) -> usize {
         // nothing, so no two are ever live at once (and each starts its
         // slots at zero)
         let base = f.slots;
+        let mbase = f.frame;
         let code = std::mem::take(&mut f.code);
         let depth = loop_depths(&code);
         let mut labels = label_count(&code);
@@ -43,7 +44,8 @@ pub fn run(funcs: &mut [Func], r: &Rules, release: bool) -> usize {
                 continue;
             }
             f.slots = f.slots.max(base + c.slots);
-            copy(&mut out, c, base, &mut labels);
+            f.frame = f.frame.max(mbase + c.frame);
+            copy(&mut out, c, base, mbase, &mut labels);
             copied += 1;
         }
         f.code = out;
@@ -54,8 +56,8 @@ pub fn run(funcs: &mut [Func], r: &Rules, release: bool) -> usize {
 /// The callee's body in place of a call: the arguments into its slots
 /// (the last is on top), its other slots to zero as its own prologue would,
 /// its labels renumbered, and its returns a jump past the copy with the
-/// value on the stack.
-fn copy(out: &mut Vec<Op>, c: &Func, base: u32, labels: &mut u32) {
+/// value on the stack. Its own memory goes after the caller's (from mbase).
+fn copy(out: &mut Vec<Op>, c: &Func, base: u32, mbase: u32, labels: &mut u32) {
     for p in (0..c.params).rev() {
         out.push(Op::Store(base + p));
     }
@@ -75,6 +77,7 @@ fn copy(out: &mut Vec<Op>, c: &Func, base: u32, labels: &mut u32) {
             Op::Jz(l) => Op::Jz(l + lbase),
             Op::Jnz(l) => Op::Jnz(l + lbase),
             Op::Label(l) => Op::Label(l + lbase),
+            Op::Frame(n) => Op::Frame(n + mbase),
             Op::Ret => Op::Jmp(end),
             o => o.clone(),
         });
@@ -99,6 +102,7 @@ pub fn unroll(funcs: &mut [Func], r: &Rules) -> usize {
         for _ in 0..r.unroll.levels {
             let original = f.clone();
             let base = f.slots;
+            let mbase = f.frame;
             let code = std::mem::take(&mut f.code);
             let mut labels = label_count(&code);
             let mut out = Vec::with_capacity(code.len() * (sites + 1));
@@ -108,7 +112,8 @@ pub fn unroll(funcs: &mut [Func], r: &Rules) -> usize {
                         // copies do not overlap: one is done before the next
                         // starts, and a call inside it has its own frame
                         f.slots = f.slots.max(base + original.slots);
-                        copy(&mut out, &original, base, &mut labels);
+                        f.frame = f.frame.max(mbase + original.frame);
+                        copy(&mut out, &original, base, mbase, &mut labels);
                         unrolled += 1;
                     }
                     o => out.push(o.clone()),

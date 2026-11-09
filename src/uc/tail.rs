@@ -14,6 +14,11 @@ use super::ir::{label_count, BinOp, Func, Op};
 
 /// Rewrites the function; returns how many calls became jumps.
 pub fn run(f: &mut Func) -> usize {
+    // a call may be given the address of this one's own memory (C's
+    // `return f(a)` with a local array), which a jump would reuse
+    if f.frame > 0 {
+        return 0;
+    }
     let me = f.name.clone();
     let n = f.params;
     let code = &f.code;

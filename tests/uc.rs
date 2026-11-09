@@ -84,6 +84,56 @@ fn globals_are_what_clang_go_and_python_make_of_them() {
     }
 }
 
+/// Builds a suite file in every mode: what it prints must be what the real
+/// toolchain printed.
+fn runs_in_every_mode_as_the_real_one(file: &str) {
+    let want = std::fs::read(suite(&format!("{file}.out"))).unwrap();
+    let r = root(&format!("modes-{file}"));
+    for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+        let exe = r.join("a.exe");
+        let o = compile_with(&r, &suite(file), &exe, &mode, None);
+        assert!(o.status.success(), "{file} {mode:?}: {}", text(&o));
+        let got = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&want), "{file} {mode:?}");
+        assert!(got.status.success(), "{file} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+    }
+}
+
+#[test]
+fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
+    for file in ["arrays.c", "arrays.go", "arrays.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+/// An index out of range stops the program as the language stops it:
+/// Python's IndexError with exit code 1, Go's panic with exit code 2, and
+/// nothing printed after it.
+#[test]
+fn an_index_out_of_range_stops_the_program_as_python_and_go_stop_it() {
+    let r = root("index");
+    for (name, src, code, says) in [
+        ("list.py", "a = [1, 2, 3]\nprint(a[2])\nprint(a[3])\nprint(9)\n", 1, "IndexError"),
+        ("negative.py", "a = [1, 2, 3]\nprint(a[-3])\nprint(a[-4])\n", 1, "IndexError"),
+        ("pop.py", "a = []\na.append(1)\nprint(a.pop())\nprint(a.pop())\n", 1, "pop from empty list"),
+        ("slice.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := []int{1, 2}\n\tfmt.Println(s[1])\n\ti := 2\n\tfmt.Println(s[i])\n}\n", 2, "index out of range"),
+        ("array.go", "package main\nimport \"fmt\"\nfunc main() {\n\tvar a [3]int\n\ti := -1\n\tfmt.Println(a[0])\n\ta[i] = 1\n}\n", 2, "index out of range"),
+        ("bounds.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := make([]int, 2, 4)\n\tfmt.Println(len(s[1:4]))\n\tn := 5\n\tfmt.Println(s[1:n])\n}\n", 2, "slice bounds out of range"),
+        ("make.go", "package main\nimport \"fmt\"\nfunc main() {\n\tn := -1\n\tfmt.Println(1)\n\ts := make([]int, n)\n\tfmt.Println(len(s))\n}\n", 2, "makeslice"),
+    ] {
+        let p = r.join(name);
+        std::fs::write(&p, src).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"]] {
+            let exe = r.join("a.exe");
+            assert!(compile_with(&r, &p, &exe, &mode, None).status.success(), "{name}");
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(got.status.code(), Some(code), "{name} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout).lines().count(), 1, "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stdout));
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{name} {mode:?}");
+        }
+    }
+}
+
 #[test]
 fn input_is_read_as_clang_go_and_python_read_it() {
     runs_with_input_as_the_real_one("input.c", "input.in");
@@ -344,10 +394,35 @@ impl Gen {
             );
             sums.push((format!("z{k}"), if arg.is_empty() { format!("{}", self.below(100)) } else { arg }));
         }
+        // arrays: a local one in the function's own memory, a global one,
+        // one given to another function; every index held in range by & 15
+        out += "long long garr[16];\nlong long asum(long long v[], long long n) {\n    long long s = 0;\n    for (long long i = 0; i < n; i++) {\n        s += v[i] * (i + 1);\n    }\n    return s;\n}\n";
+        let mut arrays = Vec::new();
+        for k in 0..3 {
+            let names: Vec<String> = ["n", "i", "arr[(i * 7) & 15]", "garr[(n + i) & 15]", "arr[n & 15]"].iter().map(|s| s.to_string()).collect();
+            let outer = vec!["n".to_string(), "arr[3]".to_string(), "garr[n & 15]".to_string()];
+            out += &format!(
+                "long long a{k}(long long n) {{\n    long long arr[16] = {{{}, {}}};\n    for (long long i = 0; i < 16; i++) {{\n        arr[({}) & 15] += {};\n        garr[i] = arr[i] ^ {};\n    }}\n    arr[({}) & 15] = arr[({}) & 15] - {};\n    return asum(arr, 16) + {};\n}}\n",
+                self.constant(),
+                self.constant(),
+                self.expr(&names, &[], 2),
+                self.expr(&names, &[], 3),
+                self.expr(&names, &[], 2),
+                self.expr(&outer, &[], 2),
+                self.expr(&outer, &[], 2),
+                self.expr(&outer, &[], 2),
+                self.expr(&outer, &[], 3)
+            );
+            arrays.push(format!("a{k}"));
+        }
         out += "int main() {\n";
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
         }
+        for f in &arrays {
+            out += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
+        }
+        out += "    printf(\"%lld %lld\\n\", garr[0], garr[15]);\n";
         for (f, n) in &funcs {
             let args: Vec<String> = (0..*n).map(|_| self.constant()).collect();
             out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));
@@ -497,7 +572,9 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("none.py", "def f(x):\n    if x:\n        return 1\nprint(f(0))\n", "can end without returning"),
         ("nolang.txt", "SELECT * FROM t;\n", "no description reads the whole file"),
         ("unsigned.c", "int main() { unsigned int x = 1; return x; }\n", "unsigned numbers are not in Strike yet"),
-        ("pointer.c", "int f(int *p) { return 0; }\nint main() { return 0; }\n", "pointers and arrays are not in Strike yet"),
+        ("pointer.c", "int main() { int *p; return 0; }\n", "pointer variables are not in Strike yet"),
+        ("vla.c", "int main() { int n = 3; int a[n]; return 0; }\n", "no variable-length arrays"),
+        ("mixed.py", "a = [1, True]\nprint(a)\n", "one kind per list"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
         ("unbound.py", "n = 1\ndef f():\n    print(n)\n    n = 2\nf()\n", "read before this function assigns it"),
         ("string.py", "x = input()\nprint(x)\n", "strings are not in Strike yet"),

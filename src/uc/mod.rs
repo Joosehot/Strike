@@ -18,6 +18,7 @@ mod tail;
 pub mod ir;
 mod lang;
 mod lex;
+mod lib;
 mod lower;
 mod opt;
 mod parse;
@@ -278,7 +279,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
             }
             code.push(ir::Op::Push(d.returned));
             code.push(ir::Op::Ret);
-            low.funcs = vec![ir::Func { name: low.entry.clone(), params: 0, slots: 0, code }];
+            low.funcs = vec![ir::Func::new(low.entry.clone(), 0, 0, code)];
             evaluated = Some(format!("worked out by Strike's IR runner in {} steps", d.steps));
         }
     }
@@ -329,7 +330,8 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     let code_seconds = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let mut exe = pe::link(&funcs, "rt.start")?;
+    let bss = x64::GLOBALS + 8 * low.globals;
+    let mut exe = pe::link(&funcs, "rt.start", bss)?;
     // --release, too long for the IR runner: the program run once as it
     // was compiled, and the executable only gives its output
     if gen == Gen::Release && evaluate && evaluated.is_none() && rules.release.evaluate.max_seconds > 0.0 {
@@ -338,7 +340,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
         baking[0] = ("rt.start".to_string(), x64::bake_start(&low.entry));
         // a path with its folder: a bare name would be looked for on PATH
         let path = std::path::absolute(out.with_extension(format!("bake{}.exe", std::process::id()))).map_err(|e| e.to_string())?;
-        if std::fs::write(&path, pe::link(&baking, "rt.start")?).is_ok() {
+        if std::fs::write(&path, pe::link(&baking, "rt.start", bss)?).is_ok() {
             let result = eval::bake(&path, &rules.release.evaluate);
             let _ = std::fs::remove_file(&path);
             if let Some((output, returned)) = result {
@@ -348,10 +350,10 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
                 }
                 code.push(ir::Op::Push(returned));
                 code.push(ir::Op::Ret);
-                let f = ir::Func { name: low.entry.clone(), params: 0, slots: 0, code };
+                let f = ir::Func::new(low.entry.clone(), 0, 0, code);
                 let mut only = x64::runtime(&low.entry);
                 only.push((f.name.clone(), x64opt::compile(&f, &rules, true)));
-                exe = pe::link(&only, "rt.start")?;
+                exe = pe::link(&only, "rt.start", bss)?;
                 evaluated = Some(format!("run once while compiling ({:.3} s)", run.elapsed().as_secs_f64()));
             }
         }

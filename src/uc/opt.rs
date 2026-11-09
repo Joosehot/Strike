@@ -46,7 +46,18 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 }
                 st.push(None);
             }
-            Op::Dup | Op::LoadG(_) | Op::ReadLine => st.push(None),
+            // what memory holds is not a plain expression: a store may
+            // change it
+            Op::LoadM(_) => {
+                st.pop();
+                st.push(None);
+            }
+            Op::StoreM(_) => {
+                st.pop();
+                st.pop();
+            }
+            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => st.push(None),
+            Op::Fail(..) => st.iter_mut().for_each(|x| *x = None),
             Op::ReadToken => {
                 st.push(None);
                 st.push(None);
@@ -194,7 +205,7 @@ mod tests {
     use super::*;
 
     fn func(code: Vec<Op>, slots: u32) -> Func {
-        Func { name: "t".into(), params: 0, slots, code }
+        Func::new("t", 0, slots, code)
     }
 
     #[test]

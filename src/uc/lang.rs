@@ -50,6 +50,34 @@ struct Raw {
     literals: Option<String>,
     #[serde(default)]
     int_widths: BTreeMap<String, u8>,
+    /// what an index out of range does: the exit code and the message
+    /// (none: nothing is checked, as C does nothing)
+    #[serde(default)]
+    index_error: Option<(u8, String)>,
+    /// a[-1] is the last element (Python)
+    #[serde(default)]
+    negative_index: bool,
+    /// [a, b] is a list (Python)
+    #[serde(default)]
+    list_literals: bool,
+    /// [e for x in xs] (Python)
+    #[serde(default)]
+    comprehensions: bool,
+    /// []int{a, b}, [3]int{a, b, c} (Go)
+    #[serde(default)]
+    composite_literals: bool,
+    /// {a, b} as a value (C's initializers)
+    #[serde(default)]
+    brace_lists: bool,
+    /// how a list prints: before, between, after
+    #[serde(default)]
+    list_print: Option<[String; 3]>,
+    /// functions every program has: the language's name -> what it is
+    #[serde(default)]
+    builtins: BTreeMap<String, String>,
+    /// x.name(...) on a list: the name -> what it is
+    #[serde(default)]
+    methods: BTreeMap<String, String>,
     #[serde(default)]
     bool_constants: BTreeMap<String, i64>,
     #[serde(default)]
@@ -74,6 +102,9 @@ struct RawForm {
     value: Option<i64>,
     #[serde(default)]
     style: Option<String>,
+    /// for_each: what each $name of the pattern is ("index", "value")
+    #[serde(default)]
+    names: Option<Vec<String>>,
     pattern: String,
 }
 
@@ -105,6 +136,15 @@ pub enum Kind {
     Global,
     /// a whole number read from standard input into a variable
     Read,
+    /// a loop over the elements of a list, a slice or an array
+    ForEach,
+}
+
+/// What a $name of a for_each form is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Index,
+    Value,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -138,6 +178,10 @@ pub enum Cap {
     End,
     Simple,
     Str,
+    /// a name with indexes after it: what an assignment changes (a[i][j])
+    Place,
+    /// zero or more [size] after a declared name (C's arrays)
+    Dims,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +200,7 @@ pub struct Form {
     pub op: Option<BinOp>,
     pub value: Option<i64>,
     pub style: Style,
+    pub names: Vec<Role>,
     pub pat: Vec<Pat>,
 }
 
@@ -187,6 +232,15 @@ pub struct Lang {
     /// the call that reads a whole line as a number: outer(inner())
     pub read_line: Option<(String, String)>,
     pub bool_print: Option<(String, String)>,
+    pub index_error: Option<(u8, String)>,
+    pub negative_index: bool,
+    pub list_literals: bool,
+    pub comprehensions: bool,
+    pub composite_literals: bool,
+    pub brace_lists: bool,
+    pub list_print: (String, String, String),
+    pub builtins: HashMap<String, String>,
+    pub methods: HashMap<String, String>,
     pub bool_constants: HashMap<String, i64>,
     pub binary: HashMap<String, (u8, BinOp)>,
     pub unary: HashMap<String, (u8, UnOp)>,
@@ -243,6 +297,8 @@ fn compile_seq(words: &[&str], i: &mut usize) -> Result<Vec<Pat>, String> {
                 "end" => Cap::End,
                 "simple" => Cap::Simple,
                 "str" => Cap::Str,
+                "place" => Cap::Place,
+                "dims" => Cap::Dims,
                 _ => return Err(format!("unknown capture ${c}")),
             })
         } else if let Some(n) = w.strip_prefix('@') {
@@ -289,7 +345,19 @@ impl Lang {
                 "expr" => Kind::Expr,
                 "global" => Kind::Global,
                 "read" => Kind::Read,
+                "for_each" => Kind::ForEach,
                 k => return Err(err(format!("unknown kind {k}"))),
+            };
+            let names = match &f.names {
+                None => vec![Role::Value],
+                Some(v) => v
+                    .iter()
+                    .map(|n| match n.as_str() {
+                        "index" => Ok(Role::Index),
+                        "value" => Ok(Role::Value),
+                        x => Err(err(format!("unknown name role {x}"))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             };
             let place = match f.place.as_deref() {
                 None | Some("stmt") => Place::Stmt,
@@ -314,7 +382,7 @@ impl Lang {
             if i != words.len() {
                 return Err(err(format!("a stray {} in {:?}", words[i], f.pattern)));
             }
-            forms.push(Form { name: f.name.clone(), kind, place, op, value: f.value, style, pat });
+            forms.push(Form { name: f.name.clone(), kind, place, op, value: f.value, style, names, pat });
         }
         for f in &forms {
             let mut subs = Vec::new();
@@ -353,6 +421,12 @@ impl Lang {
         tokens.extend(r.end_after.iter().cloned());
         let mut puncts: Vec<String> = tokens.iter().filter(|t| !is_word(t)).cloned().collect();
         puncts.extend(["(", ")", "{", "}", ",", ";", "[", "]"].map(String::from));
+        if !r.methods.is_empty() {
+            puncts.push(".".into());
+        }
+        if r.composite_literals || r.list_literals {
+            puncts.push(":".into()); // a[i:j]
+        }
         puncts.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         puncts.dedup();
         let mut keywords: HashSet<String> = tokens.into_iter().filter(|t| is_word(t)).collect();
@@ -419,6 +493,18 @@ impl Lang {
             end_after: r.end_after.into_iter().collect(),
             type_words: r.type_words.into_iter().collect(),
             bool_print,
+            index_error: r.index_error,
+            negative_index: r.negative_index,
+            list_literals: r.list_literals,
+            comprehensions: r.comprehensions,
+            composite_literals: r.composite_literals,
+            brace_lists: r.brace_lists,
+            list_print: match r.list_print {
+                Some([a, b, c]) => (a, b, c),
+                None => ("[".into(), " ".into(), "]".into()),
+            },
+            builtins: r.builtins.into_iter().collect(),
+            methods: r.methods.into_iter().collect(),
             bool_constants: r.bool_constants.into_iter().collect(),
             binary,
             unary,
