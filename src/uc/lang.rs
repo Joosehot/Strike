@@ -12,6 +12,8 @@ pub const BUILT_IN: [&str; 3] = [
     include_str!("../../languages/python.toml"),
 ];
 pub const JUDGES: &str = include_str!("../../languages/judges.toml");
+/// files a description names for what is too long to write in it
+const DATA: [(&str, &str); 1] = [("c-predefined.h", include_str!("../../languages/c-predefined.h"))];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,8 +24,6 @@ struct Raw {
     line_comments: Vec<String>,
     #[serde(default)]
     block_comments: Vec<[String; 2]>,
-    #[serde(default)]
-    skip_lines: Vec<String>,
     #[serde(default)]
     string_quotes: Vec<String>,
     #[serde(default)]
@@ -86,6 +86,38 @@ struct Raw {
     unary: BTreeMap<String, (u8, String)>,
     #[serde(default)]
     form: Vec<RawForm>,
+    /// a.b: a name b of the imported module or package a (Go, Python)
+    #[serde(default)]
+    qualified: bool,
+    #[serde(default)]
+    preprocessor: Option<RawPre>,
+    #[serde(default)]
+    program: Option<RawProgram>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPre {
+    marker: String,
+    /// a file in languages/ of #define lines: the compiler's own macros
+    predefined: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProgram {
+    model: String,
+    directory: String,
+    #[serde(default)]
+    skip_suffixes: Vec<String>,
+    #[serde(default)]
+    module_file: Option<String>,
+    #[serde(default)]
+    standard: Vec<String>,
+    #[serde(default)]
+    found_first: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +170,12 @@ pub enum Kind {
     Read,
     /// a loop over the elements of a list, a slice or an array
     ForEach,
+    /// import m, import "mod/pkg": another module or package of the program
+    Import,
+    /// Python's from m import a, b
+    ImportFrom,
+    /// Go's package clause
+    Package,
 }
 
 /// What a $name of a for_each form is.
@@ -191,6 +229,8 @@ pub enum Pat {
     Sub(String),
     /// one of the alternatives, or nothing
     Opt(Vec<Vec<Pat>>),
+    /// [ a | b ]*: the alternatives, as many times as they match
+    Many(Vec<Vec<Pat>>),
 }
 
 pub struct Form {
@@ -209,7 +249,6 @@ pub struct Lang {
     pub extensions: Vec<String>,
     pub line_comments: Vec<String>,
     pub block_comments: Vec<(String, String)>,
-    pub skip_lines: Vec<String>,
     pub string_quotes: Vec<u8>,
     pub char_quotes: Vec<u8>,
     pub indent: bool,
@@ -249,6 +288,45 @@ pub struct Lang {
     pub puncts: Vec<String>,
     /// words that are never a name
     pub keywords: HashSet<String>,
+    pub qualified: bool,
+    pub preprocessor: Option<Preprocessor>,
+    pub program: ProgramRule,
+}
+
+/// C's preprocessor, as the description gives it.
+pub struct Preprocessor {
+    /// the token a directive line begins with
+    pub marker: String,
+    /// #define lines: the macros the compiler defines before any file
+    pub predefined: String,
+    /// the headers Strike knows: name -> the text including it gives
+    pub headers: HashMap<String, String>,
+}
+
+/// How the files of a program make one program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Model {
+    /// every file on its own, sharing the names outside functions that are
+    /// not static (C's translation units)
+    Units,
+    /// a directory is a package; others are imported by their path (Go)
+    Packages,
+    /// one file runs, and imports the others by name (Python)
+    Modules,
+}
+
+pub struct ProgramRule {
+    pub model: Model,
+    /// the files a directory is: "*.ext" for every such file, or one name
+    pub directory: String,
+    /// files of the directory that are not part of it (Go's _test.go)
+    pub skip_suffixes: Vec<String>,
+    /// the file that names the module and its root (go.mod)
+    pub module_file: Option<String>,
+    /// the language's own packages that Strike provides (fmt)
+    pub standard: Vec<String>,
+    /// module names the language finds before any file of the program
+    pub found_first: Vec<String>,
 }
 
 fn is_word(s: &str) -> bool {
@@ -265,22 +343,26 @@ fn compile_seq(words: &[&str], i: &mut usize) -> Result<Vec<Pat>, String> {
     let mut seq = Vec::new();
     while let Some(&w) = words.get(*i) {
         match w {
-            "]" | "|" => break,
+            "]" | "]*" | "|" => break,
             "[" => {
                 *i += 1;
                 let mut alts = Vec::new();
-                loop {
+                let many = loop {
                     alts.push(compile_seq(words, i)?);
                     match words.get(*i) {
                         Some(&"|") => *i += 1,
                         Some(&"]") => {
                             *i += 1;
-                            break;
+                            break false;
+                        }
+                        Some(&"]*") => {
+                            *i += 1;
+                            break true;
                         }
                         _ => return Err("a [ without its ]".into()),
                     }
-                }
-                seq.push(Pat::Opt(alts));
+                };
+                seq.push(if many { Pat::Many(alts) } else { Pat::Opt(alts) });
                 continue;
             }
             _ => {}
@@ -315,7 +397,7 @@ fn literals(p: &[Pat], out: &mut Vec<String>) {
     for x in p {
         match x {
             Pat::Lit(s) => out.push(s.clone()),
-            Pat::Opt(alts) => alts.iter().for_each(|a| literals(a, out)),
+            Pat::Opt(alts) | Pat::Many(alts) => alts.iter().for_each(|a| literals(a, out)),
             _ => {}
         }
     }
@@ -346,6 +428,9 @@ impl Lang {
                 "global" => Kind::Global,
                 "read" => Kind::Read,
                 "for_each" => Kind::ForEach,
+                "import" => Kind::Import,
+                "import_from" => Kind::ImportFrom,
+                "package" => Kind::Package,
                 k => return Err(err(format!("unknown kind {k}"))),
             };
             let names = match &f.names {
@@ -390,7 +475,7 @@ impl Lang {
                 for x in p {
                     match x {
                         Pat::Sub(n) => out.push(n.clone()),
-                        Pat::Opt(a) => a.iter().for_each(|s| walk(s, out)),
+                        Pat::Opt(a) | Pat::Many(a) => a.iter().for_each(|s| walk(s, out)),
                         _ => {}
                     }
                 }
@@ -421,7 +506,7 @@ impl Lang {
         tokens.extend(r.end_after.iter().cloned());
         let mut puncts: Vec<String> = tokens.iter().filter(|t| !is_word(t)).cloned().collect();
         puncts.extend(["(", ")", "{", "}", ",", ";", "[", "]"].map(String::from));
-        if !r.methods.is_empty() {
+        if !r.methods.is_empty() || r.qualified {
             puncts.push(".".into());
         }
         if r.composite_literals || r.list_literals {
@@ -438,7 +523,46 @@ impl Lang {
             [t, f] => Some((t.clone(), f.clone())),
             _ => return Err(err("bool_print is the words for true and false".into())),
         };
+        let preprocessor = match r.preprocessor {
+            None => None,
+            Some(p) => Some(Preprocessor {
+                marker: p.marker,
+                predefined: DATA
+                    .iter()
+                    .find(|(n, _)| *n == p.predefined)
+                    .ok_or_else(|| err(format!("there is no file {} in languages/", p.predefined)))?
+                    .1
+                    .to_string(),
+                headers: p.headers.into_iter().collect(),
+            }),
+        };
+        let program = match r.program {
+            None => ProgramRule {
+                model: Model::Units,
+                directory: format!("*.{}", r.extensions.first().cloned().unwrap_or_default()),
+                skip_suffixes: Vec::new(),
+                module_file: None,
+                standard: Vec::new(),
+                found_first: Vec::new(),
+            },
+            Some(p) => ProgramRule {
+                model: match p.model.as_str() {
+                    "units" => Model::Units,
+                    "packages" => Model::Packages,
+                    "modules" => Model::Modules,
+                    m => return Err(err(format!("unknown program model {m}"))),
+                },
+                directory: p.directory,
+                skip_suffixes: p.skip_suffixes,
+                module_file: p.module_file,
+                standard: p.standard,
+                found_first: p.found_first,
+            },
+        };
         Ok(Lang {
+            qualified: r.qualified,
+            preprocessor,
+            program,
             indent: match r.blocks.as_str() {
                 "indent" => true,
                 "braces" => false,
@@ -489,7 +613,6 @@ impl Lang {
             extensions: r.extensions,
             line_comments: r.line_comments,
             block_comments: r.block_comments.into_iter().map(|[a, b]| (a, b)).collect(),
-            skip_lines: r.skip_lines,
             end_after: r.end_after.into_iter().collect(),
             type_words: r.type_words.into_iter().collect(),
             bool_print,

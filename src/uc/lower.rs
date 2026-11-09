@@ -145,7 +145,7 @@ fn symbol(name: &str) -> String {
 
 /// Every name a body assigns whole, in its blocks too (an element's
 /// assignment does not make a name the function's own).
-fn assigned_names(body: &[Stmt]) -> HashSet<String> {
+pub(super) fn assigned_names(body: &[Stmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     fn walk(body: &[Stmt], out: &mut HashSet<String>) {
         for s in body {

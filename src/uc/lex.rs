@@ -58,7 +58,7 @@ pub fn lex(src: &str, l: &Lang) -> Result<Vec<Tok>, (u32, String)> {
 
     while i < s.len() {
         if at_line_start && depth == 0 {
-            // a new line: its indentation, or a line that is skipped whole
+            // a new line: its indentation, or a blank line
             let mut j = i;
             let mut col = 0;
             while j < s.len() && (s[j] == b' ' || s[j] == b'\t') {
@@ -70,13 +70,6 @@ pub fn lex(src: &str, l: &Lang) -> Result<Vec<Tok>, (u32, String)> {
                 || s[j] == b'\n'
                 || s[j] == b'\r'
                 || (l.indent && l.line_comments.iter().any(|c| rest.starts_with(c.as_str())));
-            if !blank && l.skip_lines.iter().any(|p| rest.starts_with(p.as_str())) {
-                while j < s.len() && s[j] != b'\n' {
-                    j += 1;
-                }
-                i = j;
-                continue;
-            }
             if blank {
                 while j < s.len() && s[j] != b'\n' {
                     j += 1;

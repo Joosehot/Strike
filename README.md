@@ -60,7 +60,7 @@ own time goes.
 ## The universal compiler
 
 ```
-strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
+strike compile <file>... | <dir> [-o EXE] [-I DIR] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
 ```
 
 Strike's own compiler. It does not know any language itself. Every
@@ -78,6 +78,8 @@ Each form says which universal construct it is. A new language is a new
 file, not a new compiler. There are three today: C, Go and Python.
 
 ### How a file becomes an executable
+
+(A program of several files: [below](#several-files-modules-and-cs-preprocessor).)
 
 1. **HotMotor picks the language.** Every description is a candidate, and
    the judges in [languages/judges.toml](languages/judges.toml) score each
@@ -139,6 +141,64 @@ Integers are exactly what each language says they are:
   number would leave 64 bits, the program stops with exit code 1 and a
   message on standard error. It never goes on with a wrong number.
 
+### Several files, modules and C's preprocessor
+
+`strike compile a.c b.c`, or a directory: `strike compile prog/`. Each
+description says in its `[program]` table what a directory is in its
+language: every `.c` file, every `.go` file but the tests, or Python's
+`__main__.py`. HotMotor still picks the language, now for the whole
+program. The files are read into the universal syntax one by one
+([src/uc/modules.rs](src/uc/modules.rs)) and made one program before it
+is lowered:
+
+- **C** ([src/uc/cpp.rs](src/uc/cpp.rs)). Every file is preprocessed
+  first. The preprocessor does `#include "..."` (next to the including
+  file, then `-I`) and `<...>`, `#define` with arguments, `#`, `##` and
+  `__VA_ARGS__`, `#undef`, `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/
+  `#endif` with `defined` and clang's integer arithmetic (unsigned where
+  clang makes it unsigned, `&&`, `||` and `?:` evaluating only the side
+  taken), `#error`, `#pragma once` and `__LINE__`. Expansion is the
+  standard's, by hide sets. The macros clang defines before any file come
+  first ([languages/c-predefined.h](languages/c-predefined.h), from `clang
+  -O2 -dM -E`), so `#ifdef _WIN32` or `#if __STDC_VERSION__ >= 201112L`
+  finds what clang has. A header Strike knows (`stdio.h`, `stdlib.h`,
+  `stdbool.h`, `stdint.h`, `limits.h`) gives what [c.toml](languages/c.toml)
+  says it gives: `printf`, `puts` and `scanf` are Strike's own, and
+  `INT_MAX` or `true` are clang's values. Every token keeps its file and
+  line, so an error in a header points at the header's line.
+- **C files** are translation units. A function or a variable outside a
+  function is shared by every file, and `extern int x;` names one that
+  some file defines. A `static` one is its file's own: two files may each
+  have a `static int count`. A `static` variable in a function keeps its
+  value from call to call, given once before main, as C gives it.
+- **Go** reads `go.mod`. The files of a directory are one package, and
+  `import "example.com/m/calc"` is the package in `calc/` under the module.
+  `calc.Add(1, 2)`, `calc.Total` and `calc.Total += 1` reach its names. A
+  name that does not begin with a capital letter is not seen outside its
+  package. The packages' variables are given in Go's order: a package
+  after those it imports, and of those ready the first by its path.
+- **Python** imports `m.py` next to the main file: `import m`, `import m as
+  k`, `from m import f, x as y`. A module runs where it is first imported,
+  and only then. `from m import x` copies x as it is at that point.
+  `m.f()`, `m.x`, `m.x = 1` (in a function too) and `__name__ ==
+  "__main__"` mean what they do in Python.
+
+A name of a module other than the main one is given the module's prefix
+(`m.f`, `example.com/m/calc.Add`), and a C static name its file's. So
+names from different files never meet in the IR. A function's brand is
+still its IR: the same program given as a directory or as its files
+strikes every function from the brands made the first time.
+
+What is refused, with its file and line: `#pragma` (but `once`), `#line`,
+`#include_next`, `#embed`, a computed `#include`, `__FILE__`, `__DATE__`,
+`_Pragma`, `__has_include`, `__VA_OPT__`, GNU's `, ## __VA_ARGS__`, digraphs
+and any header Strike does not know. Also a function or variable defined
+in two C files; Go's `init`, import cycles, unused imports, packages
+outside the module and `require` in go.mod; Python's circular imports,
+`from m import *`, an import inside a function or a block, a module named
+like one of Python's own (which Python finds first), and a module used as
+a value.
+
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
@@ -174,7 +234,14 @@ the line and the reason, and never guessed. Refused today:
   loop for 300 random polynomials, with overflow.
 - Globals and input are checked against clang, Go and Python with the
   same input, in every mode, and Python's input errors one by one.
-- 41 tests in all, in about 25 s.
+- Programs of several files ([tests/uc/multi_c/](tests/uc/multi_c/),
+  [multi_go/](tests/uc/multi_go/), [multi_py/](tests/uc/multi_py/)) and a
+  preprocessed C program are built in every mode, given as a directory and
+  as their files. They print what clang, `go run .` and Python print. The
+  preprocessor alone gives, token for token, what `clang -E -P` gives for
+  [tests/uc/cpp/](tests/uc/cpp/): the standard's own macro examples,
+  conditionals, and includes through guards, `#pragma once` and `-I`.
+- 39 tests in all, in about 30 s.
 
 The tests have found real bugs, all fixed:
 
@@ -302,8 +369,8 @@ are planned:
    command-line arguments, which are strings).
 2. Floats.
 3. Structs and classes.
-4. Several files and modules, and C's preprocessor. Today a `#` line is
-   skipped. It must become a preprocessor, or be refused.
+4. ~~Several files and modules, and C's preprocessor.~~ Done: see
+   above.
 
 After those come garbage collection (for Python's and Go's objects),
 `unsigned`, maps, closures, exceptions, the rest of each standard library,

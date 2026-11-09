@@ -6,7 +6,6 @@ name = "Go"
 extensions = ["go"]
 line_comments = ["//"]
 block_comments = [["/*", "*/"]]
-skip_lines = []
 string_quotes = ["\""]
 char_quotes = ["'"]
 blocks = "braces"
@@ -24,7 +23,19 @@ literals = "untyped"
 # an index out of range panics: Go stops with exit code 2
 index_error = [2, "panic: runtime error: index out of range\n"]
 composite_literals = true
+# pkg.Name: a name of an imported package
+qualified = true
 list_print = ["[", " ", "]"]
+
+# a directory is a package (its .go files but the tests); a package of the
+# same module is imported by its path under go.mod's module path, and only
+# its names that begin with a capital letter are seen outside it
+[program]
+model = "packages"
+directory = "*.go"
+skip_suffixes = ["_test.go"]
+module_file = "go.mod"
+standard = ["fmt"]
 
 [builtins]
 len = "len"
@@ -71,14 +82,25 @@ false = 0
 "^" = [6, "bnot"]
 
 [[form]]
-kind = "ignore"
+kind = "package"
 place = "top"
 pattern = "package $name $end"
 
 [[form]]
-kind = "ignore"
+name = "spec"
+kind = "import"
+place = "sub"
+pattern = "[ $name ] $str"
+
+[[form]]
+kind = "import"
 place = "top"
-pattern = "import [ $str | ( $str ) ] $end"
+pattern = "import ( [ @spec [ ; ] ]* ) $end"
+
+[[form]]
+kind = "import"
+place = "top"
+pattern = "import @spec $end"
 
 [[form]]
 kind = "function"

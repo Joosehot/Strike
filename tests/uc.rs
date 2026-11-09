@@ -578,6 +578,20 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
         ("unbound.py", "n = 1\ndef f():\n    print(n)\n    n = 2\nf()\n", "read before this function assigns it"),
         ("string.py", "x = input()\nprint(x)\n", "strings are not in Strike yet"),
+        // the preprocessor: what it does not do, and a header it does not know
+        ("pragma.c", "#pragma pack(1)\nint main() { return 0; }\n", "#pragma pack(1) is not in Strike yet"),
+        ("windows.c", "#include <windows.h>\nint main() { return 0; }\n", "the header <windows.h> is not one Strike knows"),
+        ("error.c", "#if 1\n#error stop here\n#endif\nint main() { return 0; }\n", "error.c:2: #error stop here"),
+        ("file.c", "#include <stdio.h>\nint main() { puts(__FILE__); return 0; }\n", "__FILE__ depends on how and when clang is run"),
+        ("unterminated.c", "#ifdef X\nint main() { return 0; }\n", "unterminated conditional directive"),
+        // packages and modules
+        ("init.go", "package main\nfunc init() {\n}\nfunc main() {\n}\n", "a package's init function is not in Strike yet"),
+        ("lib.go", "package lib\nfunc main() {\n}\n", "package lib is not a main package"),
+        ("os.go", "package main\nimport \"os\"\nfunc main() {\n}\n", "the package os is not in Strike yet"),
+        ("sprintf.go", "package main\nimport \"fmt\"\nfunc main() {\n\tx := fmt.Sprint(1)\n\tfmt.Println(x)\n}\n", "fmt.Sprint is not in Strike yet"),
+        ("math.py", "import math\nprint(1)\n", "math is one of Python's own modules"),
+        ("missing.py", "import nowhere\nprint(1)\n", "there is no nowhere.py next to missing.py"),
+        ("nested.py", "def f():\n    import nowhere\n    return 1\nprint(f())\n", "an import inside a function or a block is not in Strike yet"),
     ] {
         let p = r.join(name);
         std::fs::write(&p, src).unwrap();
@@ -585,4 +599,133 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         assert!(!o.status.success(), "{name} compiled");
         assert!(text(&o).contains(says), "{name}: {}", text(&o));
     }
+}
+
+/// Builds a program of several files in every mode, given as its
+/// directory and as its files one by one: what it prints must be what the
+/// real toolchain printed for it (tests/uc/<dir>.out).
+fn program_runs_in_every_mode_as_the_real_one(dir: &str, files: &[&str], lang: &str) {
+    let want = std::fs::read(suite(&format!("{dir}.out"))).unwrap();
+    let r = root(&format!("program-{dir}"));
+    let named: Vec<String> = files.iter().map(|f| suite(dir).join(f).to_str().unwrap().to_string()).collect();
+    for (round, given) in [vec![suite(dir).to_str().unwrap().to_string()], named].into_iter().enumerate() {
+        for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join("a.exe");
+            let o = Command::new(env!("CARGO_BIN_EXE_strike"))
+                .arg("compile")
+                .args(&given)
+                .args(["-o", exe.to_str().unwrap()])
+                .args(&mode)
+                .env("STRIKE_HOME", r.join("home"))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{given:?} {mode:?}: {}", text(&o));
+            assert!(text(&o).contains(&format!("read as {lang};")), "{}", text(&o));
+            // the same program given the other way is the same IR: every
+            // function is struck from its brand
+            if round == 1 && mode.is_empty() {
+                assert!(text(&o).contains(" struck, 0 compiled"), "{}", text(&o));
+            }
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&want), "{given:?} {mode:?}");
+            assert!(got.status.success(), "{given:?} {mode:?}");
+        }
+    }
+}
+
+/// C: three files linked by a header's functions and extern globals; the
+/// static names of two files are the same, and each file has its own.
+#[test]
+fn several_c_files_are_one_program_as_clang_links_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_c", &["main.c", "calc.c", "counter.c"], "C");
+}
+
+/// Go: package main in two files, and two packages of the module, one
+/// importing the other; their variables are given before main's.
+#[test]
+fn go_packages_of_a_module_are_what_go_makes_of_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_go", &["main.go", "helper.go"], "Go");
+}
+
+/// Python: modules next to the main one, each run once where it is first
+/// imported; `from m import x` copies x as it is then.
+#[test]
+fn python_modules_run_as_python_imports_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_py", &["__main__.py"], "Python");
+}
+
+/// Macros, conditionals and a header, compiled and run as clang's.
+#[test]
+fn the_preprocessed_program_prints_what_clangs_prints() {
+    runs_in_every_mode_as_the_real_one("preprocess.c");
+}
+
+/// A program of several files that Strike cannot make what the language
+/// makes of it is refused, at the file and line it stops on.
+#[test]
+fn what_several_files_cannot_do_yet_is_refused_not_guessed() {
+    let r = root("refused-programs");
+    let go_mod = ("go.mod", "module example.com/m\n\ngo 1.22\n");
+    let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+        (
+            "unexported",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n\tcalc.add(1, 2)\n}\n"), ("calc/calc.go", "package calc\nfunc add(a, b int) int {\n\treturn a + b\n}\n")],
+            "main.go:4: name add not exported by package calc",
+        ),
+        (
+            "unused",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n}\n"), ("calc/calc.go", "package calc\nfunc Add(a, b int) int {\n\treturn a + b\n}\n")],
+            "\"example.com/m/calc\" imported and not used",
+        ),
+        (
+            "cycle",
+            vec![
+                go_mod,
+                ("main.go", "package main\nimport \"example.com/m/a\"\nfunc main() {\n\ta.F()\n}\n"),
+                ("a/a.go", "package a\nimport \"example.com/m/b\"\nfunc F() {\n\tb.G()\n}\n"),
+                ("b/b.go", "package b\nimport \"example.com/m/a\"\nfunc G() {\n\ta.F()\n}\n"),
+            ],
+            "import cycle not allowed",
+        ),
+        (
+            "require",
+            vec![("go.mod", "module example.com/m\n\ngo 1.22\n\nrequire example.com/other v1.0.0\n"), ("main.go", "package main\nfunc main() {\n}\n")],
+            "go.mod:5: require in go.mod is not in Strike yet",
+        ),
+        (
+            "twice",
+            vec![("a.c", "int f(void) { return 1; }\nint main() { return f(); }\n"), ("b.c", "int f(void) { return 2; }\n")],
+            "b.c:1: f is defined in",
+        ),
+        ("static", vec![("a.c", "int helper(void);\nint main() { return helper(); }\n"), ("b.c", "static int helper(void) { return 2; }\n")], "there is no function helper"),
+        ("header_line", vec![("main.c", "#include \"bad.h\"\nint main() { return 0; }\n"), ("bad.h", "/* a header */\n\nint x = ;\n")], "bad.h:3:"),
+        (
+            "circular",
+            vec![("__main__.py", "import a\nprint(a.x)\n"), ("a.py", "import b\nx = 1\n"), ("b.py", "import a\ny = 2\n")],
+            "a circular import is not in Strike yet",
+        ),
+        ("noname", vec![("__main__.py", "from m import nothing\n"), ("m.py", "x = 1\n")], "__main__.py:1: cannot import name nothing from m"),
+        ("star", vec![("__main__.py", "from m import *\n"), ("m.py", "x = 1\n")], "from m import * is not in Strike yet"),
+        ("module_line", vec![("__main__.py", "import m\n"), ("m.py", "x = 1\nprint(x / 2)\n")], "m.py:2:"),
+        ("module_value", vec![("__main__.py", "import m\nprint(m)\n"), ("m.py", "x = 1\n")], "m is a module"),
+    ];
+    for (name, files, says) in cases {
+        let d = r.join(name);
+        for (f, src) in files {
+            let p = d.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, src).unwrap();
+        }
+        let o = compile(&r, &d, &r.join("a.exe"));
+        assert!(!o.status.success(), "{name} compiled");
+        assert!(text(&o).replace('\\', "/").contains(says), "{name}: {}", text(&o));
+    }
+    // Python runs one file: the others are imported, not given
+    let d = r.join("noname");
+    let o = Command::new(env!("CARGO_BIN_EXE_strike"))
+        .args(["compile", d.join("__main__.py").to_str().unwrap(), d.join("m.py").to_str().unwrap(), "-o", r.join("a.exe").to_str().unwrap()])
+        .env("STRIKE_HOME", r.join("home"))
+        .output()
+        .unwrap();
+    assert!(!o.status.success() && text(&o).contains("Python runs one file"), "{}", text(&o));
 }

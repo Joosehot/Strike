@@ -4,13 +4,15 @@
 //! its IR, a function already branded is struck from the brand instead of
 //! compiled, and the executable is written by Strike itself.
 //!
-//!   text --lex, parse (the description)--> universal syntax
+//!   text --preprocess (C), lex, parse (the description)--> universal syntax
+//!        --modules (several files made one program)--> universal syntax
 //!        --lower--> Strike IR --x64opt (or x64, plain)--> machine code
 //!        --pe--> .exe
 //!
 //! The brands are one pack (~/.strike/uc/pack), read whole once per
 //! compile, with new brands added at its end.
 
+mod cpp;
 mod eval;
 mod fold;
 mod inline;
@@ -20,6 +22,7 @@ mod lang;
 mod lex;
 mod lib;
 mod lower;
+mod modules;
 mod opt;
 mod parse;
 mod pe;
@@ -96,8 +99,19 @@ impl Pack {
     }
 }
 
+/// What is compiled: files, or a directory (each description takes from it
+/// what a program of its language is there); and where #include looks
+/// after the including file's own directory.
+pub struct Input {
+    pub files: Vec<PathBuf>,
+    pub dir: Option<PathBuf>,
+    pub include: Vec<PathBuf>,
+}
+
 pub struct Report {
     pub lang: String,
+    /// every file read: the program's, the ones it imports or includes
+    pub files: Vec<PathBuf>,
     /// how the judges scored each description
     pub explain: Vec<String>,
     pub funcs: usize,
@@ -190,7 +204,9 @@ fn load(b: &[u8]) -> Option<Code> {
     (i == b.len()).then_some(Code { bytes, relocs })
 }
 
-/// One description's reading of the file: the IR, or how far it got.
+/// One description's reading of a text with no directives and no imports:
+/// the IR, or how far it got.
+#[cfg(test)]
 fn front(text: &str, l: &Lang) -> Result<lower::Lowered, (u32, String, f64)> {
     let toks = lex::lex(text, l).map_err(|(line, m)| (line, m, 0.0))?;
     let prog = parse::parse(&toks, l).map_err(|f| (f.line, f.message, f.reach))?;
@@ -203,54 +219,69 @@ pub fn languages() -> Result<Vec<Lang>, String> {
     Ok(v)
 }
 
-pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -> Result<Report, String> {
+pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool) -> Result<Report, String> {
     let start = Instant::now();
-    let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let langs = languages()?;
     let j: Judges = toml::from_str(lang::JUDGES).map_err(|e| e.to_string())?;
-    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    // the files each description takes: those given, or what a directory
+    // is in its language
+    let units: Vec<Vec<PathBuf>> = langs.iter().map(|l| modules::units(l, &input.files, input.dir.as_deref())).collect();
+    if units.iter().all(Vec::is_empty) {
+        let what = input.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+        return Err(format!("{what}: no file of a language Strike knows is a program here"));
+    }
 
     // HotMotor: every description is a candidate; the judges score it. The
     // most a description can score bounds the order: one that cannot beat
-    // the best so far is not read at all.
-    let ext_score = |l: &Lang| if l.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)) { j.extension } else { 0.0 };
+    // the best so far is not read at all. The extension judged is the
+    // first file's.
+    let ext_score = |i: usize| {
+        let ext = units[i].first().and_then(|f| f.extension()).and_then(|e| e.to_str()).unwrap_or("");
+        if langs[i].extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) { j.extension } else { 0.0 }
+    };
     let mut order: Vec<usize> = (0..langs.len()).collect();
-    let bound = |l: &Lang| j.whole + ext_score(l) + j.reach;
-    order.sort_by(|&a, &b| bound(&langs[b]).total_cmp(&bound(&langs[a])).then(a.cmp(&b)));
+    let bound = |i: usize| j.whole + ext_score(i) + j.reach;
+    order.sort_by(|&a, &b| bound(b).total_cmp(&bound(a)).then(a.cmp(&b)));
     let mut explain = Vec::new();
-    let mut best: Option<(f64, usize, lower::Lowered)> = None;
-    let mut nearest: Option<(f64, usize, (u32, String, bool))> = None;
+    let mut best: Option<(f64, usize, lower::Lowered, Vec<PathBuf>)> = None;
+    let mut nearest: Option<(f64, usize, modules::Fail)> = None;
     for &i in &order {
         let l = &langs[i];
-        if let Some((s, _, _)) = &best {
-            if *s >= bound(l) {
-                explain.push(format!("{:<8} not read: it can score at most {:.2}", l.name, bound(l)));
+        if units[i].is_empty() {
+            explain.push(format!("{:<8} not read: no file of it is a program in the directory", l.name));
+            continue;
+        }
+        if let Some((s, _, _, _)) = &best {
+            if *s >= bound(i) {
+                explain.push(format!("{:<8} not read: it can score at most {:.2}", l.name, bound(i)));
                 continue;
             }
         }
-        match front(&text, l) {
-            Ok(low) => {
-                let s = j.whole + ext_score(l) + j.reach;
-                explain.push(format!("{:<8} {s:.2}  reads the whole file", l.name));
-                if best.as_ref().is_none_or(|(b, _, _)| s > *b) {
-                    best = Some((s, i, low));
+        match modules::front(l, &units[i], &input.include) {
+            Ok((low, read)) => {
+                let s = j.whole + ext_score(i) + j.reach;
+                let what = if read.len() > 1 { format!("all {} files", read.len()) } else { "the whole file".to_string() };
+                explain.push(format!("{:<8} {s:.2}  reads {what}", l.name));
+                if best.as_ref().is_none_or(|(b, _, _, _)| s > *b) {
+                    best = Some((s, i, low, read));
                 }
             }
-            Err((line, m, reach)) => {
-                let s = ext_score(l) + j.reach * reach;
-                explain.push(format!("{:<8} {s:.2}  stops at line {line}: {m}", l.name));
+            Err(f) => {
+                let s = ext_score(i) + j.reach * f.reach;
+                explain.push(format!("{:<8} {s:.2}  stops at {}:{}: {}", l.name, f.file.display(), f.line, f.message));
                 if nearest.as_ref().is_none_or(|(b, _, _)| s > *b) {
-                    nearest = Some((s, i, (line, m, reach >= 1.0)));
+                    nearest = Some((s, i, f));
                 }
             }
         }
     }
-    let Some((_, chosen, low)) = best else {
-        let (_, i, (line, m, whole)) = nearest.ok_or("there are no languages")?;
+    let Some((_, chosen, low, files)) = best else {
+        let (_, i, f) = nearest.ok_or("there are no languages")?;
         // read whole but not lowered: the language is known, the program is not
         // what Strike can compile yet
-        let why = if whole { String::new() } else { "; no description reads the whole file".to_string() };
-        return Err(format!("{}:{line}: {m} (read as {}{why})", src.display(), langs[i].name));
+        let why = if f.reach >= 1.0 { String::new() } else { "; no description reads the whole file".to_string() };
+        let at = if f.line == 0 { format!("{}", f.file.display()) } else { format!("{}:{}", f.file.display(), f.line) };
+        return Err(format!("{at}: {} (read as {}{why})", f.message, langs[i].name));
     };
     let read_seconds = start.elapsed().as_secs_f64();
 
@@ -361,6 +392,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     std::fs::write(out, &exe).map_err(|e| format!("{}: {e}", out.display()))?;
     Ok(Report {
         lang: langs[chosen].name.clone(),
+        files,
         explain,
         funcs: low.funcs.len(),
         struck,

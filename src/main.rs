@@ -7,7 +7,7 @@
 //!   strike fetch <dir>    fStrike: the packages of a Cargo.lock
 //!   strike fetch <url> <file> [--sha256 HASH]
 //!   strike arc devices|receive|send   ArcStrike: folders to a nearby device
-//!   strike compile <file> [-o EXE]    the universal compiler
+//!   strike compile <files|dir> [-o EXE]   the universal compiler
 
 mod arc;
 mod builder;
@@ -32,7 +32,7 @@ const USAGE: &str = "usage:
   strike arc devices
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
-  strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
+  strike compile <file>... | <dir> [-o EXE] [-I DIR] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
   strike brand";
 
 fn main() -> ExitCode {
@@ -159,7 +159,8 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         }
         "arc" => arc_command(&args[1..]),
         "compile" => {
-            let mut file = None;
+            let mut files: Vec<PathBuf> = Vec::new();
+            let mut include = Vec::new();
             let mut out = None;
             let mut explain = false;
             let mut brands = true;
@@ -169,27 +170,42 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "-o" => out = Some(PathBuf::from(it.next().ok_or("-o needs a file")?)),
+                    "-I" => include.push(PathBuf::from(it.next().ok_or("-I needs a directory")?)),
+                    s if s.starts_with("-I") && s.len() > 2 => include.push(PathBuf::from(&s[2..])),
                     "--explain" => explain = true,
                     "--no-brand" => brands = false,
                     "--plain" => gen = uc::Gen::Plain,
                     "--release" => gen = uc::Gen::Release,
                     "--no-evaluate" => evaluate = false,
                     s if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
-                    s if file.is_none() => file = Some(PathBuf::from(s)),
-                    s => return Err(format!("one file only, got also {s}\n{USAGE}")),
+                    s => files.push(PathBuf::from(s)),
                 }
             }
-            let file = file.ok_or(USAGE)?;
-            let out = out.unwrap_or_else(|| file.with_extension("exe"));
-            let r = uc::compile(&file, &out, brands, gen, evaluate)?;
+            let first = files.first().cloned().ok_or(USAGE)?;
+            // one directory, or files: a directory is what a program of the
+            // language is there (its .c or .go files, Python's __main__.py)
+            let dir = if first.is_dir() {
+                if files.len() > 1 {
+                    return Err(format!("a directory is compiled on its own, got also {}\n{USAGE}", files[1].display()));
+                }
+                files.clear();
+                Some(first.clone())
+            } else {
+                None
+            };
+            let shown = if files.len() > 1 { files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" ") } else { first.display().to_string() };
+            let out = out.unwrap_or_else(|| first.with_extension("exe"));
+            let input = uc::Input { files, dir, include };
+            let r = uc::compile(&input, &out, brands, gen, evaluate)?;
             if explain {
                 for line in &r.explain {
                     println!("  {line}");
                 }
             }
+            let files = if r.files.len() > 1 { format!("{} files, ", r.files.len()) } else { String::new() };
             println!(
-                "strike: {} read as {}; {} functions, {} struck, {} compiled, {} calls inlined, {} tail calls made jumps, {} recursive calls unrolled; {:.3} s (read {:.3}, code {:.3}, exe {:.3}); {} ({} bytes)",
-                file.display(),
+                "strike: {} read as {}; {files}{} functions, {} struck, {} compiled, {} calls inlined, {} tail calls made jumps, {} recursive calls unrolled; {:.3} s (read {:.3}, code {:.3}, exe {:.3}); {} ({} bytes)",
+                shown,
                 r.lang,
                 r.funcs,
                 r.struck,
