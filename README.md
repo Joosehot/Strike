@@ -311,6 +311,96 @@ debug information, and other platforms (ELF, Mach-O, ARM). Next to clang,
 Go and CPython, Strike covers a small part of each language. Within that
 part it is checked against them and gives their answers.
 
+## The daemon
+
+```
+strike daemon start [--idle SECONDS]   one per user and Strike home (idle exit: 30 min)
+strike daemon stop | status
+strike daemon watch <dir> | unwatch <dir>
+```
+
+A resident Strike that keeps work hot between commands. `strike compile`
+and `strike build` use it when it runs, and work alone when it does not,
+or when it does not answer. The executables are byte for byte the same
+either way. `STRIKE_DAEMON=off` never uses it; `STRIKE_DAEMON=auto` also
+starts one in the background when none runs.
+
+What it keeps was chosen by measuring where a small command's time goes.
+Parsing the language descriptions takes 0.4 ms and opening the brand pack
+0.07 ms, so they are not kept. Three things are:
+
+- **Readings.** A description's reading of a text (lex, parse, lower) is 65
+  of the 73 ms of compiling a program of 2000 functions. It is kept under
+  the hash of the description and the text.
+- **Evaluations** (`--release`). What Strike's IR runner made of a program
+  is kept under the hash of the whole IR and the runner's limits. What a
+  baking executable printed is kept under the hash of its bytes. A run
+  that did not end in time is not kept.
+- **rustc's facts.** `rustc --print cfg` and `rustc -vV` are 85 of the 90 ms
+  of a `strike build` where nothing changed. They are kept under the hash
+  of everything that decides which rustc answers:
+  - every RUST*, CARGO* and PATH variable;
+  - every rustc the search could find, by path, size and time;
+  - rustup's settings and each toolchain's rustc;
+  - the rust-toolchain files from the working folder up.
+
+  The build itself still runs in the client, with the client's own
+  environment.
+
+Everything kept is found by content, never by a file's name or time. An
+entry is either exactly what the work would give, or it is not found.
+
+`watch` reads a folder's files ahead: every file of a known language whose
+size or time changes is read within half a second, so the next compile
+finds its reading. Only the folders named are watched. Folders whose names
+start with a dot, `target`, `strike-out` and `node_modules` are skipped.
+
+### Safety
+
+- **The channel.** It is a named pipe that refuses remote clients, so
+  nothing listens on the network.
+- **The token.** Both sides prove they know a token kept in
+  `<home>/daemon/state.json`, which only the user can read. The proof is a
+  keyed BLAKE3 over a fresh nonce. A pipe someone else made is never
+  believed. A client without the token gets no answer and works alone.
+- **No impersonation.** The client opens the pipe at identification level,
+  so the daemon cannot act as its client.
+- **Another binary.** A daemon from another Strike binary is never used.
+  The binary is compared by content, and the language descriptions and
+  generator are inside it. The CLI says so on stderr and works alone, and
+  `start` replaces the old daemon.
+- **Rebuilding Strike.** The daemon runs from a copy of the binary
+  (`<home>/daemon/bin`), so Strike can be rebuilt while it runs. The
+  rebuilt binary is then another binary.
+- **The client's surroundings.** Each compile takes the client's working
+  folder and STRIKE_ variables, including the generator's rules
+  (`STRIKE_CODEGEN`, read on every compile). Compiles therefore run one at
+  a time.
+- **Ending.** The daemon goes back to its own folder after every compile.
+  It ends on `stop`, or after the idle time with no requests. It waits for
+  a compile that is running, and removes its state.
+- **Crashes.** A crashed daemon, or one that does not answer, never breaks
+  a build: the CLI works alone.
+
+### Measured
+
+Mean of 7 runs of the whole command, the brands warm both times:
+
+| | alone | daemon |
+|---|---|---|
+| `compile` tests/uc/suite.c (6 functions) | 37.7 ms | 31.5 ms |
+| `compile` tests/uc/suite.py | 37.5 ms | 30.7 ms |
+| `compile` a program of 2000 functions | 126.7 ms | 48.0 ms |
+| `compile --release` fib(27), worked out while compiling | 57.6 ms | 32.7 ms |
+| the 2000 functions, one line changed, not watched | 105.7 ms | 109.7 ms |
+| the 2000 functions, one line changed, folder watched | 105.7 ms | 43.4 ms |
+| `build` of a small crate, nothing changed | 117.5 ms | 40.4 ms |
+
+About 30 ms of every command is starting a process, and the daemon cannot
+save that. On a small file the daemon gains next to nothing. The time
+saved is work that depends on content: reading a big file, evaluating, and
+asking rustc.
+
 ## fStrike: downloads
 
 ```

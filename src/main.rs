@@ -8,9 +8,11 @@
 //!   strike fetch <url> <file> [--sha256 HASH]
 //!   strike arc devices|receive|send   ArcStrike: folders to a nearby device
 //!   strike compile <file> [-o EXE]    the universal compiler
+//!   strike daemon start|stop|status   keeps work hot between commands
 
 mod arc;
 mod builder;
+mod daemon;
 mod fstrike;
 mod graph;
 mod jvm;
@@ -33,6 +35,7 @@ const USAGE: &str = "usage:
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
   strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
+  strike daemon start [--idle SECONDS] | stop | status | watch <dir> | unwatch <dir>
   strike brand";
 
 fn main() -> ExitCode {
@@ -158,6 +161,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "arc" => arc_command(&args[1..]),
+        "daemon" => daemon::command(&args[1..]),
         "compile" => {
             let mut file = None;
             let mut out = None;
@@ -181,7 +185,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             }
             let file = file.ok_or(USAGE)?;
             let out = out.unwrap_or_else(|| file.with_extension("exe"));
-            let r = uc::compile(&file, &out, brands, gen, evaluate)?;
+            let r = daemon::compile(&file, &out, brands, gen, evaluate)?;
             if explain {
                 for line in &r.explain {
                     println!("  {line}");

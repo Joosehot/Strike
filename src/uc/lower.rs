@@ -123,6 +123,7 @@ struct Sig {
     ret: Ty,
 }
 
+#[derive(Clone)]
 pub struct Lowered {
     pub funcs: Vec<Func>,
     pub entry: String,
