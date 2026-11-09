@@ -77,7 +77,7 @@ const MARGIN: f64 = 0.5;
 // The expression tree
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-enum E {
+pub(super) enum E {
     Push(i64),
     Load(u32),
     AddrG(u32),
@@ -88,7 +88,7 @@ enum E {
 }
 
 /// The run of operations as a tree (None if it is not one whole value).
-fn tree(run: &[Op]) -> Option<E> {
+pub(super) fn tree(run: &[Op]) -> Option<E> {
     let mut st: Vec<E> = Vec::new();
     for op in run {
         let e = match op {
@@ -132,7 +132,7 @@ fn ops(e: &E, out: &mut Vec<Op>) {
     }
 }
 
-fn to_ops(e: &E) -> Vec<Op> {
+pub(super) fn to_ops(e: &E) -> Vec<Op> {
     let mut v = Vec::new();
     ops(e, &mut v);
     v
@@ -140,7 +140,7 @@ fn to_ops(e: &E) -> Vec<Op> {
 
 /// Can evaluating it stop the program? (A division by anything but a
 /// constant other than 0 and -1, or a checked operation.)
-fn fallible(e: &E) -> bool {
+pub(super) fn fallible(e: &E) -> bool {
     match e {
         E::Bin(BinOp::AddOv | BinOp::SubOv | BinOp::MulOv | BinOp::ShlOv, ..) | E::Un(UnOp::NegOv, _) => true,
         E::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor, l, r) => !matches!(**r, E::Push(d) if d != 0 && d != -1) || fallible(l),
@@ -530,7 +530,7 @@ impl Region<'_> {
         self.cx.stored.is_some()
     }
 
-    /// The whole run's form: `t = t + rest` with t on the left, which
+    /// The whole run's form: `t = rest + t`, t read last, which
     /// x64opt works out in t's own register (`add t, rax`).
     fn emit_root(&self, a: &A) -> Vec<Op> {
         if let (true, Some(t), A::Sum(ts)) = (self.top, self.cx.target, a) {
@@ -538,7 +538,7 @@ impl Region<'_> {
             if let Some(p) = own.filter(|_| ts.len() >= 2) {
                 let mut rest = ts.clone();
                 rest.remove(p);
-                return bin(BinOp::Add, (vec![Op::Load(t)], 0), self.emit_sum(&rest)).0;
+                return bin(BinOp::Add, self.emit_sum(&rest), (vec![Op::Load(t)], 0)).0;
             }
         }
         self.emit(a).0
@@ -649,6 +649,9 @@ impl Region<'_> {
             un(UnOp::Neg, acc)
         } else if c > 0 && c & (c - 1) == 0 {
             bin(BinOp::Shl, acc, (vec![Op::Push(c.trailing_zeros() as i64)], 0))
+        } else if matches!(c, 3 | 5 | 9) && matches!(acc.0[..], [Op::Load(_)]) && acc.1 == 0 {
+            let x = acc.clone();
+            bin(BinOp::Add, bin(BinOp::Shl, acc, (vec![Op::Push((c - 1).trailing_zeros() as i64)], 0)), x)
         } else {
             // (2^k + 1) x as one lea [x + x * 2^k] is the split rule's to
             // offer: always taking it was measured slower on a Zen 4, where
@@ -1212,6 +1215,12 @@ const EDGES: [i64; 12] = [0, 1, -1, 2, -2, i64::MIN, i64::MAX, i32::MIN as i64, 
 /// Do the two runs give the same value (or both stop) on 200 sets of
 /// inputs? The first sets are edge values, the rest random.
 fn same(a: &[Op], b: &[Op]) -> bool {
+    same_masked(a, b, &|_| -1)
+}
+
+/// `same`, every local's value taken through its mask (a local known to be
+/// even is only given even values).
+pub(super) fn same_masked(a: &[Op], b: &[Op], mask: &dyn Fn(u32) -> i64) -> bool {
     let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
     for k in 0..200u64 {
         seed ^= seed << 13;
@@ -1221,7 +1230,8 @@ fn same(a: &[Op], b: &[Op]) -> bool {
         let input = |kind: u8, id: u32| -> i64 {
             let h = (s ^ (kind as u64) << 40 ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
             let h = h ^ h >> 29;
-            match k % 3 {
+            let m = if kind == 0 { mask(id) } else { -1 };
+            m & match k % 3 {
                 // the same edge value everywhere, then mixed edge values
                 0 if k < 36 => EDGES[(k / 3) as usize],
                 0 | 1 => EDGES[(h % EDGES.len() as u64) as usize],
