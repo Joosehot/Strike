@@ -319,8 +319,76 @@ The last four of five runs:
 | clang -O0 | 0.057-0.058 s | 0.125-0.126 s | 0.021-0.022 s |
 | go | 0.057-0.058 s | 0.091-0.092 s | 0.026-0.027 s |
 
-On calls, Strike's code is now as fast as clang -O2 or faster. On loops
-of division it is within 10% of it. A release build of big.c takes 0.08 s, with all 2000 calls in
+On calls, Strike's code is now as fast as clang -O2 or faster.
+
+### Division of small numbers
+
+The primes loop divides by a variable, so the magic multiplication does not
+apply. clang -O2 was 11% faster on it, because C's `long` is 32 bits on
+Windows and clang uses the 32-bit division. Strike's numbers are 64 bits,
+and the 64-bit division is the slower instruction.
+
+Each division now first checks its two numbers. If both are at least zero
+and below 2^32, the 32-bit unsigned division gives the same quotient and
+remainder, so Strike uses it. Otherwise it uses the 64-bit one, so no
+64-bit number loses anything. LLVM does the same. The rule is `[division]
+bypass_32` in codegen.toml. A comparison with zero is also a `test` now,
+which sets the same flags as `cmp`.
+
+Primes below 300 000, mean of 7 runs:
+
+| | time | Strike against it |
+|---|---|---|
+| **Strike** | **0.0208 s** (0.0227 s before: 8% faster) | |
+| clang -O2 | 0.0205 s | 1.5% slower (min 0.0195 s against 0.0197 s) |
+| clang -O0 | 0.0208 s | the same |
+| go | 0.0283 s | 26% faster |
+
+## A program that reads nothing is worked out while compiling (--release)
+
+A program with no input has a fixed result: what it prints and what it
+returns. A release build works the program out while compiling, and the
+executable only prints that output and returns that number
+([src/uc/eval.rs](src/uc/eval.rs); limits in `[release.evaluate]` of
+codegen.toml):
+
+1. Strike's own IR runner tries first, for up to 20 million steps. It
+   follows the machine's rules: wrapping arithmetic, a shift's count modulo
+   64, and each language's division.
+2. If that is not enough, the program is compiled and run once, for up to
+   2 s. This run prints a marker and then the number main returned, so a
+   crash can never be taken for a result. It is safe, because these
+   languages can only print.
+3. If the program does not end in time, prints more than 1 MB, recurses
+   too deep, or fails (a division by zero), it is compiled as it is, and it
+   fails when it runs, as it would.
+
+Nothing is recognised or guessed. It is the program's own work, done once
+before it ships. Golden Answer would answer "how many primes are below
+300 000" as fast, but it answers a question; this runs the code, whatever
+it is.
+
+| --release | compile | run |
+|---|---|---|
+| primes below 300 000 | 0.24 s | 0.005 s (0.021 s before) |
+| 30 million calls | 0.23 s | 0.004 s (0.085 s before) |
+| fib(36) | 0.21 s | 0.004 s (0.030 s before) |
+| big.c, the suites | 0.03-0.07 s (IR runner) | 0.004 s |
+
+The 4 ms left is starting the process. The run-time tables above measure
+the code generator, so they are built without `--release`. A benchmark of
+the generated code must take its numbers from outside, or a release build
+works it out.
+
+Tests check four things:
+
+- a release build of each suite prints what clang, Go and Python print,
+  by both ways;
+- the number main returns stays the exit code;
+- a program that divides by zero is not worked out and fails as the plain
+  build fails;
+- the random-program test runs division by multiplying with nothing
+  worked out, so that machine code is still tested. A release build of big.c takes 0.08 s, with all 2000 calls in
 main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes

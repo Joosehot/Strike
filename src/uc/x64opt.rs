@@ -25,7 +25,13 @@ pub struct Rules {
     pub beam: usize,
     pub inline: InlineRules,
     pub unroll: UnrollRules,
+    pub division: DivisionRules,
     pub release: Release,
+}
+
+#[derive(serde::Deserialize, Clone)]
+pub struct DivisionRules {
+    pub bypass_32: bool,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -37,6 +43,7 @@ pub struct UnrollRules {
 #[derive(serde::Deserialize, Clone)]
 pub struct Release {
     pub magic_division: bool,
+    pub evaluate: super::eval::Limits,
     pub inline: InlineRules,
 }
 
@@ -63,8 +70,9 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-4 release={release} magic={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-5 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
+            self.division.bypass_32,
             self.unroll.levels,
             self.unroll.max_ops,
             self.loop_weight,
@@ -258,6 +266,8 @@ struct G {
     extra: i32,
     /// division by a constant as a multiplication (codegen.toml)
     magic: bool,
+    /// division of numbers that fit 32 bits by the 32-bit instruction
+    div32: bool,
 }
 
 impl G {
@@ -506,7 +516,11 @@ impl G {
                     RAX
                 }
             };
-            self.alu(7, dst, o);
+            if matches!(o, Opd::Imm(0)) {
+                self.rr(&[0x85], dst, dst); // test: the same flags as cmp with 0
+            } else {
+                self.alu(7, dst, o);
+            }
             let cc = match b {
                 BinOp::Eq => 0x94,
                 BinOp::Ne => 0x95,
@@ -584,7 +598,21 @@ impl G {
             }
             BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor => {
                 self.into_rcx(o);
-                self.a.e(&[0x48, 0x99, 0x48, 0xF7, 0xF9]); // cqo; idiv rcx
+                if self.div32 {
+                    // both at least zero and below 2^32: the 32-bit unsigned
+                    // division gives the same quotient and remainder, and is
+                    // the faster instruction
+                    let (wide, done32) = (done(&mut self.a), done(&mut self.a));
+                    self.a.e(&[0x48, 0x89, 0xC2, 0x48, 0x09, 0xCA, 0x48, 0xC1, 0xEA, 0x20]); // rdx = (rax | rcx) >> 32
+                    self.a.jcc(5, wide);
+                    self.a.e(&[0x31, 0xD2, 0xF7, 0xF1]); // xor edx, edx; div ecx
+                    self.a.jmp(done32);
+                    self.a.bind(wide);
+                    self.a.e(&[0x48, 0x99, 0x48, 0xF7, 0xF9]); // cqo; idiv rcx
+                    self.a.bind(done32);
+                } else {
+                    self.a.e(&[0x48, 0x99, 0x48, 0xF7, 0xF9]); // cqo; idiv rcx
+                }
                 if matches!(b, BinOp::DivFloor | BinOp::ModFloor) {
                     let l = done(&mut self.a);
                     self.a.e(&[0x48, 0x85, 0xD2]);
@@ -1029,7 +1057,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, div32: rules.division.bypass_32 };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9

@@ -11,6 +11,7 @@
 //! The brands are one pack (~/.strike/uc/pack), read whole once per
 //! compile, with new brands added at its end.
 
+mod eval;
 mod fold;
 mod inline;
 mod tail;
@@ -108,6 +109,8 @@ pub struct Report {
     pub tail_calls: usize,
     /// calls of a function by itself replaced by a copy of its body
     pub unrolled: usize,
+    /// --release: how the program was worked out while compiling
+    pub evaluated: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -244,6 +247,20 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         Gen::Plain => "x64-plain".to_string(),
     };
     let mut low = low;
+    // --release: a program that reads nothing, worked out now
+    let mut evaluated = None;
+    if gen == Gen::Release {
+        if let Some(d) = eval::run(&low.funcs, &low.entry, &rules.release.evaluate) {
+            let mut code = Vec::new();
+            if !d.output.is_empty() {
+                code.push(ir::Op::PrintStr(d.output));
+            }
+            code.push(ir::Op::Push(d.returned));
+            code.push(ir::Op::Ret);
+            low.funcs = vec![ir::Func { name: low.entry.clone(), params: 0, slots: 0, code }];
+            evaluated = Some(format!("worked out by Strike's IR runner in {} steps", d.steps));
+        }
+    }
     let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
@@ -285,7 +302,33 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     let code_seconds = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    let exe = pe::link(&funcs, "rt.start")?;
+    let mut exe = pe::link(&funcs, "rt.start")?;
+    // --release, too long for the IR runner: the program run once as it
+    // was compiled, and the executable only gives its output
+    if gen == Gen::Release && evaluated.is_none() && rules.release.evaluate.max_seconds > 0.0 {
+        let run = Instant::now();
+        let mut baking = funcs.clone();
+        baking[0] = ("rt.start".to_string(), x64::bake_start(&low.entry));
+        // a path with its folder: a bare name would be looked for on PATH
+        let path = std::path::absolute(out.with_extension(format!("bake{}.exe", std::process::id()))).map_err(|e| e.to_string())?;
+        if std::fs::write(&path, pe::link(&baking, "rt.start")?).is_ok() {
+            let result = eval::bake(&path, &rules.release.evaluate);
+            let _ = std::fs::remove_file(&path);
+            if let Some((output, returned)) = result {
+                let mut code = Vec::new();
+                if !output.is_empty() {
+                    code.push(ir::Op::PrintStr(output));
+                }
+                code.push(ir::Op::Push(returned));
+                code.push(ir::Op::Ret);
+                let f = ir::Func { name: low.entry.clone(), params: 0, slots: 0, code };
+                let mut only = x64::runtime(&low.entry);
+                only.push((f.name.clone(), x64opt::compile(&f, &rules, true)));
+                exe = pe::link(&only, "rt.start")?;
+                evaluated = Some(format!("run once while compiling ({:.3} s)", run.elapsed().as_secs_f64()));
+            }
+        }
+    }
     std::fs::write(out, &exe).map_err(|e| format!("{}: {e}", out.display()))?;
     Ok(Report {
         lang: langs[chosen].name.clone(),
@@ -300,6 +343,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         inlined,
         tail_calls,
         unrolled,
+        evaluated,
     })
 }
 

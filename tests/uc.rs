@@ -199,7 +199,14 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
     let r = root("differ");
     let rules = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("codegen.toml")).unwrap();
     let magic = r.join("magic.toml");
-    std::fs::write(&magic, rules.replace("magic_division = false", "magic_division = true")).unwrap();
+    // division by multiplying, and nothing worked out while compiling, so
+    // the machine code itself is what runs
+    let magic_rules = rules
+        .replace("magic_division = false", "magic_division = true")
+        .replace("max_steps = 20000000", "max_steps = 0")
+        .replace("max_seconds = 2.0", "max_seconds = 0.0");
+    assert!(magic_rules.contains("max_steps = 0") && magic_rules.contains("max_seconds = 0.0"));
+    std::fs::write(&magic, magic_rules).unwrap();
     let mut g = Gen(0x9E37_79B9_7F4A_7C15);
     for n in 0..100 {
         let src = r.join(format!("p{n}.c"));
@@ -226,6 +233,63 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
         assert_eq!(outs[0], outs[1], "p{n}.c: the optimized and the plain code differ");
         assert_eq!(outs[0], outs[2], "p{n}.c: the release and the plain code differ");
         assert_eq!(outs[0], outs[3], "p{n}.c: division by multiplying and the plain code differ");
+    }
+}
+
+fn compile_with(home: &Path, src: &Path, exe: &Path, extra: &[&str], rules: Option<&Path>) -> Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_strike"));
+    c.args(["compile", src.to_str().unwrap(), "-o", exe.to_str().unwrap()]).args(extra).env("STRIKE_HOME", home.join("home"));
+    if let Some(r) = rules {
+        c.env("STRIKE_CODEGEN", r);
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn a_release_build_of_a_program_that_reads_nothing_gives_its_output_as_it_is() {
+    let r = root("worked-out");
+    let rules = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("codegen.toml")).unwrap();
+    let run_once = r.join("run-once.toml");
+    std::fs::write(&run_once, rules.replace("max_steps = 20000000", "max_steps = 0")).unwrap();
+    for file in ["suite.c", "suite.go", "suite.py"] {
+        let want = std::fs::read(suite(&format!("{file}.out"))).unwrap();
+        for (rules, says) in [(None, "IR runner"), (Some(run_once.as_path()), "run once while compiling")] {
+            let exe = r.join(format!("{file}.exe"));
+            let o = compile_with(&r, &suite(file), &exe, &["--release"], rules);
+            assert!(o.status.success() && text(&o).contains(says), "{file}: {}", text(&o));
+            let run = Command::new(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&want), "{file} ({says})");
+        }
+    }
+    // the number main returns is the exit code, worked out or not
+    let p = r.join("seven.c");
+    std::fs::write(&p, "#include <stdio.h>\nint main() {\n    puts(\"hi\");\n    return 7;\n}\n").unwrap();
+    for rules in [None, Some(run_once.as_path())] {
+        let exe = r.join("seven.exe");
+        assert!(compile_with(&r, &p, &exe, &["--release"], rules).status.success());
+        let run = Command::new(&exe).output().unwrap();
+        assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).to_string()), (Some(7), "hi\n".to_string()));
+    }
+}
+
+#[test]
+fn a_program_that_fails_is_not_worked_out_and_fails_as_it_would() {
+    let r = root("fails");
+    let p = r.join("zero.c");
+    std::fs::write(&p, "#include <stdio.h>\nint main() {\n    long z = 0;\n    puts(\"before\");\n    printf(\"%lld\\n\", 1 / z);\n    return 0;\n}\n").unwrap();
+    let rules = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("codegen.toml")).unwrap();
+    let run_once = r.join("run-once.toml");
+    std::fs::write(&run_once, rules.replace("max_steps = 20000000", "max_steps = 0")).unwrap();
+    let plain = r.join("plain.exe");
+    assert!(compile_with(&r, &p, &plain, &["--plain"], None).status.success());
+    let want = Command::new(&plain).output().unwrap();
+    assert!(!want.status.success());
+    for rules in [None, Some(run_once.as_path())] {
+        let exe = r.join("release.exe");
+        let o = compile_with(&r, &p, &exe, &["--release"], rules);
+        assert!(o.status.success() && !text(&o).contains("reads nothing"), "{}", text(&o));
+        let got = Command::new(&exe).output().unwrap();
+        assert_eq!((got.status.code(), got.stdout), (want.status.code(), want.stdout.clone()));
     }
 }
 

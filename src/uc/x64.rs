@@ -366,3 +366,28 @@ pub fn runtime(entry: &str) -> Vec<(String, Code)> {
 
     vec![("rt.start".into(), start), ("rt.print_str".into(), print_str), ("rt.print_int".into(), print_int)]
 }
+
+/// What a baking run prints after the program's own output, before the
+/// number the program returned.
+pub const RETURNED: &[u8] = b"\n\x01strike returned\x01 ";
+
+/// The entry of a baking run (--release): the program, then RETURNED and
+/// the number it returned, then exit 0. A run that crashes never prints
+/// RETURNED, so a crash is never taken for a result.
+pub fn bake_start(entry: &str) -> Code {
+    let mut a = Asm::new();
+    a.e(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 40
+    a.call(entry);
+    a.e(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+32], rax
+    a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [rip + RETURNED]
+    a.reloc(Target::Data(RETURNED.to_vec()));
+    a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, len
+    a.d32(RETURNED.len() as i32);
+    a.call("rt.print_str");
+    a.e(&[0x48, 0x8B, 0x4C, 0x24, 0x20]); // mov rcx, [rsp+32]
+    a.call("rt.print_int");
+    a.e(&[0x31, 0xC9]); // xor ecx, ecx
+    a.call_import("ExitProcess");
+    a.e(&[0xCC]);
+    a.finish()
+}

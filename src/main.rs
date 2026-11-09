@@ -202,6 +202,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 out.display(),
                 r.exe_bytes
             );
+            if let Some(how) = &r.evaluated {
+                println!("  the program reads nothing: {how}; the executable only prints its output");
+            }
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(USAGE.into()),

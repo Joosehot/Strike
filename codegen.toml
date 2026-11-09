@@ -32,6 +32,13 @@ max_ops = 60
 levels = 1
 max_ops = 80
 
+# A division whose numbers are both at least zero and below 2^32 gives the
+# same quotient and remainder with the 32-bit instruction, which is the
+# faster one. Every such division first checks its numbers and takes the
+# 32-bit way when it can.
+[division]
+bypass_32 = true
+
 # --release: the same rules, and the work a release build may spend more
 # time on. Division by a constant becomes a multiplication by its magic
 # number, constant expressions are worked out while compiling, and calls
@@ -43,6 +50,19 @@ max_ops = 80
 # instructions (0.095 s against 0.085 s with idiv; clang -O2's own
 # multiplication 0.100 s)
 magic_division = false
+
+# A program that reads nothing has a fixed result. --release runs it while
+# compiling, by the machine's own rules, and when it ends within these
+# limits the executable only prints its output and returns its number.
+# Otherwise (or on a division by zero, which must fail when it runs) the
+# program is compiled as it is.
+[release.evaluate]
+# first Strike's own IR runner, for small programs (no process to start)
+max_steps = 20000000
+max_depth = 10000
+# then the program compiled and run once, for at most this long
+max_seconds = 2.0
+max_output = 1048576
 
 [release.inline]
 call_cost = 12.0
