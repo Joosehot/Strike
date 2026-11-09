@@ -512,25 +512,31 @@ impl Gen {
             let params: Vec<String> = (0..np).map(|p| format!("p{p}")).collect();
             let nl = 6 + self.below(10) as usize;
             let calls = self.below(2) == 0;
+            // C int locals: each store cut to 32 bits (cuts a loop may
+            // leave to its way out)
+            let ty = ["long long", "int"][self.below(2) as usize];
             let mut names = params.clone();
             names.reverse();
             let mut body = String::new();
             for v in 0..nl {
-                body += &format!("    long long v{v} = {};\n", self.int_expr(&names, 2, false));
+                body += &format!("    {ty} v{v} = {};\n", self.int_expr(&names, 2, false));
                 names.push(format!("v{v}"));
             }
             let locals: Vec<String> = (0..nl).map(|v| format!("v{v}")).collect();
             let mut inner = String::new();
             for _ in 0..3 + self.below(6) {
                 let a = &locals[self.below(nl as u64) as usize];
-                inner += &match self.below(7) {
+                let b = locals[self.below(nl as u64) as usize].clone();
+                inner += &match self.below(8) {
+                    // a chain round the loop through a multiplication
+                    7 => format!("        {a} = {a} * ({b} + {}) + {} - i;\n", self.below(9), self.int_expr(&names, 1, false)),
                     0 => format!("        {a} = {a} {} {};\n", ["+", "-", "*", "^", "&", "|"][self.below(6) as usize], self.int_expr(&names, 2, calls)),
                     1 => format!("        {a} = ({}) / {};\n", self.int_expr(&names, 2, calls), [3, 7, -5, 1000003][self.below(4) as usize]),
                     2 => format!("        {a} = ({}) % ((({}) & 7) + 1);\n", self.int_expr(&names, 2, calls), self.int_expr(&names, 1, false)),
                     3 => format!("        {a} = ({}) {} {};\n", self.int_expr(&names, 2, calls), ["<<", ">>"][self.below(2) as usize], self.below(64)),
                     4 => format!("        if ({}) {a} = {};\n", self.int_expr(&names, 1, false), self.int_expr(&names, 2, calls)),
                     5 => format!("        {a} = {} * {};\n", self.int_expr(&names, 1, false), [3, 5, 9, 6, -7][self.below(5) as usize]),
-                    6 if calls => format!("        printf(\"%lld\\n\", {});\n", self.int_expr(&names, 2, false)),
+                    6 if calls => format!("        printf(\"%lld\\n\", (long long)({}));\n", self.int_expr(&names, 2, false)),
                     _ => format!("        {a} = {};\n", self.int_expr(&names, 3, calls)),
                 };
             }

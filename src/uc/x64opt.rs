@@ -358,7 +358,7 @@ fn live_after(code: &[Op], slots: u32) -> Vec<Vec<u64>> {
 /// label reached only by jumps from later on (a loop's top) is reached even
 /// where the code just before it is not, and a jump that is never reached
 /// decides nothing.
-fn stack_depths(code: &[Op]) -> Vec<Option<i32>> {
+pub(super) fn stack_depths(code: &[Op]) -> Vec<Option<i32>> {
     let labels = super::ir::label_count(code);
     let mut pos = vec![0usize; labels as usize];
     for (i, op) in code.iter().enumerate() {

@@ -347,6 +347,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             fold::run(f);
             rotate::run(f);
             simplified += values::run(f);
+            simplified += opt::defer_cuts(f);
             fold::run(f);
         }
     }
