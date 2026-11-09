@@ -169,6 +169,10 @@ fn save(c: &Code) -> Vec<u8> {
                 offset = o.to_le_bytes();
                 (3, &offset[..])
             }
+            Target::Abs(o) => {
+                offset = o.to_le_bytes();
+                (4, &offset[..])
+            }
         };
         b.push(kind);
         b.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -203,6 +207,7 @@ fn load(b: &[u8]) -> Option<Code> {
                 1 => Target::Import(String::from_utf8(data).ok()?),
                 2 => Target::Data(data),
                 3 => Target::Writable(u32::from_le_bytes(data.try_into().ok()?)),
+                4 => Target::Abs(u32::from_le_bytes(data.try_into().ok()?)),
                 _ => return None,
             },
         ));

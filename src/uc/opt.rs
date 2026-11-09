@@ -132,6 +132,28 @@ fn cannot_fail(run: &[Op]) -> bool {
     })
 }
 
+/// Is this run an address the code generator uses where it is, with no
+/// register of its own: a global's or the frame's memory, plus a constant,
+/// plus at most one local times 1, 2, 4 or 8 (`[index * 8 + address]`,
+/// `[rsp + index * 8 + d]`)? Moved out of a loop it would only take a
+/// register.
+fn known_address(run: &[Op]) -> bool {
+    let mut r = run;
+    while let [rest @ .., Op::Push(_), Op::Bin(BinOp::Add | BinOp::Sub)] = r {
+        r = rest;
+    }
+    let base = |o: &Op| matches!(o, Op::AddrG(_) | Op::Frame(_));
+    // a local, or a local plus a constant, times 1, 2, 4 or 8
+    let index = |x: &[Op]| matches!(x, [Op::Load(_)] | [Op::Load(_), Op::Push(_), Op::Bin(BinOp::Add | BinOp::Sub)]);
+    let scaled = |x: &[Op]| index(x) || matches!(x, [i @ .., Op::Push(0..=3), Op::Bin(BinOp::Shl)] if index(i));
+    match r {
+        [b] => base(b),
+        [b, x @ .., Op::Bin(BinOp::Add)] if base(b) => scaled(x),
+        [x @ .., b, Op::Bin(BinOp::Add)] if base(b) => scaled(x),
+        _ => false,
+    }
+}
+
 /// LICM; returns how many expressions it moved.
 pub fn hoist(f: &mut Func) -> usize {
     let mut moved = 0;
@@ -166,6 +188,15 @@ pub fn hoist(f: &mut Func) -> usize {
                 continue;
             }
             let stored: Vec<u32> = code[t..=j].iter().filter_map(|o| if let Op::Store(s) = o { Some(*s) } else { None }).collect();
+            // the addresses used where they are, and every part of them
+            let mut inside = vec![false; j + 1];
+            for i in t + 1..j {
+                if let Some(s) = st[i] {
+                    if s > t && known_address(&code[s..=i]) {
+                        inside[s..=i].iter_mut().for_each(|x| *x = true);
+                    }
+                }
+            }
             // the largest invariant expression in the loop (one that holds
             // a smaller one is larger, so the smaller goes with it)
             let mut best: Option<(usize, usize)> = None;
@@ -179,7 +210,7 @@ pub fn hoist(f: &mut Func) -> usize {
                 let invariant = run.iter().all(|o| !matches!(o, Op::Load(x) if stored.contains(x)));
                 // a row's address (a global array plus a row offset) is worth a register
                 let has_load = run.iter().any(|o| matches!(o, Op::Load(_) | Op::AddrG(_) | Op::Frame(_)));
-                if plain && invariant && has_load && cannot_fail(run) && best.is_none_or(|(bs, bi)| i - s > bi - bs) {
+                if plain && invariant && has_load && !inside[i] && cannot_fail(run) && best.is_none_or(|(bs, bi)| i - s > bi - bs) {
                     best = Some((s, i));
                 }
             }

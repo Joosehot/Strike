@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-18 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-19 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -172,6 +172,20 @@ enum V {
     /// float operation): the next float operation takes it there, anything
     /// else has it moved out
     X(u8),
+    /// a global's or the frame's memory plus d bytes: used where it is, as
+    /// [address] (an absolute displacement) or [rsp + d]
+    At(B, i32),
+    /// the same plus index << k, the index a local in a register:
+    /// [index * size + address], [rsp + index * size + d]
+    AtIdx(B, u32, u8, i32),
+}
+
+/// Memory whose address the code knows without a register: the zeros at a
+/// bss offset (a global), or the function's own memory at a frame offset.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum B {
+    G(u32),
+    F(i32),
 }
 
 /// The xmm registers floats wait in (volatile on Windows, so a call takes
@@ -184,6 +198,9 @@ const XMMS: std::ops::RangeInclusive<u8> = 2..=5;
 enum Addr {
     Base(u8, i32),
     Index(Option<u8>, u8, u8, i32),
+    /// an absolute address in the zeros (its bss offset, wrapping), plus
+    /// index << k
+    Abs(Option<(u8, u8)>, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -336,6 +353,142 @@ fn live_after(code: &[Op], slots: u32) -> Vec<Vec<u64>> {
     }
 }
 
+/// Which operations can be reached from the start, and the depth of the
+/// IR's stack at each, found by following every way through the code: a
+/// label reached only by jumps from later on (a loop's top) is reached even
+/// where the code just before it is not, and a jump that is never reached
+/// decides nothing.
+fn stack_depths(code: &[Op]) -> Vec<Option<i32>> {
+    let labels = super::ir::label_count(code);
+    let mut pos = vec![0usize; labels as usize];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            pos[*l as usize] = i;
+        }
+    }
+    let mut at: Vec<Option<i32>> = vec![None; code.len()];
+    let mut work = vec![(0usize, 0i32)];
+    while let Some((i, d)) = work.pop() {
+        if i >= code.len() || at[i].is_some() {
+            continue;
+        }
+        at[i] = Some(d);
+        let Some(effect) = super::ir::stack_effect(&code[i]) else { continue }; // a return or a stop
+        let after = d + effect;
+        match &code[i] {
+            Op::Jmp(l) => work.push((pos[*l as usize], after)),
+            Op::Jz(l) | Op::Jnz(l) => {
+                work.push((pos[*l as usize], after));
+                work.push((i + 1, after));
+            }
+            _ => work.push((i + 1, after)),
+        }
+    }
+    at
+}
+
+/// Locals that are never live at once share one slot, so HotMotor's beam
+/// chooses a register for them together: a local is "live" from a store to
+/// its last read, and also while a value read from it may still wait on the
+/// generator's stack (read since the IR's stack was last empty). Two locals
+/// meet where one is stored while the other is live. Parameters, and locals
+/// read before they are stored (they hold their zero from the start), keep
+/// their own slots; a float local shares only with float locals. The slots
+/// are numbered anew, the parameters first.
+fn coalesce(f: &Func) -> Func {
+    let n = f.slots as usize;
+    let words = n.div_ceil(64).max(1);
+    if n == 0 {
+        return f.clone();
+    }
+    let code = &f.code;
+    let live = live_after(code, f.slots);
+    let bit = |v: &[u64], s: usize| v[s / 64] & (1u64 << (s % 64)) != 0;
+    // live where the function begins
+    let mut entry = vec![0u64; words];
+    if let Some(after) = live.first() {
+        entry.clone_from(after);
+        match code[0] {
+            Op::Store(s) => entry[s as usize / 64] &= !(1u64 << (s % 64)),
+            Op::Load(s) => entry[s as usize / 64] |= 1u64 << (s % 64),
+            _ => {}
+        }
+    }
+    // float or not, by most of its uses
+    let fl = float_uses(code);
+    let mut votes = vec![0i64; n];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Load(s) | Op::Store(s) = op {
+            votes[*s as usize] += if fl[i] { 1 } else { -1 };
+        }
+    }
+    let mut meet = vec![vec![0u64; words]; n];
+    let at_depth = stack_depths(code);
+    let mut window: Vec<u32> = Vec::new();
+    for (i, op) in code.iter().enumerate() {
+        match op {
+            Op::Load(s) => window.push(*s),
+            Op::Store(b) => {
+                let b = *b as usize;
+                let mut with = live[i].clone();
+                for &a in &window {
+                    with[a as usize / 64] |= 1u64 << (a % 64);
+                }
+                for a in 0..n {
+                    if a != b && bit(&with, a) {
+                        meet[a][b / 64] |= 1u64 << (b % 64);
+                        meet[b][a / 64] |= 1u64 << (a % 64);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // the window as volatile_ok keeps it
+        if at_depth.get(i + 1) == Some(&Some(0)) || matches!(op, Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret) {
+            window.clear();
+        }
+    }
+    let mut rep = vec![usize::MAX; n];
+    // (the slot that stands for them, every slot met by one of them, float)
+    let mut groups: Vec<(usize, Vec<u64>, bool)> = Vec::new();
+    for s in 0..n {
+        if s < f.params as usize || bit(&entry, s) {
+            rep[s] = s;
+            continue;
+        }
+        let float = votes[s] > 0;
+        match groups.iter_mut().find(|(_, m, k)| *k == float && !bit(m, s)) {
+            Some((r, m, _)) => {
+                rep[s] = *r;
+                for w in 0..words {
+                    m[w] |= meet[s][w];
+                }
+            }
+            None => {
+                rep[s] = s;
+                groups.push((s, meet[s].clone(), float));
+            }
+        }
+    }
+    // numbered anew: the parameters, then each slot that stands for others
+    let mut new = vec![u32::MAX; n];
+    let mut next = 0u32;
+    for s in 0..n {
+        if rep[s] == s {
+            new[s] = next;
+            next += 1;
+        }
+    }
+    let mut g = f.clone();
+    g.slots = next;
+    for op in g.code.iter_mut() {
+        if let Op::Load(s) | Op::Store(s) = op {
+            *s = new[rep[*s as usize]];
+        }
+    }
+    g
+}
+
 /// For every Load and Store, whether it is a float operation's: the value
 /// loaded goes to one, or the value stored comes from one. Followed on the
 /// IR's stack between labels and jumps.
@@ -381,6 +534,22 @@ fn float_uses(code: &[Op]) -> Vec<bool> {
         }
         for _ in 0..outs {
             st.push(Some(i));
+        }
+    }
+    // an element stored into a local that only float operations read is a
+    // float's use too: it is loaded straight into the xmm register
+    let mut read = vec![(false, true); code.iter().filter_map(|o| if let Op::Load(s) | Op::Store(s) = o { Some(*s as usize + 1) } else { None }).max().unwrap_or(0)];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Load(s) = op {
+            let r = &mut read[*s as usize];
+            *r = (true, r.1 && out[i]);
+        }
+    }
+    for i in 1..code.len() {
+        if let (Op::LoadM(8), Op::Store(s)) = (&code[i - 1], &code[i]) {
+            if read[*s as usize] == (true, true) {
+                out[i] = true;
+            }
         }
     }
     out
@@ -678,7 +847,7 @@ impl G {
         self.v.iter().rposition(|y| match y {
             V::Slot(t) | V::Lea(t, _) | V::Scaled(t, _, _) => *t == s,
             V::Index(b, i, _, _) => *b == s || *i == s,
-            V::RIdx(i, _, _) => *i == s,
+            V::RIdx(i, _, _) | V::AtIdx(_, i, _, _) => *i == s,
             _ => false,
         })
     }
@@ -695,10 +864,21 @@ impl G {
         let (b, x) = match at {
             Addr::Base(b, _) => (b, 0),
             Addr::Index(b, i, _, _) => (b.unwrap_or(0), i),
+            Addr::Abs(i, _) => (0, i.map_or(0, |(i, _)| i)),
         };
         self.a.e(&[0x40 | (wide as u8) << 3 | ((r >> 3) & 1) << 2 | ((x >> 3) & 1) << 1 | ((b >> 3) & 1)]);
         self.a.e(op);
         match at {
+            Addr::Abs(i, o) => {
+                // no base: mod 00, SIB base 101 is a 32-bit displacement;
+                // index 100 is none
+                let sib = match i {
+                    Some((i, k)) => k << 6 | (i & 7) << 3 | 5,
+                    None => 0x25,
+                };
+                self.a.e(&[0x04 | (r & 7) << 3, sib]);
+                self.a.reloc(Target::Abs(o));
+            }
             Addr::Base(b, d) => {
                 self.a.e(&[0x80 | (r & 7) << 3 | (b & 7)]);
                 if b & 7 == 4 {
@@ -786,6 +966,20 @@ impl G {
                 let yi = self.slot_reg(i);
                 self.mem(false, true, &[0x8D], r, Addr::Index(Some(RAX), yi, k, d));
             }
+            V::At(..) | V::AtIdx(..) => {
+                let at = self.address(x);
+                self.mem(false, true, &[0x8D], r, at);
+            }
+        }
+    }
+
+    /// Where global or frame memory is, plus index << k and d.
+    fn at_addr(&self, b: B, idx: Option<(u32, u8)>, d: i32) -> Addr {
+        let idx = idx.map(|(i, k)| (self.slot_reg(i), k));
+        match (b, idx) {
+            (B::G(o), idx) => Addr::Abs(idx, o.wrapping_add(d as u32)),
+            (B::F(off), None) => Addr::Base(4, self.at(off) + d),
+            (B::F(off), Some((i, k))) => Addr::Index(Some(4), i, k, self.at(off) + d),
         }
     }
 
@@ -817,7 +1011,7 @@ impl G {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
             }
-            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::RIdx(..) | V::X(_) => {
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::RIdx(..) | V::X(_) | V::At(..) | V::AtIdx(..) => {
                 self.to_reg(x, R11);
                 self.push_r(R11);
             }
@@ -960,6 +1154,18 @@ impl G {
                     let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
                     c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).map(|d| V::Index(base, i, k, d))
                 }
+                // global or frame memory: plus a constant, plus an index
+                (BinOp::Add | BinOp::Sub, V::At(m, d), V::Imm(c)) => {
+                    let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                    c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::At(m, d))
+                }
+                (BinOp::Add | BinOp::Sub, V::AtIdx(m, i, k, d), V::Imm(c)) => {
+                    let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                    c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, k, d))
+                }
+                (BinOp::Add, V::At(m, d), V::Scaled(i, k, e)) | (BinOp::Add, V::Scaled(i, k, e), V::At(m, d)) => d.checked_add(e).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, k, d)),
+                (BinOp::Add, V::At(m, d), V::Lea(i, e)) | (BinOp::Add, V::Lea(i, e), V::At(m, d)) => d.checked_add(e).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, 0, d)),
+                (BinOp::Add, V::At(m, d), V::Slot(i)) | (BinOp::Add, V::Slot(i), V::At(m, d)) if reg(i) => Some(V::AtIdx(m, i, 0, d)),
                 _ => None,
             };
             if let Some(x) = lazy {
@@ -1625,6 +1831,8 @@ impl G {
             V::Scaled(s, k, d) => Addr::Index(None, self.slot_reg(s), k, d),
             V::Index(b, i, k, d) => Addr::Index(Some(self.slot_reg(b)), self.slot_reg(i), k, d),
             V::RIdx(i, k, d) => Addr::Index(Some(RAX), self.slot_reg(i), k, d),
+            V::At(b, d) => self.at_addr(b, None, d),
+            V::AtIdx(b, i, k, d) => self.at_addr(b, Some((i, k)), d),
             x => {
                 self.need_rax();
                 self.to_reg(x, RAX);
@@ -1636,8 +1844,9 @@ impl G {
     /// The w bytes at the address on top, sign-extended into rax.
     fn load_mem(&mut self, w: u8) {
         let x = self.pop();
-        let at = self.address(x);
+        // rax made free first: a push moves rsp, which a frame address counts
         self.need_rax();
+        let at = self.address(x);
         let op: &[u8] = match w {
             1 => &[0x0F, 0xBE],
             2 => &[0x0F, 0xBF],
@@ -1666,7 +1875,7 @@ impl G {
         };
         // an address that needs no register of its own leaves rax alone
         let in_place = match a {
-            V::Lea(..) | V::Scaled(..) | V::Index(..) => true,
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..) => true,
             V::Slot(s) => self.in_reg(s),
             _ => false,
         };
@@ -2058,40 +2267,10 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             eprintln!("  {i:4} {op:?}");
         }
     }
+    let merged = coalesce(f);
+    let f = &merged;
     let labels = super::ir::label_count(&f.code);
-    // which operations can be reached from the start, and the depth of the
-    // IR's stack at each, found by following every way through the code: a
-    // label reached only by jumps from later on (a loop's top) is reached
-    // even where the code just before it is not, and a jump that is never
-    // reached decides nothing
-    let at_depth: Vec<Option<i32>> = {
-        let code = &f.code;
-        let mut pos = vec![0usize; labels as usize];
-        for (i, op) in code.iter().enumerate() {
-            if let Op::Label(l) = op {
-                pos[*l as usize] = i;
-            }
-        }
-        let mut at: Vec<Option<i32>> = vec![None; code.len()];
-        let mut work = vec![(0usize, 0i32)];
-        while let Some((i, d)) = work.pop() {
-            if i >= code.len() || at[i].is_some() {
-                continue;
-            }
-            at[i] = Some(d);
-            let Some(effect) = super::ir::stack_effect(&code[i]) else { continue }; // a return or a stop
-            let after = d + effect;
-            match &code[i] {
-                Op::Jmp(l) => work.push((pos[*l as usize], after)),
-                Op::Jz(l) | Op::Jnz(l) => {
-                    work.push((pos[*l as usize], after));
-                    work.push((i + 1, after));
-                }
-                _ => work.push((i + 1, after)),
-            }
-        }
-        at
-    };
+    let at_depth = stack_depths(&f.code);
     let live = live_after(&f.code, f.slots);
     let vol_ok = volatile_ok(&f.code, f.slots, &live, &at_depth);
     let place = choose(f, rules, &vol_ok);
@@ -2399,19 +2578,9 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             Op::LoadM(w) => g.load_mem(*w),
             Op::StoreM(w) => g.store_mem(*w, None),
             Op::OpM(b, w) => g.store_mem(*w, Some(*b)),
-            Op::Frame(n) => {
-                g.fresh_rax();
-                let d = g.at(g.memory + *n as i32);
-                g.a.e(&[0x48, 0x8D, 0x84, 0x24]); // lea rax, [rsp + d]
-                g.a.d32(d);
-                g.v.push(V::Rax);
-            }
-            Op::AddrG(gl) => {
-                g.fresh_rax();
-                g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [global]
-                g.a.reloc(super::x64::global(*gl));
-                g.v.push(V::Rax);
-            }
+            // an address the code knows: it waits, and is used where it is
+            Op::Frame(n) => g.push(V::At(B::F(g.memory + *n as i32), 0)),
+            Op::AddrG(gl) => g.push(V::At(B::G(super::x64::GLOBALS + 8 * *gl), 0)),
             Op::Data(d) => {
                 g.fresh_rax();
                 g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [rip + data]
@@ -2432,7 +2601,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 live = false;
             }
             Op::Dup => match g.v.last().copied() {
-                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..))) => g.push(x),
+                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..))) => g.push(x),
                 _ => {
                     g.flush();
                     g.a.e(&[0xFF, 0x34, 0x24]);
