@@ -7,7 +7,9 @@
 use super::x64::{Code, Target, IMPORTS};
 use std::collections::HashMap;
 
-const BASE: u64 = 0x1_4000_0000;
+/// low enough that every address of the image fits a signed 32-bit
+/// displacement (Target::Abs)
+const BASE: u64 = 0x40_0000;
 const SECTION: u32 = 0x1000;
 const FILE: u32 = 0x200;
 const TEXT_RVA: u32 = SECTION;
@@ -117,6 +119,12 @@ pub fn link(funcs: &[(String, Code)], entry: &str, bss_min: u32) -> Result<Vec<u
                 }
                 Target::Data(s) => rdata_rva + strings[s.as_slice()],
                 Target::Writable(o) => bss_rva + o,
+                Target::Abs(o) => {
+                    let abs = (BASE as u32).wrapping_add(bss_rva).wrapping_add(*o);
+                    let p = (base + field) as usize;
+                    text[p..p + 4].copy_from_slice(&abs.to_le_bytes());
+                    continue;
+                }
             };
             let from = TEXT_RVA + base + field + 4;
             let rel = target.wrapping_sub(from) as i32;
@@ -130,6 +138,9 @@ pub fn link(funcs: &[(String, Code)], entry: &str, bss_min: u32) -> Result<Vec<u
     let rdata_raw = align(rdata_len, FILE);
     let headers = FILE;
     let image = bss_rva + align(bss_len, SECTION);
+    if BASE + image as u64 >= 1 << 31 {
+        return Err(format!("the program's memory ({} bytes) is past what Strike's 32-bit addresses reach", image));
+    }
 
     let mut b = Vec::with_capacity((headers + text_raw + rdata_raw) as usize);
     // DOS header: only its magic and where the PE header is

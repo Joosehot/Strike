@@ -112,6 +112,13 @@ fn work_across_statements_is_what_clang_and_go_make_of_it() {
     }
 }
 
+/// A comparison waiting as flags under a call of no arguments: in every
+/// mode what clang prints (a bug of the optimizing generator, fixed).
+#[test]
+fn a_comparison_before_a_call_of_no_arguments_keeps_its_value() {
+    runs_in_every_mode_as_the_real_one("flags_call.c");
+}
+
 #[test]
 fn simplified_expressions_are_what_clang_and_go_make_of_them() {
     for file in ["algebra.c", "algebra.go"] {
@@ -492,6 +499,148 @@ impl Gen {
             }
         }
         out + "    return 0;\n}\n"
+    }
+
+    /// A C program of integer functions with many locals (more than the
+    /// registers): leaf functions, whose locals HotMotor may put in the
+    /// volatile registers, and functions with calls, divisions (which take
+    /// rdx and r8) and shifts between their uses; parameters used in every
+    /// order, so they are moved between argument registers.
+    fn int_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n");
+        // h writes the volatile registers: its own locals, a division by a
+        // constant and by a variable
+        out += "long long h(long long a, long long b) {\n    long long q = a / 7 + b % 5;\n    long long r = (a ^ b) / ((b & 3) + 1);\n    long long t = q * 3 + r - (a >> 2);\n    return t * 3 - (b >> 2) + q;\n}\n";
+        // a function of no arguments that stays a call: a comparison
+        // waiting as flags before it must keep its value
+        out += "long long gz = 3;\nlong long z() {\n    if (gz > 0) {\n        gz = gz - 1;\n        return z() * 2 - 1;\n    }\n    gz = 3;\n    return -783;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..4 {
+            let np = 1 + self.below(6) as usize;
+            let params: Vec<String> = (0..np).map(|p| format!("p{p}")).collect();
+            let nl = 6 + self.below(10) as usize;
+            let calls = self.below(2) == 0;
+            // C int locals: each store cut to 32 bits (cuts a loop may
+            // leave to its way out)
+            let ty = ["long long", "int"][self.below(2) as usize];
+            let mut names = params.clone();
+            names.reverse();
+            let mut body = String::new();
+            for v in 0..nl {
+                body += &format!("    {ty} v{v} = {};\n", self.int_expr(&names, 2, false));
+                names.push(format!("v{v}"));
+            }
+            let locals: Vec<String> = (0..nl).map(|v| format!("v{v}")).collect();
+            let mut inner = String::new();
+            for _ in 0..3 + self.below(6) {
+                let a = &locals[self.below(nl as u64) as usize];
+                let b = locals[self.below(nl as u64) as usize].clone();
+                inner += &match self.below(8) {
+                    // a chain round the loop through a multiplication
+                    7 => format!("        {a} = {a} * ({b} + {}) + {} - i;\n", self.below(9), self.int_expr(&names, 1, false)),
+                    0 => format!("        {a} = {a} {} {};\n", ["+", "-", "*", "^", "&", "|"][self.below(6) as usize], self.int_expr(&names, 2, calls)),
+                    1 => format!("        {a} = ({}) / {};\n", self.int_expr(&names, 2, calls), [3, 7, -5, 1000003][self.below(4) as usize]),
+                    2 => format!("        {a} = ({}) % ((({}) & 7) + 1);\n", self.int_expr(&names, 2, calls), self.int_expr(&names, 1, false)),
+                    3 => format!("        {a} = ({}) {} {};\n", self.int_expr(&names, 2, calls), ["<<", ">>"][self.below(2) as usize], self.below(64)),
+                    4 => format!("        if ({}) {a} = {};\n", self.int_expr(&names, 1, false), self.int_expr(&names, 2, calls)),
+                    5 => format!("        {a} = {} * {};\n", self.int_expr(&names, 1, false), [3, 5, 9, 6, -7][self.below(5) as usize]),
+                    6 if calls => format!("        printf(\"%lld\\n\", (long long)({}));\n", self.int_expr(&names, 2, false)),
+                    _ => format!("        {a} = {};\n", self.int_expr(&names, 3, calls)),
+                };
+            }
+            body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", self.below(9));
+            let ret: Vec<String> = (0..3).map(|_| names[self.below(names.len() as u64) as usize].clone()).collect();
+            body += &if calls {
+                // a comparison as the left side of z(), straight in the return
+                format!("    return {} + (({} {} {}) {} z());\n", ret[0], ret[1], ["<", "<=", "==", "!="][self.below(4) as usize], ret[2], ["^", "+", "-"][self.below(3) as usize])
+            } else {
+                format!("    return {} + {} * 3 - {};\n", ret[0], ret[1], ret[2])
+            };
+            let decl: Vec<String> = params.iter().map(|p| format!("long long {p}")).collect();
+            out += &format!("long long f{k}({}) {{\n{body}}}\n", decl.join(", "));
+            funcs.push((format!("f{k}"), np));
+        }
+        out += "int main() {\n";
+        for (f, np) in &funcs {
+            for _ in 0..2 {
+                let args: Vec<String> = (0..*np).map(|_| self.constant()).collect();
+                out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));
+            }
+        }
+        out + "    return 0;\n}\n"
+    }
+
+    /// An integer expression of the names; with `calls`, h() in it too.
+    fn int_expr(&mut self, names: &[String], depth: u32, calls: bool) -> String {
+        if depth == 0 || self.below(3) == 0 {
+            return if self.below(4) > 0 { names[self.below(names.len() as u64) as usize].clone() } else { self.constant() };
+        }
+        let d = depth - 1;
+        match self.below(8) {
+            0..=3 => format!("({} {} {})", self.int_expr(names, d, calls), ["+", "-", "*", "^", "&", "|", "<", "=="][self.below(8) as usize], self.int_expr(names, d, calls)),
+            4 => format!("({} >> {})", self.int_expr(names, d, calls), self.below(8)),
+            5 if calls => match self.below(2) {
+                0 => format!("h({}, {})", self.int_expr(names, d, calls), self.int_expr(names, d, calls)),
+                _ => format!("(({} {} {}) {} z())", self.int_expr(names, d, false), ["<", "<=", "==", "!="][self.below(4) as usize], self.int_expr(names, d, false), ["^", "+", "-", "*"][self.below(4) as usize]),
+            },
+            6 => format!("-({})", self.int_expr(names, d, calls)),
+            _ => self.int_expr(names, d, calls),
+        }
+    }
+
+    /// A C program whose loops read elements other statements of the loop
+    /// may or may not write: adjacent global arrays (an index past the end
+    /// of one reaches the next), a local array, and an array given to the
+    /// function, which may be the very array the loop reads, also written
+    /// through another function. Every value the loops leave is printed.
+    fn alias_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n");
+        // pad first: an index a little below ga's start stays in the globals
+        out += "long long pad[4];\nlong long ga[16];\nlong long gb[16];\nlong long gc[8];\nlong long tail[16];\n";
+        out += "void put(long long v[], long long i, long long x) {\n    v[i & 15] = x;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..4 {
+            // an index in range, or (of a global array) one a little past
+            // either end; the frame's array is kept in range, as what lies
+            // next to it differs from mode to mode
+            let idx = |g: &mut Gen, v: &str, a: &str| -> String {
+                match if a == "la" { 0 } else { g.below(4) } {
+                    0 => format!("({v} & 15)"),
+                    1 => format!("(({v} & 7) + {})", g.below(12)),
+                    2 => format!("({v} - {})", g.below(3)),
+                    _ => format!("(({v} + {}) & 15)", g.below(16)),
+                }
+            };
+            let arrays = ["ga", "gb", "la", "v"];
+            let mut inner = String::new();
+            for _ in 0..2 + self.below(4) {
+                let (w, r) = (arrays[self.below(4) as usize], arrays[self.below(4) as usize]);
+                let wv = ["j", "i"][self.below(2) as usize];
+                let (wi, ri) = (idx(self, wv, w), idx(self, "i", r));
+                inner += &match self.below(5) {
+                    0 => format!("            {w}[{wi}] = {r}[{ri}] + j;\n"),
+                    1 => format!("            {w}[{wi}] += {r}[{ri}] * 3;\n"),
+                    2 => format!("            s = s + {r}[{ri}] - gc[{}];\n", self.below(8)),
+                    3 => format!("            put({w}, {wi}, s + {r}[{ri}]);\n"),
+                    _ => format!("            gc[(j + {}) & 7] = s ^ {r}[{ri}];\n", self.below(8)),
+                };
+            }
+            out += &format!(
+                "long long a{k}(long long v[], long long n) {{\n    long long la[16];\n    long long s = n;\n    for (long long q = 0; q < 16; q++) la[q] = q * {} + n;\n    for (long long i = {}; i < {}; i++) {{\n        for (long long j = 0; j < {}; j++) {{\n{inner}            s = s * 3 + la[i & 15];\n        }}\n    }}\n    for (long long q = 0; q < 16; q++) s = s * 7 + la[q];\n    return s;\n}}\n",
+                self.below(9),
+                self.below(3),
+                1 + self.below(6),
+                1 + self.below(5)
+            );
+            funcs.push(format!("a{k}"));
+        }
+        out += "int main() {\n    for (long long q = 0; q < 16; q++) {\n        ga[q] = q * 5 + 1;\n        gb[q] = 100 - q;\n    }\n";
+        for f in &funcs {
+            let arg = ["ga", "gb"][self.below(2) as usize];
+            out += &format!("    printf(\"%lld\\n\", {f}({arg}, {}));\n", self.constant());
+        }
+        out += "    long long t = 0;\n    for (long long q = 0; q < 16; q++) t = t * 31 + ga[q] * 7 + gb[q];\n    for (long long q = 0; q < 8; q++) t = t * 31 + gc[q];\n";
+        out + "    printf(\"%lld\\n\", t);\n    return 0;\n}\n"
     }
 
     fn next(&mut self) -> u64 {
@@ -943,6 +1092,47 @@ fn float_locals_in_registers_print_what_the_plain_code_prints() {
             assert_eq!(&outs[0], o, "f{n}.c: mode {i} and the plain code differ");
         }
     }
+}
+
+/// Builds `n` random programs of `gen` in the plain mode, the default and
+/// --release --no-evaluate: each must print, and return, what the plain code
+/// does.
+fn every_mode_as_plain(dir: &str, seed: u64, n: usize, gen: fn(&mut Gen) -> String) {
+    let r = root(dir);
+    let mut g = Gen(seed);
+    for k in 0..n {
+        let src = r.join(format!("p{k}.c"));
+        std::fs::write(&src, gen(&mut g)).unwrap();
+        let mut outs = Vec::new();
+        for mode in [vec!["--plain"], vec![], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join(format!("p{k}.exe"));
+            let o = compile_with(&r, &src, &exe, &mode, None);
+            assert!(o.status.success(), "{dir}/p{k}.c: {}", text(&o));
+            let run = Command::new(&exe).output().unwrap();
+            outs.push((run.status.code(), run.stdout));
+        }
+        for (i, o) in outs.iter().enumerate().skip(1) {
+            assert_eq!(&outs[0], o, "{dir}/p{k}.c: mode {i} and the plain code differ");
+        }
+    }
+}
+
+/// Random C programs of integer functions with more locals than registers,
+/// leaf functions and functions with calls and divisions between the uses
+/// of their locals (so locals live in volatile registers only where nothing
+/// writes them): every mode prints what the plain code prints.
+#[test]
+fn integer_locals_in_every_register_print_what_the_plain_code_prints() {
+    every_mode_as_plain("int-locals", 0x1234_5678_9ABC_DEF1, 40, Gen::int_program);
+}
+
+/// Random C programs whose loops read elements that writes of the same
+/// loop may reach: adjacent globals (an index past an array's end), a local
+/// array, and an array given as a parameter that is the one the loop reads.
+/// An element moved out of a loop must never be one a write reaches.
+#[test]
+fn elements_moved_out_of_loops_are_never_ones_the_loop_writes() {
+    every_mode_as_plain("alias", 0x0DDB_A11C_AFE5_7EA5, 40, Gen::alias_program);
 }
 
 fn compile_with(home: &Path, src: &Path, exe: &Path, extra: &[&str], rules: Option<&Path>) -> Output {
