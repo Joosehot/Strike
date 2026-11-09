@@ -25,6 +25,7 @@ mod parse;
 mod pe;
 mod rotate;
 mod scev;
+mod strs;
 mod x64;
 mod x64opt;
 
@@ -269,7 +270,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     let mut evaluated = None;
     // a program that reads its input is never worked out while compiling:
     // what it does depends on what it is given
-    let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine)));
+    let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine) || matches!(o, ir::Op::Call(s, _) if s == ir::GETC)));
     let evaluate = evaluate && !reads;
     if gen == Gen::Release && evaluate {
         if let Some(d) = eval::run(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {

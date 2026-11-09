@@ -106,6 +106,51 @@ fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
     }
 }
 
+#[test]
+fn strings_are_what_clang_go_and_python_make_of_them() {
+    for file in ["strings.c", "strings.go", "strings.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+    runs_with_input_as_the_real_one("strings_input.py", "strings_input.in");
+}
+
+/// What a string cannot be stops the program as the language stops it
+/// (Python's IndexError, ValueError, TypeError and EOFError with exit code
+/// 1, Go's panic with 2), with what was printed before it and nothing
+/// after; and what Strike's strings do not hold stops it with Strike's
+/// reason, never a wrong string.
+#[test]
+fn a_string_that_cannot_be_stops_the_program_as_python_and_go_stop_it() {
+    let r = root("string-errors");
+    for (name, src, stdin, code, says) in [
+        ("index.py", "s = \"abc\"\nprint(s[-3])\nprint(s[3])\nprint(9)\n", "", 1, "IndexError: string index out of range"),
+        ("int.py", "print(int(\" 1_0 \"))\nprint(int(\"1__0\"))\n", "", 1, "ValueError"),
+        ("ord.py", "print(ord(\"a\"))\nprint(ord(\"ab\"))\n", "", 1, "TypeError"),
+        ("chr.py", "print(chr(97))\nprint(chr(1114112))\n", "", 1, "ValueError"),
+        ("eof.py", "print(input())\nprint(input())\n", "one\n", 1, "EOFError"),
+        ("byte.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 3\n\tfmt.Println(s[2])\n\tfmt.Println(s[i])\n}\n", "", 2, "index out of range"),
+        ("cut.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 2\n\tfmt.Println(s[1:3])\n\tfmt.Println(s[i:1])\n}\n", "", 2, "slice bounds out of range"),
+        ("past.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 4\n\tfmt.Println(s[:3])\n\tfmt.Println(s[:i])\n}\n", "", 2, "slice bounds out of range"),
+        // not exact yet: refused while running, with the reason
+        ("chr_past.py", "print(chr(65))\nprint(chr(233))\n", "", 1, "past ASCII"),
+        ("read_past.py", "print(input())\nprint(input())\n", "ok\ncaf\u{e9}\n", 1, "past ASCII"),
+        ("lone_cr.py", "print(input())\nprint(input())\n", "ok\na\rb\n", 1, "carriage return"),
+        ("quote_past.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Printf(\"%q\\n\", \"ab\")\n\tfmt.Printf(\"%q\\n\", \"caf\u{e9}\")\n}\n", "", 1, "%q of a string past ASCII"),
+    ] {
+        let p = r.join(name);
+        std::fs::write(&p, src).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"]] {
+            let exe = r.join("a.exe");
+            let o = compile_with(&r, &p, &exe, &mode, None);
+            assert!(o.status.success(), "{name}: {}", text(&o));
+            let got = run_with(&exe, stdin.as_bytes());
+            assert_eq!(got.status.code(), Some(code), "{name} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout).lines().count(), 1, "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stdout));
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+        }
+    }
+}
+
 /// An index out of range stops the program as the language stops it:
 /// Python's IndexError with exit code 1, Go's panic with exit code 2, and
 /// nothing printed after it.
@@ -301,7 +346,7 @@ impl Gen {
         }
     }
     fn program(&mut self) -> String {
-        let mut out = String::from("#include <stdio.h>\n");
+        let mut out = String::from("#include <stdio.h>\n#include <string.h>\n");
         // two globals every function may read and change
         out += &format!("long long g0 = {};\nlong long g1;\n", self.constant());
         let mut funcs: Vec<(String, usize)> = Vec::new();
@@ -415,7 +460,25 @@ impl Gen {
             );
             arrays.push(format!("a{k}"));
         }
+        // strings: a char array made from a literal and changed in place,
+        // a pointer to a literal, strlen (compared unsigned) and strcmp
+        let word = |g: &mut Gen| -> String { (0..1 + g.below(20)).map(|_| (b'a' + g.below(26) as u8) as char).collect() };
+        let mut texts = Vec::new();
+        for k in 0..3 {
+            let names = vec!["n".to_string(), "i".to_string(), "buf[i]".to_string(), "p[i % 3]".to_string()];
+            out += &format!(
+                "long long t{k}(long long n) {{\n    char buf[24] = \"{}\";\n    const char *p = \"{}\";\n    for (long long i = 0; buf[i]; i++) {{\n        buf[i] = 'a' + (({}) & 15);\n    }}\n    printf(\"%s %c %zu\\n\", buf, buf[0], strlen(p));\n    return strlen(buf) * 3 + strcmp(buf, p) + (strlen(buf) > n) + (n <= strlen(p));\n}}\n",
+                word(self),
+                // at least three chars: p[i % 3] is always one of them or its zero
+                word(self) + "abc",
+                self.expr(&names, &[], 3)
+            );
+            texts.push(format!("t{k}"));
+        }
         out += "int main() {\n";
+        for f in &texts {
+            out += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
+        }
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
         }
@@ -577,7 +640,21 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("mixed.py", "a = [1, True]\nprint(a)\n", "one kind per list"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
         ("unbound.py", "n = 1\ndef f():\n    print(n)\n    n = 2\nf()\n", "read before this function assigns it"),
-        ("string.py", "x = input()\nprint(x)\n", "strings are not in Strike yet"),
+        // strings: what is not exact yet
+        ("unicode.py", "s = \"caf\u{e9}\"\nprint(len(s))\n", "past ASCII"),
+        ("unicode_print.py", "print(\"caf\u{e9}\")\n", "past ASCII"),
+        ("change.py", "s = \"abc\"\ns[0] = \"x\"\n", "a string is not changed in place"),
+        ("str_int.py", "print(\"a\" + 1)\n", "this operator on a string and a number"),
+        ("list_in.py", "print(1 in [1, 2])\n", "this operator on a number and a list"),
+        ("split_sep.py", "print(\"a,b\".split(\",\"))\n", ".split() with these values"),
+        ("bytes.go", "package main\nimport \"fmt\"\nfunc main() {\n\tb := []byte{1}\n\tfmt.Println(b)\n}\n", "a slice or an array of bytes is not in Strike yet"),
+        ("atoi.go", "package main\nimport \"strconv\"\nfunc main() {\n\tn := strconv.Atoi(\"1\")\n\tn = n + 1\n}\n", "strconv.Atoi is not in Strike yet"),
+        ("quote_int.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Printf(\"%q\\n\", 65)\n}\n", "%q is given a number"),
+        ("string_cond.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"a\"\n\tif s {\n\t\tfmt.Println(s)\n\t}\n}\n", "a string is not a condition"),
+        ("pointer_math.c", "#include <stdio.h>\nint main() { const char *p = \"abc\"; puts(p + 1); return 0; }\n", "this operator on a pointer"),
+        ("strlen_div.c", "#include <string.h>\nint main() { return strlen(\"abcd\") / 2; }\n", "unsigned division"),
+        ("char_array.c", "int main() { char s[2] = \"abc\"; return s[0]; }\n", "a string of 3 chars is given to an array of 2"),
+        ("int_string.c", "int main() { int s[4] = \"abc\"; return s[0]; }\n", "only a char array is given a string"),
     ] {
         let p = r.join(name);
         std::fs::write(&p, src).unwrap();

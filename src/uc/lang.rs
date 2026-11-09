@@ -75,9 +75,16 @@ struct Raw {
     /// functions every program has: the language's name -> what it is
     #[serde(default)]
     builtins: BTreeMap<String, String>,
-    /// x.name(...) on a list: the name -> what it is
+    /// x.name(...) on a list or a string: the name -> what it is
     #[serde(default)]
     methods: BTreeMap<String, String>,
+    /// package.name(...): the two names -> what it is (Go's strconv.Itoa)
+    #[serde(default)]
+    qualified: BTreeMap<String, String>,
+    /// what a string is: "c" (chars ended by a zero byte), "bytes" (Go),
+    /// "ascii" (Python's code points, which Strike holds to ASCII)
+    #[serde(default)]
+    strings: Option<String>,
     #[serde(default)]
     bool_constants: BTreeMap<String, i64>,
     #[serde(default)]
@@ -166,6 +173,20 @@ pub enum Style {
     SpacedLine,
 }
 
+/// What the language's strings are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Strings {
+    /// none: a string can only be printed
+    None,
+    /// C: chars in a row, ended by a zero byte; a literal is their address
+    C,
+    /// Go: bytes, s[i] a byte (uint8), ranged over as UTF-8
+    Bytes,
+    /// Python: code points, s[i] a string of one; Strike holds them to
+    /// ASCII, so each is one byte
+    Ascii,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cap {
     Name,
@@ -241,6 +262,8 @@ pub struct Lang {
     pub list_print: (String, String, String),
     pub builtins: HashMap<String, String>,
     pub methods: HashMap<String, String>,
+    pub qualified: HashMap<String, String>,
+    pub strings: Strings,
     pub bool_constants: HashMap<String, i64>,
     pub binary: HashMap<String, (u8, BinOp)>,
     pub unary: HashMap<String, (u8, UnOp)>,
@@ -421,7 +444,7 @@ impl Lang {
         tokens.extend(r.end_after.iter().cloned());
         let mut puncts: Vec<String> = tokens.iter().filter(|t| !is_word(t)).cloned().collect();
         puncts.extend(["(", ")", "{", "}", ",", ";", "[", "]"].map(String::from));
-        if !r.methods.is_empty() {
+        if !r.methods.is_empty() || !r.qualified.is_empty() {
             puncts.push(".".into());
         }
         if r.composite_literals || r.list_literals {
@@ -433,6 +456,13 @@ impl Lang {
         keywords.extend(r.type_words.iter().cloned());
         keywords.extend(r.bool_constants.keys().cloned());
 
+        let strings = match r.strings.as_deref() {
+            None => Strings::None,
+            Some("c") => Strings::C,
+            Some("bytes") => Strings::Bytes,
+            Some("ascii") => Strings::Ascii,
+            Some(x) => return Err(err(format!("unknown strings {x}"))),
+        };
         let bool_print = match r.bool_print.as_slice() {
             [] => None,
             [t, f] => Some((t.clone(), f.clone())),
@@ -505,6 +535,8 @@ impl Lang {
             },
             builtins: r.builtins.into_iter().collect(),
             methods: r.methods.into_iter().collect(),
+            qualified: r.qualified.into_iter().collect(),
+            strings,
             bool_constants: r.bool_constants.into_iter().collect(),
             binary,
             unary,

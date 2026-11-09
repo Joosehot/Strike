@@ -56,7 +56,7 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 st.pop();
                 st.pop();
             }
-            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => st.push(None),
+            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) | Op::Data(_) => st.push(None),
             Op::Fail(..) => st.iter_mut().for_each(|x| *x = None),
             Op::ReadToken => {
                 st.push(None);

@@ -34,6 +34,13 @@ literals = "typed"
 # {1, 2, 3} gives an array its first values; an index is not checked,
 # as C does not check it
 brace_lists = true
+# a string is chars ended by a zero byte: a literal is the address of its
+# chars (read-only), a char array holds its own
+strings = "c"
+
+[builtins]
+strlen = "c_strlen"
+strcmp = "c_strcmp"
 
 [int_widths]
 int = 32

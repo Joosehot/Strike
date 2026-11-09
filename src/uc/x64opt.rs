@@ -1580,6 +1580,12 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 g.a.reloc(super::x64::global(*gl));
                 g.v.push(V::Rax);
             }
+            Op::Data(d) => {
+                g.fresh_rax();
+                g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [rip + data]
+                g.a.reloc(Target::Data(d.clone()));
+                g.v.push(V::Rax);
+            }
             Op::Fail(code, m) => {
                 super::x64::fail_here(&mut g.a, *code, m);
                 live = false;
