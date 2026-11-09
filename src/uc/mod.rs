@@ -25,6 +25,7 @@ mod parse;
 mod pe;
 mod rotate;
 mod scev;
+mod simplify;
 mod x64;
 mod x64opt;
 
@@ -294,6 +295,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
                 fold::run(f);
             }
             simplified += opt::simplify(f);
+            simplified += simplify::run(f, rules.loop_weight);
             hoisted += opt::hoist(f);
             simplified += opt::counters(f);
             closed += scev::run(f);
