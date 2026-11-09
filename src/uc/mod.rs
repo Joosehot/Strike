@@ -27,6 +27,7 @@ mod modules;
 mod opt;
 mod parse;
 mod pe;
+mod ranges;
 mod rotate;
 mod scev;
 mod simplify;
@@ -334,6 +335,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             simplified += simplify::run(f, rules.loop_weight);
             hoisted += opt::hoist(f);
             simplified += opt::counters(f);
+            simplified += ranges::run(f);
             closed += scev::run(f);
             fold::run(f);
             rotate::run(f);

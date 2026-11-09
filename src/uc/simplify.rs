@@ -1134,6 +1134,11 @@ impl Cx {
 
 /// The run's value with these inputs, by the machine's rules (None: it
 /// stops, a division by zero or a checked operation that does not fit).
+#[cfg(test)]
+pub(super) fn eval_ops(run: &[Op], input: &dyn Fn(u8, u32) -> i64) -> Option<i64> {
+    eval(run, input)
+}
+
 fn eval(run: &[Op], input: &dyn Fn(u8, u32) -> i64) -> Option<i64> {
     let mut st: Vec<i64> = Vec::new();
     for op in run {
