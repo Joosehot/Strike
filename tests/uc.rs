@@ -99,6 +99,16 @@ fn runs_in_every_mode_as_the_real_one(file: &str) {
     }
 }
 
+/// Programs heavy in what the release simplifier rewrites (polynomials,
+/// shared factors, constant multiples, index arithmetic, C int and char
+/// cuts) print in every mode what clang and Go print.
+#[test]
+fn simplified_expressions_are_what_clang_and_go_make_of_them() {
+    for file in ["algebra.c", "algebra.go"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
 #[test]
 fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
     for file in ["arrays.c", "arrays.go", "arrays.py"] {
@@ -345,6 +355,38 @@ impl Gen {
             _ => self.expr(names, funcs, d),
         }
     }
+    /// A ring expression with some atoms: what the simplifier rewrites.
+    fn ring(&mut self, names: &[String], depth: u32) -> String {
+        if depth == 0 || self.below(5) == 0 {
+            return if self.below(4) > 0 { names[self.below(names.len() as u64) as usize].clone() } else { self.constant() };
+        }
+        let d = depth - 1;
+        match self.below(12) {
+            0 | 1 => format!("({} + {})", self.ring(names, d), self.ring(names, d)),
+            2 => format!("({} - {})", self.ring(names, d), self.ring(names, d)),
+            3 | 4 => format!("({} * {})", self.ring(names, d), self.ring(names, d)),
+            // a shared factor: f*x + f*y
+            5 => {
+                let f = self.ring(names, d.min(1));
+                format!("({f} * {} + {f} * {} - {} * {f})", self.ring(names, d), self.ring(names, d), self.ring(names, d))
+            }
+            6 => {
+                let k = [3, 5, 9, 7, -3, 8, 1 << 20, -1, 0, 6, 10, 12][self.below(12) as usize];
+                format!("({} * {k})", self.ring(names, d))
+            }
+            7 => format!("({} << {})", self.ring(names, d), self.below(66)),
+            8 => format!("{}({})", ["-", "~"][self.below(2) as usize], self.ring(names, d)),
+            // a polynomial in one name
+            9 => {
+                let x = names[self.below(names.len() as u64) as usize].clone();
+                format!("({} * {x} * {x} + {} * {x} + {})", self.below(20) as i64 - 10, self.below(20) as i64 - 10, self.constant())
+            }
+            // atoms: division and remainder by constants, a comparison, a shift right
+            10 => format!("({} {} {})", self.ring(names, d), ["/", "%"][self.below(2) as usize], [3, 7, -5, 1000003][self.below(4) as usize]),
+            _ => format!("({} {} {})", self.ring(names, d), ["<", ">>", "^"][self.below(3) as usize], self.below(5) + 1),
+        }
+    }
+
     fn program(&mut self) -> String {
         let mut out = String::from("#include <stdio.h>\n#include <string.h>\n");
         // two globals every function may read and change
@@ -475,9 +517,31 @@ impl Gen {
             );
             texts.push(format!("t{k}"));
         }
+        // ring expressions for the release simplifier: shared factors,
+        // polynomials, constant multiples, C long (cut to 32 bits) and long
+        // long, index arithmetic in loops, atoms inside
+        let mut rings = Vec::new();
+        out += "long long rarr[64];\n";
+        for k in 0..4 {
+            let ty = ["long", "long long"][self.below(2) as usize];
+            let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            let inner: Vec<String> = ["a", "b", "c", "i", "j", "s"].iter().map(|s| s.to_string()).collect();
+            let (n, m) = (self.below(9), self.below(9));
+            let first = self.ring(&names, 3);
+            let body = self.ring(&inner, 3);
+            let index = self.ring(&inner, 2);
+            let last = self.ring(&names, 4);
+            out += &format!(
+                "{ty} q{k}({ty} a, {ty} b, {ty} c) {{\n    {ty} s = {first};\n    for ({ty} i = 0; i < {n}; i++) {{\n        for ({ty} j = 0; j < {m}; j++) {{\n            s = s + {body} + rarr[({index}) & 63];\n            rarr[(i * {m} + j) & 63] = s;\n        }}\n    }}\n    return s + {last};\n}}\n"
+            );
+            rings.push(format!("q{k}"));
+        }
         out += "int main() {\n";
         for f in &texts {
             out += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
+        }
+        for f in &rings {
+            out += &format!("    printf(\"%lld\\n\", {f}({}, {}, {}));\n", self.constant(), self.constant(), self.constant());
         }
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
