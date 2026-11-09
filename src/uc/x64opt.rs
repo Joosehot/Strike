@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-11 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-17 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -118,6 +118,10 @@ enum V {
     /// base + index << k + d, both locals in registers: an element's
     /// address, used where it is as [base + index * size + d]
     Index(u32, u32, u8, i32),
+    /// rax + index << k + d, the index a local in a register: an element's
+    /// address whose base (a local in memory) was loaded into rax. It holds
+    /// rax, as V::Rax does.
+    RIdx(u32, u8, i32),
     /// a float in xmm2 to xmm5 (a result, or an element loaded for a
     /// float operation): the next float operation takes it there, anything
     /// else has it moved out
@@ -221,6 +225,55 @@ fn choose(f: &Func, r: &Rules) -> Vec<Place> {
         beam = next;
     }
     beam.swap_remove(0).1
+}
+
+/// For every operation, the locals live after it (read later before they
+/// are written again), by the usual backward dataflow over the jumps. A
+/// local that is not live after an operation may have its register taken.
+fn live_after(code: &[Op], slots: u32) -> Vec<Vec<u64>> {
+    let words = (slots as usize).div_ceil(64).max(1);
+    let n = code.len();
+    let mut label_at = vec![n; super::ir::label_count(code) as usize];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            label_at[*l as usize] = i;
+        }
+    }
+    let succ = |i: usize| -> Vec<usize> {
+        match &code[i] {
+            Op::Jmp(l) => vec![label_at[*l as usize]],
+            Op::Jz(l) | Op::Jnz(l) => vec![label_at[*l as usize], i + 1],
+            Op::Ret | Op::Fail(..) | Op::FailMem(_) => vec![],
+            _ => vec![i + 1],
+        }
+    };
+    let mut live_in = vec![vec![0u64; words]; n + 1];
+    let mut out = vec![vec![0u64; words]; n];
+    loop {
+        let mut changed = false;
+        for i in (0..n).rev() {
+            let mut o = vec![0u64; words];
+            for s in succ(i) {
+                for w in 0..words {
+                    o[w] |= live_in[s][w];
+                }
+            }
+            let mut li = o.clone();
+            match &code[i] {
+                Op::Store(s) => li[*s as usize / 64] &= !(1u64 << (s % 64)),
+                Op::Load(s) => li[*s as usize / 64] |= 1u64 << (s % 64),
+                _ => {}
+            }
+            if li != live_in[i] || o != out[i] {
+                live_in[i] = li;
+                out[i] = o;
+                changed = true;
+            }
+        }
+        if !changed {
+            return out;
+        }
+    }
 }
 
 /// For every Load and Store, whether it is a float operation's: the value
@@ -460,6 +513,9 @@ struct G {
     div32: bool,
     /// the frame offset of the function's own memory (Op::Frame)
     memory: i32,
+    /// the locals live after each operation (computed where a local is in
+    /// an xmm register: its register may then take a result in place)
+    live: Vec<Vec<u64>>,
 }
 
 impl G {
@@ -501,6 +557,19 @@ impl G {
             Loc::Mem(_) | Loc::Xmm(_) => unreachable!("a Lea is made only of a local in a register"),
         }
     }
+    /// Is local s read no more after the operation being compiled, and no
+    /// value waiting on the stack is it? Then its register may be taken.
+    fn dead(&self, s: u32) -> bool {
+        let Some(after) = self.live.get(self.op_at) else { return false };
+        after[s as usize / 64] & (1u64 << (s % 64)) == 0 && self.reads(s).is_none()
+    }
+    /// A float result waiting in xmm register k is pushed before k is
+    /// written (k is a float local's, which a dead local's result took).
+    fn keep_xmm(&mut self, k: u8) {
+        if let Some(i) = self.v.iter().rposition(|x| *x == V::X(k)) {
+            self.flush_to(i);
+        }
+    }
     /// An SSE operation xmm dst, xmm src (prefix 0x66, 0xF2, 0xF3 or none;
     /// a REX for xmm8 and up).
     fn sse_rr(&mut self, prefix: Option<u8>, op: u8, dst: u8, src: u8) {
@@ -524,6 +593,18 @@ impl G {
         self.a.e(&[0x0F, op, 0x84 | (xmm & 7) << 3, 0x24]);
         self.a.d32(disp);
     }
+    /// An SSE operation xmm, [rip + the 8 bytes of c] (a float constant in
+    /// the read-only data, as clang keeps it).
+    fn sse_const(&mut self, prefix: Option<u8>, op: u8, xmm: u8, c: i64) {
+        if let Some(p) = prefix {
+            self.a.e(&[p]);
+        }
+        if xmm >= 8 {
+            self.a.e(&[0x44]);
+        }
+        self.a.e(&[0x0F, op, 0x05 | (xmm & 7) << 3]);
+        self.a.reloc(Target::Data(c.to_le_bytes().to_vec()));
+    }
     /// movq xmm, r
     fn movq_to_xmm(&mut self, xmm: u8, r: u8) {
         self.a.e(&[0x66, 0x48 | (xmm >> 3) << 2 | (r >> 3), 0x0F, 0x6E, 0xC0 | (xmm & 7) << 3 | (r & 7)]);
@@ -537,6 +618,7 @@ impl G {
         self.v.iter().rposition(|y| match y {
             V::Slot(t) | V::Lea(t, _) | V::Scaled(t, _, _) => *t == s,
             V::Index(b, i, _, _) => *b == s || *i == s,
+            V::RIdx(i, _, _) => *i == s,
             _ => false,
         })
     }
@@ -640,6 +722,10 @@ impl G {
                 let (yb, yi) = (self.slot_reg(b), self.slot_reg(i));
                 self.mem(false, true, &[0x8D], r, Addr::Index(Some(yb), yi, k, d));
             }
+            V::RIdx(i, k, d) => {
+                let yi = self.slot_reg(i);
+                self.mem(false, true, &[0x8D], r, Addr::Index(Some(RAX), yi, k, d));
+            }
         }
     }
 
@@ -671,7 +757,7 @@ impl G {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
             }
-            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::X(_) => {
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::RIdx(..) | V::X(_) => {
                 self.to_reg(x, R11);
                 self.push_r(R11);
             }
@@ -697,7 +783,7 @@ impl G {
         }
     }
     fn need_rax(&mut self) {
-        if let Some(i) = self.v.iter().rposition(|x| *x == V::Rax) {
+        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::RIdx(..))) {
             self.flush_to(i);
         }
     }
@@ -820,6 +906,31 @@ impl G {
                 self.v.truncate(n - 2);
                 self.v.push(x);
                 return;
+            }
+            // a base in memory (or in rax already) plus index << k: the
+            // base into rax, and the address waits as [rax + index * size]
+            let mem = |s: u32| matches!(self.loc[s as usize], Loc::Mem(_));
+            let base = match (b, l, r) {
+                (BinOp::Add, V::Slot(s), V::Scaled(i, k, d)) | (BinOp::Add, V::Scaled(i, k, d), V::Slot(s)) if mem(s) => Some((Some(s), i, k, d)),
+                (BinOp::Add, V::Rax, V::Scaled(i, k, d)) | (BinOp::Add, V::Scaled(i, k, d), V::Rax) => Some((None, i, k, d)),
+                _ => None,
+            };
+            if let Some((s, i, k, d)) = base {
+                self.v.truncate(n - 2);
+                if let Some(s) = s {
+                    self.need_rax();
+                    self.to_reg(V::Slot(s), RAX);
+                }
+                self.v.push(V::RIdx(i, k, d));
+                return;
+            }
+            if let (BinOp::Add | BinOp::Sub, V::RIdx(i, k, d), V::Imm(c)) = (b, l, r) {
+                let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                if let Some(d) = c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)) {
+                    self.v.truncate(n - 2);
+                    self.v.push(V::RIdx(i, k, d));
+                    return;
+                }
             }
         }
         let mut right = self.pop();
@@ -1002,9 +1113,14 @@ impl G {
             BinOp::FDiv => 0x5E,
             _ => 0,
         };
-        // the left side's register, which the result takes
+        // the left side's register, which the result takes: a float local's
+        // own where the local is not read again
         let a = match left {
             V::X(k) => k,
+            V::Slot(s) if matches!(self.loc[s as usize], Loc::Xmm(_)) && self.dead(s) => {
+                let Loc::Xmm(k) = self.loc[s as usize] else { unreachable!() };
+                k
+            }
             x => {
                 let avoid = if let V::X(k) = right { vec![k] } else { vec![] };
                 let k = self.alloc_xmm(&avoid);
@@ -1012,15 +1128,18 @@ impl G {
                 k
             }
         };
-        // arithmetic takes a local in memory as it is
+        // arithmetic takes a local in memory, and a constant, as they are
         if let (V::Slot(s), true) = (right, op != 0) {
             if let Loc::Mem(d) = self.loc[s as usize] {
-                let disp = self.at(d);
-                self.a.e(&[0xF2, 0x0F, op, 0x84 | a << 3, 0x24]); // op xmm, [rsp + d]
-                self.a.d32(disp);
+                self.sse_rsp(Some(0xF2), op, a, d); // op xmm, [rsp + d]
                 self.v.push(V::X(a));
                 return;
             }
+        }
+        if let (V::Imm(c), true) = (right, op != 0) {
+            self.sse_const(Some(0xF2), op, a, c); // op xmm, [rip + c]
+            self.v.push(V::X(a));
+            return;
         }
         // the right side's register: a float local's own, used where it is
         let c = match right {
@@ -1074,11 +1193,10 @@ impl G {
         if n < 2 {
             return false;
         }
-        let (mut left, mut right) = (self.v[n - 2], self.v[n - 1]);
-        if right == V::Slot(s) && left != V::Slot(s) && matches!(b, BinOp::FAdd | BinOp::FMul) {
-            std::mem::swap(&mut left, &mut right);
-        }
-        let ok = |x: V| !matches!(x, V::Stack | V::Flags(_));
+        // the sides stay in their order (x + s is not s + x: with two NaNs
+        // the first one comes out)
+        let (left, right) = (self.v[n - 2], self.v[n - 1]);
+        let ok = |x: V| !matches!(x, V::Stack | V::Flags(_)) && x != V::X(k);
         if !ok(left) || !ok(right) || (right == V::Slot(s) && left != V::Slot(s)) {
             return false;
         }
@@ -1086,6 +1204,7 @@ impl G {
         if let Some(i) = self.reads(s) {
             self.flush_to(i);
         }
+        self.keep_xmm(k);
         // the right side where it is: held first when it is a pending
         // float or the local itself, before the local is written
         let c = match right {
@@ -1101,6 +1220,13 @@ impl G {
                 }
                 let Loc::Mem(d) = self.loc[t as usize] else { unreachable!() };
                 self.sse_rsp(Some(0xF2), op, k, d);
+                return true;
+            }
+            V::Imm(c) => {
+                if left != V::Slot(s) {
+                    self.to_xmm_any(left, k);
+                }
+                self.sse_const(Some(0xF2), op, k, c);
                 return true;
             }
             x => {
@@ -1121,6 +1247,43 @@ impl G {
             V::X(j) => self.sse_rr(None, 0x28, xmm, j), // movaps
             x => self.to_xmm(x, xmm),
         }
+    }
+
+    /// An element that is at once the right side of float arithmetic: the
+    /// operation takes it from memory (`mulsd xmm, [address]`). False, and
+    /// nothing emitted, where the left side is not where this can be done.
+    fn load_into_op(&mut self, b: BinOp) -> bool {
+        let op = match b {
+            BinOp::FAdd => 0x58,
+            BinOp::FMul => 0x59,
+            BinOp::FSub => 0x5C,
+            BinOp::FDiv => 0x5E,
+            _ => return false,
+        };
+        let n = self.v.len();
+        if n < 2 || matches!(self.v[n - 2], V::Stack | V::Flags(_)) || self.v[n - 1] == V::Stack {
+            return false;
+        }
+        let addr = self.pop();
+        let left = self.pop();
+        let a = match left {
+            V::X(k) => k,
+            V::Slot(s) if matches!(self.loc[s as usize], Loc::Xmm(_)) && self.dead(s) => {
+                let Loc::Xmm(k) = self.loc[s as usize] else { unreachable!() };
+                self.keep_xmm(k);
+                k
+            }
+            x => {
+                let k = self.alloc_xmm(&[]);
+                self.to_xmm(x, k);
+                k
+            }
+        };
+        let at = self.address(addr);
+        self.a.e(&[0xF2]);
+        self.mem(false, false, &[0x0F, op], a, at); // op xmm, [address]
+        self.v.push(V::X(a));
+        true
     }
 
     /// An element a float operation is to use, loaded from memory straight
@@ -1144,6 +1307,7 @@ impl G {
                 Loc::Reg(r) => self.movq_to_xmm(xmm, r),
             },
             V::Imm(0) => self.sse_rr(None, 0x57, xmm, xmm), // xorps xmm, xmm
+            V::Imm(c) => self.sse_const(Some(0xF2), 0x10, xmm, c), // movsd xmm, [rip + c]
             V::Rax => self.movq_to_xmm(xmm, RAX),
             x => {
                 self.to_reg(x, R11);
@@ -1188,6 +1352,12 @@ impl G {
                 }
             },
             Loc::Xmm(k) => match x {
+                _ if self.v.contains(&V::X(k)) => {
+                    // a result waiting in this register is kept first
+                    self.keep_xmm(k);
+                    self.v.push(x);
+                    self.store(s);
+                }
                 V::Slot(t) if t == s => {}
                 V::Imm(0) => self.sse_rr(None, 0x57, k, k), // xorps
                 V::X(j) => self.sse_rr(None, 0x28, k, j),   // movaps
@@ -1221,7 +1391,7 @@ impl G {
             return;
         }
         let args: Vec<V> = self.v.split_off(at);
-        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::X(_))) {
+        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::RIdx(..) | V::X(_))) {
             self.flush_to(i);
         }
         // a comparison's flags become a number before anything changes them
@@ -1369,6 +1539,7 @@ impl G {
             V::Slot(s) if self.in_reg(s) => Addr::Base(self.slot_reg(s), 0),
             V::Scaled(s, k, d) => Addr::Index(None, self.slot_reg(s), k, d),
             V::Index(b, i, k, d) => Addr::Index(Some(self.slot_reg(b)), self.slot_reg(i), k, d),
+            V::RIdx(i, k, d) => Addr::Index(Some(RAX), self.slot_reg(i), k, d),
             x => {
                 self.need_rax();
                 self.to_reg(x, RAX);
@@ -1508,7 +1679,27 @@ impl G {
         match (u, x) {
             // a square root where the float waits
             (UnOp::FSqrt, V::X(k)) => {
-                self.a.e(&[0xF2, 0x0F, 0x51, 0xC0 | k << 3 | k]); // sqrtsd xmm, xmm
+                self.sse_rr(Some(0xF2), 0x51, k, k); // sqrtsd xmm, xmm
+                self.v.push(V::X(k));
+            }
+            // a whole number made a float straight in an xmm register
+            (UnOp::FromInt | UnOp::FromInt32, x) if !matches!(x, V::Stack | V::Flags(_)) => {
+                let k = self.alloc_xmm(&[]);
+                let r = match x {
+                    V::Slot(s) if self.in_reg(s) => self.slot_reg(s),
+                    V::Rax => RAX,
+                    x => {
+                        self.to_reg(x, R11);
+                        R11
+                    }
+                };
+                self.sse_rr(None, 0x57, k, k); // xorps: no wait on the register's old value
+                // cvtsi2sd (cvtsi2ss) xmm, r64
+                let p = if u == UnOp::FromInt { 0xF2 } else { 0xF3 };
+                self.a.e(&[p, 0x48 | (k >> 3) << 2 | (r >> 3), 0x0F, 0x2A, 0xC0 | (k & 7) << 3 | (r & 7)]);
+                if u == UnOp::FromInt32 {
+                    self.sse_rr(Some(0xF3), 0x5A, k, k); // cvtss2sd
+                }
                 self.v.push(V::X(k));
             }
             // of a float local: into a new xmm register, from its own
@@ -1832,7 +2023,8 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, xsaved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory };
+    let live = if xused.is_empty() { Vec::new() } else { live_after(&f.code, f.slots) };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, xsaved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory, live };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9
@@ -1980,6 +2172,16 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 skip = 1;
                 continue;
             }
+            // an element that is float arithmetic's right side: its memory
+            // operand
+            (Op::LoadM(8), Some(Op::Bin(b))) if b.is_float() => {
+                g.op_at = at + 1;
+                if g.load_into_op(*b) {
+                    skip = 1;
+                    continue;
+                }
+                g.op_at = at;
+            }
             (Op::Bin(b), Some(Op::Store(s))) => {
                 if g.bin_into(*b, *s) {
                     zero[*s as usize] = false;
@@ -2059,6 +2261,22 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 g.v.push(V::Rax);
             }
             Op::LoadM(8) if for_float[at] => g.load_float(),
+            // an element stored at once into a float local in an xmm register:
+            // loaded straight into it
+            Op::LoadM(8) if matches!(f.code.get(at + 1), Some(Op::Store(s)) if matches!(g.loc[*s as usize], Loc::Xmm(_))) => {
+                let Some(&Op::Store(s)) = f.code.get(at + 1) else { unreachable!() };
+                let Loc::Xmm(k) = g.loc[s as usize] else { unreachable!() };
+                let x = g.pop();
+                if let Some(i) = g.reads(s) {
+                    g.flush_to(i);
+                }
+                g.keep_xmm(k);
+                let addr = g.address(x);
+                g.a.e(&[0xF2]);
+                g.mem(false, false, &[0x0F, 0x10], k, addr); // movsd xmm, [address]
+                zero[s as usize] = false;
+                skip = 1;
+            }
             Op::LoadM(w) => g.load_mem(*w),
             Op::StoreM(w) => g.store_mem(*w, None),
             Op::OpM(b, w) => g.store_mem(*w, Some(*b)),

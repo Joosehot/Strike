@@ -201,9 +201,27 @@ of 64-bit values. The float operations are their own operations (`FAdd`,
 and the conversions `FromInt`, `FromInt32`, `ToF32`, `ToInt`, `ToInt32`).
 The generators do them with SSE2: `addsd`, `ucomisd`, `cvtsi2sd`,
 `cvttsd2si`, `sqrtsd`. `FRem` (Python's `%` needs C's `fmod`) uses the
-x87's `fprem`, which is exact. The optimizing generator keeps a float in
-xmm2 to xmm5 until something else needs it, and loads an array element a
-float operation will use straight into one.
+x87's `fprem`, which is exact.
+
+The optimizing generator keeps float results in xmm2 to xmm5 until
+something else needs them, and it puts float locals in registers:
+
+- **HotMotor chooses a register for each float local.** Its beam chooses
+  for every local between a general register, one of xmm6 to xmm15, and
+  memory. An xmm register gains the uses that are a float operation's, and
+  a general register gains the others. A function saves the xmm registers
+  it uses (they are callee-saved on Windows), all 128 bits.
+- **Operands are used where they are.** A local in a register, a local in
+  memory, a float constant (from the read-only data, as clang keeps it) and
+  an element used at once (`mulsd xmm, [rax + rbx*8]`) are operands as they
+  are. `s = s + x` is one `addsd` into s's register.
+- **A dead local's register takes the result.** A local not read again
+  after an operation (found by liveness over the jumps) gives its register
+  to the result, so no copy is made.
+- **Conversions stay in xmm.** A whole number is converted straight into an
+  xmm register.
+- **The order of the operands is always kept.** With two NaNs the first one
+  comes out, so `x + s` is never made `s + x`.
 
 Folding and the IR runner work a float out bit for bit as the machine
 does, including which NaN comes out: the first NaN that comes in, quieted,
@@ -368,6 +386,10 @@ the line and the reason, and never guessed. Refused today:
   float stops are checked one by one. The 100 random C programs have float
   functions too, with every float operator, both conversions, NaN, the
   infinities and both zeros, and they print every result's bits.
+- 40 more random C programs check float locals in registers. Their
+  functions have up to 15 float locals (more than the ten xmm registers),
+  up to six parameters (the last ones on the stack), and calls and printf
+  between float operations. In every mode they print the plain code's bits.
 - Programs of several files ([tests/uc/multi_c/](tests/uc/multi_c/),
   [multi_go/](tests/uc/multi_go/), [multi_py/](tests/uc/multi_py/)) and a
   preprocessed C program are built in every mode, given as a directory and
@@ -383,7 +405,7 @@ the line and the reason, and never guessed. Refused today:
   TypeError, EOFError, Go's panics) and each refusal. The random C
   programs make strings in char arrays too, and compare them with strlen
   and strcmp.
-- 82 tests in all (every target of `cargo test --release`), in about 50 s.
+- 83 tests in all (every target of `cargo test --release`), in about 55 s.
 
 The tests have found real bugs, all fixed:
 
@@ -634,16 +656,28 @@ bits, because C's `long` is 32 bits on Windows. clang does not cut,
 because signed overflow is undefined in C. Proving that no overflow can
 happen, and so leaving the cut out, would win that back.
 
-Floats: a 5-body simulation, 1 million steps, mean of 7 runs. Both print
-the same energies.
+Floats, fastest and median of 11 interleaved runs. Both print the same
+results.
 
 | | Strike | clang -O2 | Strike against clang -O2 |
 |---|---|---|---|
-| n-body | 0.147 s | 0.054 s | 2.7 times as slow |
+| midpoint integration of 4/(1+x²), 50 million steps | 0.050 / 0.054 s | 0.055 / 0.058 s | 7-10% faster |
+| n-body, 5 bodies, 1 million steps | 0.087 / 0.087 s | 0.052 / 0.054 s | 1.6 times as slow |
+| 300x300 matrix product (`double`), 4 times | 0.031 / 0.032 s | 0.017 / 0.018 s | 1.8 times as slow |
 
-A float local lives in a general register today, so each use is a move
-to an xmm register and back; float locals in xmm registers are being
-built.
+Float locals in xmm registers brought the n-body from 0.147 s to 0.087 s,
+and the integration from 0.097 s to 0.050 s.
+
+clang does no FMA here: x86-64 without `-march` has none, so the two do
+the same roundings. The rest of the gap is two things Strike does not do
+yet:
+
+- **The matrix product.** clang vectorizes it with `mulpd` and `addpd`,
+  two elements an instruction. Strike's loop is six scalar instructions an
+  element.
+- **The n-body.** clang loads `x[i]` and `m[i]` once outside the inner
+  loop. Its alias analysis knows that the stores to `vx` cannot reach
+  them. Strike loads them every time round.
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds
