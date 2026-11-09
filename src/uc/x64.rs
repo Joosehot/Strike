@@ -93,8 +93,11 @@ impl Asm {
     }
     pub(super) fn prologue(&mut self, frame: i32) {
         self.e(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp, rsp
-        // Windows grows the stack one guard page at a time: a frame larger
-        // than a page touches every page on its way down
+        self.grow_stack(frame);
+    }
+    /// sub rsp, frame. Windows grows the stack one guard page at a time: a
+    /// frame larger than a page touches every page on its way down.
+    pub(super) fn grow_stack(&mut self, frame: i32) {
         let pages = frame / 4096;
         if pages > 0 {
             let top = self.label();

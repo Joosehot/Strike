@@ -274,7 +274,53 @@ fib(36), the last four of five runs:
 
 One level takes fib from 0.041 s to 0.035 s, within 10% of clang -O2.
 More levels gave no gain that stands out from the noise, so the rule
-stays at one. A release build of big.c takes 0.08 s, with all 2000 calls in
+stays at one.
+
+What was still slow in that code, and is now fixed:
+
+1. **The frame.** Saving four registers to memory under an rbp frame cost
+   about 13 instructions per call. The frame now has no rbp: the saved
+   registers are pushed and popped. A local in memory is addressed from
+   rsp, because the generator knows at every operation how much has been
+   pushed since.
+2. **An unrolled copy's value went through the stack** (`push rax; jmp;
+   pop rax`). A value that crosses a jump now stays in rax. Every label
+   records what it expects (how much is pushed, and whether the top is in
+   rax), and every jump to it delivers that. A jump to the very next
+   instruction is left out.
+3. **The test ran twice.** After the fast path's test has failed, the full
+   function stores its constants and jumps straight to the rest of the
+   function.
+4. **Zeros were stored twice.** A store of zero into a slot already known
+   to be zero is left out.
+5. **`n - 1` took three instructions.** A local in a register plus or
+   minus a constant now waits as a lazy value and becomes one `lea` into
+   wherever it goes (`lea rcx, [rdi-1]`).
+
+Two bugs turned up while fixing these, and both are fixed:
+
+- **A loop that never ended.** Code that nothing falls into is not
+  emitted. A loop's top looked like such code where only later jumps came
+  back to it, so it was dropped.
+- **A release build stopped with a panic.** Folding constants had left
+  jumps in code that is never reached. Those jumps were counted, and a
+  label was given the wrong depth.
+
+The random-program test found the second one. Both are now settled by one
+pass: it follows every way through the IR from the start, and records
+which operations are reached and the depth of the stack at each.
+
+The last four of five runs:
+
+| | fib(36) | 30 million calls | primes |
+|---|---|---|---|
+| **Strike** | **0.029-0.030 s** | **0.083-0.086 s** | 0.022-0.023 s |
+| clang -O2 | 0.031-0.033 s | 0.101-0.102 s | 0.020 s |
+| clang -O0 | 0.057-0.058 s | 0.125-0.126 s | 0.021-0.022 s |
+| go | 0.057-0.058 s | 0.091-0.092 s | 0.026-0.027 s |
+
+On calls, Strike's code is now as fast as clang -O2 or faster. On loops
+of division it is within 10% of it. A release build of big.c takes 0.08 s, with all 2000 calls in
 main inlined.
 
 Compiling big.c (2000 functions) with the optimizing generator takes
