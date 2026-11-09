@@ -25,7 +25,8 @@ pub struct Tok {
 
 fn ends_value(t: &T, l: &Lang) -> bool {
     match t {
-        T::Ident(s) => !l.keywords.contains(s) || l.end_after.contains(s),
+        // a type's name ends a line as any name does (Go's `var x int`)
+        T::Ident(s) => !l.keywords.contains(s) || l.end_after.contains(s) || l.type_words.contains(s),
         T::Num(_) | T::Str(_) => true,
         T::Punct(p) => l.end_after.contains(p),
         _ => false,

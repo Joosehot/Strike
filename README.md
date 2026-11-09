@@ -111,8 +111,21 @@ file, not a new compiler. There are three today: C, Go and Python.
 ### What it compiles today
 
 Integers and truth values, functions and recursion, if/else, while, for,
-Python's `range`, break and continue, and printing (print, Println, puts,
-and printf with `%d`, `%s` and `%v`).
+Python's `range`, break and continue, printing (print, Println, puts,
+and printf with `%d`, `%s` and `%v`), global variables, and whole numbers
+read from standard input.
+
+- **Globals.** C's and Go's variables outside functions get their first
+  values before main runs. Python's module names are read by functions, and
+  `global x` lets a function change one. Python's own rule holds too: a name
+  a function assigns anywhere is its own, so reading it before that is an
+  error, as Python's UnboundLocalError is.
+- **Input.** C's `scanf("%d", &x)` and Go's `fmt.Scan(&x)` skip blanks and
+  read a number; with none, the variable keeps its value. Python's
+  `int(input())` takes a whole line. A line that is not a whole number, no
+  line at all, or a number past 64 bits stops the program, with Python's
+  reason. Input is read 4096 bytes at a time. A program that reads its input
+  is never worked out while compiling.
 
 Integers are exactly what each language says they are:
 
@@ -159,7 +172,9 @@ the line and the reason, and never guessed. Refused today:
 - Unit tests check the magic division against real division, the
   binomials against exact numbers, and the closed form of sums against the
   loop for 300 random polynomials, with overflow.
-- 37 tests in all, in about 25 s.
+- Globals and input are checked against clang, Go and Python with the
+  same input, in every mode, and Python's input errors one by one.
+- 41 tests in all, in about 25 s.
 
 The tests have found real bugs, all fixed:
 
@@ -283,11 +298,11 @@ take 0.2 s.
 To compile ordinary programs, these are still missing, in the order they
 are planned:
 
-1. Input (standard input, command-line arguments) and global variables.
-2. Arrays and strings, with a heap and an allocator under them.
-3. Floats.
-4. Structs and classes.
-5. Several files and modules, and C's preprocessor. Today a `#` line is
+1. Arrays and strings, with a heap and an allocator under them (then
+   command-line arguments, which are strings).
+2. Floats.
+3. Structs and classes.
+4. Several files and modules, and C's preprocessor. Today a `#` line is
    skipped. It must become a preprocessor, or be refused.
 
 After those come garbage collection (for Python's and Go's objects),

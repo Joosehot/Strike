@@ -160,6 +160,16 @@ pub enum Op {
     /// the top cut to its low n bits and sign-extended back (a C int, a Go
     /// int32: what a result of that width is)
     Sext(u8),
+    /// a program-wide variable (a C or Go global, a Python module name):
+    /// pushed, or popped into
+    LoadG(u32),
+    StoreG(u32),
+    /// reads a whole number from standard input and pushes it, then pushes
+    /// 1; or, when there is none, pushes 0 and 0 (C's scanf, Go's Scan)
+    ReadToken,
+    /// reads a line from standard input and pushes the whole number it is;
+    /// stops the program when it is not one (Python's int(input()))
+    ReadLine,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +253,10 @@ impl Func {
                     (15, 0)
                 }
                 Op::Sext(n) => (16, *n as i64),
+                Op::LoadG(g) => (17, *g as i64),
+                Op::StoreG(g) => (18, *g as i64),
+                Op::ReadToken => (19, 0),
+                Op::ReadLine => (20, 0),
             };
             h.update(&[tag]);
             h.update(&a.to_le_bytes());

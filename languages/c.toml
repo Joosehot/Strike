@@ -84,6 +84,15 @@ place = "top"
 pattern = "$type $name ( $params ) $block"
 
 [[form]]
+kind = "var"
+place = "top"
+pattern = "$type $name [ = $expr ] ;"
+
+[[form]]
+kind = "read"
+pattern = "scanf ( $str , & $name ) $end"
+
+[[form]]
 kind = "return"
 pattern = "return [ $expr ] $end"
 

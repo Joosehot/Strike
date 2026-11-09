@@ -25,14 +25,50 @@ struct Sig {
 pub struct Lowered {
     pub funcs: Vec<Func>,
     pub entry: String,
+    /// how many program-wide variables there are
+    pub globals: u32,
 }
 
 type E = (u32, String);
 
 const TOP: &str = "top.";
+/// where a C or Go program's globals get their first values, then main runs
+const INIT: &str = "init.";
+/// the bit that marks a slot number as a global's
+const GLOBAL: u32 = 1 << 31;
 
 fn symbol(name: &str) -> String {
     format!("u.{name}")
+}
+
+/// Every name a body assigns, in its blocks too.
+fn assigned_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(body: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        for s in body {
+            match s {
+                Stmt::Var { name, .. } | Stmt::Assign { name, .. } | Stmt::ForRange { name, .. } | Stmt::Read { name, .. } => {
+                    out.insert(name.clone());
+                }
+                _ => {}
+            }
+            match s {
+                Stmt::If { then, els, .. } => {
+                    walk(then, out);
+                    walk(els, out);
+                }
+                Stmt::While { body, .. } | Stmt::ForRange { body, .. } => walk(body, out),
+                Stmt::For { init, step, body, .. } => {
+                    walk(std::slice::from_ref(init), out);
+                    walk(std::slice::from_ref(step), out);
+                    walk(body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }
 
 fn always_returns(body: &[Stmt]) -> bool {
@@ -91,6 +127,10 @@ struct Shared<'a> {
     args: HashMap<String, Vec<Vec<Ty>>>,
     /// calls whose result is used: (callee, line)
     used: Vec<(String, u32)>,
+    /// the program's variables: name -> (slot with GLOBAL set, kind)
+    globals: HashMap<String, (u32, Ty)>,
+    gwidths: HashMap<u32, u8>,
+    nglobals: u32,
 }
 
 struct Fx<'s, 'a> {
@@ -110,6 +150,12 @@ struct Fx<'s, 'a> {
     last_w: u8,
     /// the width of what this function returns
     ret_w: u8,
+    /// this is the code at the top level: what it declares is the program's
+    globals_here: bool,
+    /// Python's `global` names in this function
+    global_names: std::collections::HashSet<String>,
+    /// every name this function assigns (Python: they are its own)
+    assigned: std::collections::HashSet<String>,
 }
 
 impl Fx<'_, '_> {
@@ -134,17 +180,59 @@ impl Fx<'_, '_> {
             Ty::Int
         }
     }
+    /// A name as the language finds it: the function's own first, then the
+    /// program's. In Python a name the function assigns anywhere is its own
+    /// even before that assignment (unless it is declared `global`).
     fn lookup(&self, name: &str) -> Option<(u32, Ty)> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+        if !self.global_names.contains(name) {
+            if let Some(x) = self.scopes.iter().rev().find_map(|s| s.get(name).copied()) {
+                return Some(x);
+            }
+            if !self.sh.l.block_scope && !self.globals_here && self.assigned.contains(name) {
+                return None;
+            }
+        }
+        self.sh.globals.get(name).copied()
     }
+    /// A new variable: the program's where the code at the top level makes
+    /// it (or Python's `global` names it), else the function's own.
     fn declare(&mut self, name: &str, ty: Ty) -> u32 {
+        if self.globals_here || self.global_names.contains(name) {
+            let g = GLOBAL | self.sh.nglobals;
+            self.sh.nglobals += 1;
+            self.sh.globals.insert(name.to_string(), (g, ty));
+            return g;
+        }
         let slot = self.slots;
         self.slots += 1;
         self.scopes.last_mut().unwrap().insert(name.to_string(), (slot, ty));
         slot
     }
+    fn load(&mut self, slot: u32) {
+        self.emit(if slot & GLOBAL != 0 { Op::LoadG(slot & !GLOBAL) } else { Op::Load(slot) });
+    }
+    fn store(&mut self, slot: u32) {
+        self.emit(if slot & GLOBAL != 0 { Op::StoreG(slot & !GLOBAL) } else { Op::Store(slot) });
+    }
     fn width(&self, slot: u32) -> u8 {
-        self.widths.get(&slot).copied().unwrap_or(64)
+        let w = if slot & GLOBAL != 0 { self.sh.gwidths.get(&slot) } else { self.widths.get(&slot) };
+        w.copied().unwrap_or(64)
+    }
+    fn set_width(&mut self, slot: u32, w: u8) {
+        if slot & GLOBAL != 0 {
+            self.sh.gwidths.insert(slot, w);
+        } else {
+            self.widths.insert(slot, w);
+        }
+    }
+    /// The error for a name that cannot be found, saying why.
+    fn unknown<X>(&self, name: &str) -> Result<X, E> {
+        if !self.sh.l.block_scope && self.assigned.contains(name) && self.sh.globals.contains_key(name) {
+            return self.err(format!(
+                "{name} is read before this function assigns it; Python makes it the function's own because it is assigned here (say `global {name}` to mean the module's)"
+            ));
+        }
+        self.err(format!("{name} is not declared"))
     }
     fn typed(&self) -> bool {
         !self.sh.l.int_widths.is_empty()
@@ -231,7 +319,8 @@ impl Fx<'_, '_> {
                         Ty::Int
                     }
                 };
-                if self.sh.l.block_scope && self.scopes.last().unwrap().contains_key(name) {
+                let twice = if self.globals_here { self.sh.globals.contains_key(name) } else { self.scopes.last().unwrap().contains_key(name) };
+                if self.sh.l.block_scope && twice {
                     return self.err(format!("{name} is declared twice in one block"));
                 }
                 let slot = match (self.sh.l.block_scope, self.lookup(name)) {
@@ -241,30 +330,30 @@ impl Fx<'_, '_> {
                     }
                     _ => {
                         let s = self.declare(name, ty);
-                        self.widths.insert(s, dw);
+                        self.set_width(s, dw);
                         s
                     }
                 };
-                self.emit(Op::Store(slot));
+                self.store(slot);
             }
             Stmt::Assign { name, op, value, line } => {
                 self.line = *line;
                 match op {
                     Some(op) => {
                         let Some((slot, was)) = self.lookup(name) else {
-                            return self.err(format!("{name} is not declared"));
+                            return self.unknown(name);
                         };
                         if was == Ty::Bool {
                             return self.err(format!("{name} holds a truth value; Strike does not do arithmetic into it"));
                         }
-                        self.emit(Op::Load(slot));
+                        self.load(slot);
                         self.expr(value, true)?;
                         let op = if self.sh.l.checked { op.checked() } else { *op };
                         self.emit(Op::Bin(op));
                         // done at the promoted width, then put back in the variable's
                         let w = self.width(slot);
                         self.narrow(w, 64)?;
-                        self.emit(Op::Store(slot));
+                        self.store(slot);
                     }
                     None => {
                         let ty = self.expr(value, true)?;
@@ -275,11 +364,11 @@ impl Fx<'_, '_> {
                                 slot
                             }
                             None if !self.sh.l.block_scope => self.declare(name, ty),
-                            None => return self.err(format!("{name} is not declared")),
+                            None => return self.unknown(name),
                         };
                         let w = self.width(slot);
                         self.narrow(w, from)?;
-                        self.emit(Op::Store(slot));
+                        self.store(slot);
                     }
                 }
             }
@@ -348,16 +437,16 @@ impl Fx<'_, '_> {
                     }
                     None => self.emit(Op::Push(0)),
                 }
-                self.emit(Op::Store(counter));
+                self.store(counter);
                 self.expr(stop, true)?;
-                self.emit(Op::Store(end));
+                self.store(end);
                 match step {
                     Some(c) => {
                         self.expr(c, true)?;
                     }
                     None => self.emit(Op::Push(1)),
                 }
-                self.emit(Op::Store(by));
+                self.store(by);
                 let var = match self.lookup(name) {
                     Some((slot, was)) => {
                         self.same(name, was, Ty::Int)?;
@@ -369,18 +458,18 @@ impl Fx<'_, '_> {
                 self.emit(Op::Label(top));
                 match fixed {
                     Some(v) => {
-                        self.emit(Op::Load(counter));
-                        self.emit(Op::Load(end));
+                        self.load(counter);
+                        self.load(end);
                         self.emit(Op::Bin(if v > 0 { BinOp::Lt } else { BinOp::Gt }));
                     }
                     None => {
                         // (step > 0 and i < end) or (step < 0 and i > end)
                         for (sign, cmp) in [(BinOp::Gt, BinOp::Lt), (BinOp::Lt, BinOp::Gt)] {
-                            self.emit(Op::Load(by));
+                            self.load(by);
                             self.emit(Op::Push(0));
                             self.emit(Op::Bin(sign));
-                            self.emit(Op::Load(counter));
-                            self.emit(Op::Load(end));
+                            self.load(counter);
+                            self.load(end);
                             self.emit(Op::Bin(cmp));
                             self.emit(Op::Bin(BinOp::Band));
                         }
@@ -388,16 +477,16 @@ impl Fx<'_, '_> {
                     }
                 }
                 self.emit(Op::Jz(done));
-                self.emit(Op::Load(counter));
-                self.emit(Op::Store(var));
+                self.load(counter);
+                self.store(var);
                 self.loops.push((cont, done));
                 self.block(body)?;
                 self.loops.pop();
                 self.emit(Op::Label(cont));
-                self.emit(Op::Load(counter));
-                self.emit(Op::Load(by));
+                self.load(counter);
+                self.load(by);
                 self.emit(Op::Bin(BinOp::Add));
-                self.emit(Op::Store(counter));
+                self.store(counter);
                 self.emit(Op::Jmp(top));
                 self.emit(Op::Label(done));
             }
@@ -431,6 +520,34 @@ impl Fx<'_, '_> {
             Stmt::Expr(e) => {
                 self.expr(e, false)?;
                 self.emit(Op::Pop);
+            }
+            Stmt::Global(name, line) => {
+                self.line = *line;
+                self.global_names.insert(name.clone());
+            }
+            Stmt::Read { name, fmt, line } => {
+                self.line = *line;
+                if let Some(f) = fmt {
+                    if !matches!(f.as_slice(), b"%d" | b"%i" | b"%ld" | b"%li" | b"%lld" | b"%lli") {
+                        return self.err("scanf reads one whole number (%d) in this stage of Strike");
+                    }
+                }
+                let Some((slot, ty)) = self.lookup(name) else { return self.unknown(name) };
+                if ty == Ty::Bool && self.sh.bools {
+                    return self.err(format!("{name} holds a truth value; a number is read into it"));
+                }
+                // the number and whether there was one; with none the
+                // variable keeps its value, as scanf and Scan leave it
+                let (none, end) = (self.label(), self.label());
+                self.emit(Op::ReadToken);
+                self.emit(Op::Jz(none));
+                let w = self.width(slot);
+                self.narrow(w, 64)?;
+                self.store(slot);
+                self.emit(Op::Jmp(end));
+                self.emit(Op::Label(none));
+                self.emit(Op::Pop);
+                self.emit(Op::Label(end));
             }
             Stmt::Nothing => {}
         }
@@ -565,14 +682,29 @@ impl Fx<'_, '_> {
             Expr::Var(name, line) => {
                 self.line = *line;
                 let Some((slot, ty)) = self.lookup(name) else {
-                    return self.err(format!("{name} is not declared"));
+                    return self.unknown(name);
                 };
-                self.emit(Op::Load(slot));
+                self.load(slot);
                 self.last_w = self.width(slot);
                 ty
             }
             Expr::Call(name, args, line) => {
                 self.line = *line;
+                // Python's int(input()): a line read as a whole number
+                if let Some((outer, inner)) = &self.sh.l.read_line {
+                    if !self.sh.sigs.contains_key(name) {
+                        if let [Expr::Call(i, a, _)] = args.as_slice() {
+                            if name == outer && i == inner && a.is_empty() {
+                                self.emit(Op::ReadLine);
+                                self.last_w = 64;
+                                return Ok(Ty::Int);
+                            }
+                        }
+                        if name == inner {
+                            return self.err(format!("{inner}() gives a string, and strings are not in Strike yet; {outer}({inner}()) reads a whole number"));
+                        }
+                    }
+                }
                 let Some(sig) = self.sh.sigs.get(name).cloned() else {
                     return self.err(format!("there is no function {name}"));
                 };
@@ -701,11 +833,19 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             return Err((f.line, format!("{} has two parameters named {d}", f.name)));
         }
     }
+    // a C or Go program with variables outside its functions: init. gives
+    // them their first values, then runs main
+    let has_init = !l.toplevel_entry && !p.top.is_empty();
+    if has_init {
+        if let Some(Stmt::Print { line, .. } | Stmt::Assign { line, .. } | Stmt::Return(_, line)) = p.top.iter().find(|s| !matches!(s, Stmt::Var { .. })) {
+            return Err((*line, "only variables are declared outside a function".into()));
+        }
+    }
     let entry = if l.toplevel_entry {
         TOP.to_string()
     } else {
         match table.get("main") {
-            Some(m) if m.params.is_empty() => symbol("main"),
+            Some(m) if m.params.is_empty() => if has_init { INIT.to_string() } else { symbol("main") },
             Some(m) => return Err((m.line, "main takes no parameters in this stage of Strike".into())),
             None => return Err((1, "there is no main function".into())),
         }
@@ -720,20 +860,19 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
     let mut sigs: HashMap<String, Sig> =
         p.funcs.iter().map(|f| (f.name.clone(), Sig { params: vec![Ty::Int; f.params.len()], ret: Ty::Int })).collect();
     for _round in 0..10 {
-        let mut sh = Shared { l, bools, sigs: &sigs, fw: &fw, args: HashMap::new(), used: Vec::new() };
+        let mut sh = Shared { l, bools, sigs: &sigs, fw: &fw, args: HashMap::new(), used: Vec::new(), globals: HashMap::new(), gwidths: HashMap::new(), nglobals: 0 };
         let mut funcs = Vec::new();
         let mut rets: HashMap<String, Vec<(Ty, u32)>> = HashMap::new();
-        let mut bodies: Vec<(String, u32, Vec<(String, Ty)>, &[Stmt], bool)> = p
-            .funcs
-            .iter()
-            .map(|f| {
-                let ps = f.params.iter().cloned().zip(sigs[&f.name].params.iter().copied()).collect();
-                (f.name.clone(), f.line, ps, f.body.as_slice(), false)
-            })
-            .collect();
-        if l.toplevel_entry {
+        // the top level first: the globals it declares are seen by every
+        // function
+        let mut bodies: Vec<(String, u32, Vec<(String, Ty)>, &[Stmt], bool)> = Vec::new();
+        if l.toplevel_entry || has_init {
             bodies.push((String::new(), 1, Vec::new(), p.top.as_slice(), true));
         }
+        bodies.extend(p.funcs.iter().map(|f| {
+            let ps = f.params.iter().cloned().zip(sigs[&f.name].params.iter().copied()).collect();
+            (f.name.clone(), f.line, ps, f.body.as_slice(), false)
+        }));
         for (name, line, params, body, top) in bodies {
             let (pw, ret_w) = fw.get(&name).cloned().unwrap_or_default();
             let mut fx = Fx {
@@ -749,20 +888,31 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                 widths: HashMap::new(),
                 last_w: 64,
                 ret_w: if top { 64 } else { ret_w },
+                globals_here: top,
+                global_names: Default::default(),
+                assigned: if top { Default::default() } else { assigned_names(body) },
             };
             for (i, (n, t)) in params.iter().enumerate() {
                 let s = fx.declare(n, *t);
-                fx.widths.insert(s, pw.get(i).copied().unwrap_or(64));
+                fx.set_width(s, pw.get(i).copied().unwrap_or(64));
             }
             fx.push_scope();
             for s in body {
                 fx.stmt(s)?;
             }
             fx.pop_scope();
-            fx.emit(Op::Push(0));
+            if top && has_init {
+                fx.emit(Op::Call(symbol("main"), 0));
+            } else {
+                fx.emit(Op::Push(0));
+            }
             fx.emit(Op::Ret);
             let f = Func {
-                name: if top { TOP.to_string() } else { symbol(&name) },
+                name: match (top, has_init) {
+                    (true, true) => INIT.to_string(),
+                    (true, false) => TOP.to_string(),
+                    _ => symbol(&name),
+                },
                 params: params.len() as u32,
                 slots: fx.slots,
                 code: fx.code,
@@ -777,6 +927,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                 return Err((*line, format!("the value of {callee} is used, but {callee} can end without returning one")));
             }
         }
+        let globals = sh.nglobals;
         let mut next = sigs.clone();
         for (name, rs) in &rets {
             let tys: Vec<Ty> = rs.iter().map(|r| r.0).collect();
@@ -791,7 +942,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             }
         }
         if next == sigs {
-            return Ok(Lowered { funcs, entry });
+            return Ok(Lowered { funcs, entry, globals });
         }
         sigs = next;
     }

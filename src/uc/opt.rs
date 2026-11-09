@@ -46,8 +46,12 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 }
                 st.push(None);
             }
-            Op::Dup => st.push(None),
-            Op::Store(_) | Op::Pop | Op::PrintInt => {
+            Op::Dup | Op::LoadG(_) | Op::ReadLine => st.push(None),
+            Op::ReadToken => {
+                st.push(None);
+                st.push(None);
+            }
+            Op::Store(_) | Op::StoreG(_) | Op::Pop | Op::PrintInt => {
                 st.pop();
             }
             Op::PrintStr(_) => {}

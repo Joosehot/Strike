@@ -1,6 +1,7 @@
 //! The functions' machine code to a Windows executable (PE32+), written
-//! whole by Strike: no linker. Two sections: .text (the code) and .rdata
-//! (the strings and the import table of KERNEL32). The image has a fixed
+//! whole by Strike: no linker. Three sections: .text (the code), .rdata
+//! (the strings and the import table of KERNEL32) and .bss (zeros the
+//! program writes: its globals, the input buffer). The image has a fixed
 //! base, so nothing is relocated when it loads.
 
 use super::x64::{Code, Target, IMPORTS};
@@ -92,6 +93,15 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     rdata.extend(hint_names);
     rdata.extend_from_slice(b"KERNEL32.dll\0");
     let rdata_len = rdata.len() as u32;
+    // .bss: as far as the furthest place written (8 bytes each)
+    let bss_len = funcs
+        .iter()
+        .flat_map(|(_, c)| c.relocs.iter())
+        .filter_map(|(_, t)| if let Target::Writable(o) = t { Some(o + 8) } else { None })
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    let bss_rva = rdata_rva + align(rdata_len, SECTION);
 
     // every distance
     for (name, code) in funcs {
@@ -104,6 +114,7 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
                     rdata_rva + iat + 8 * i as u32
                 }
                 Target::Data(s) => rdata_rva + strings[s.as_slice()],
+                Target::Writable(o) => bss_rva + o,
             };
             let from = TEXT_RVA + base + field + 4;
             let rel = target.wrapping_sub(from) as i32;
@@ -116,7 +127,7 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     let text_raw = align(text_len.max(1), FILE);
     let rdata_raw = align(rdata_len, FILE);
     let headers = FILE;
-    let image = rdata_rva + align(rdata_len, SECTION);
+    let image = bss_rva + align(bss_len, SECTION);
 
     let mut b = Vec::with_capacity((headers + text_raw + rdata_raw) as usize);
     // DOS header: only its magic and where the PE header is
@@ -126,7 +137,7 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     b.extend_from_slice(b"PE\0\0");
     // COFF header
     u16le(&mut b, 0x8664);
-    u16le(&mut b, 2);
+    u16le(&mut b, 3);
     u32le(&mut b, 0);
     u32le(&mut b, 0);
     u32le(&mut b, 0);
@@ -137,7 +148,7 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     b.extend_from_slice(&[1, 0]);
     u32le(&mut b, text_raw);
     u32le(&mut b, rdata_raw);
-    u32le(&mut b, 0);
+    u32le(&mut b, align(bss_len, FILE));
     u32le(&mut b, entry_rva);
     u32le(&mut b, TEXT_RVA);
     u64le(&mut b, BASE);
@@ -170,6 +181,8 @@ pub fn link(funcs: &[(String, Code)], entry: &str) -> Result<Vec<u8>, String> {
     for (name, vsize, rva, raw, ptr, flags) in [
         (b".text\0\0\0", text_len, TEXT_RVA, text_raw, headers, 0x6000_0020u32),
         (b".rdata\0\0", rdata_len, rdata_rva, rdata_raw, headers + text_raw, 0x4000_0040),
+        // zeros, read and written, with nothing in the file
+        (b".bss\0\0\0\0", bss_len, bss_rva, 0, 0, 0xC000_0080),
     ] {
         b.extend_from_slice(name);
         u32le(&mut b, vsize);

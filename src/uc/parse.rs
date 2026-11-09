@@ -32,6 +32,9 @@ pub enum Stmt {
     Break(u32),
     Continue(u32),
     Print { style: Style, args: Vec<Expr>, line: u32 },
+    Global(String, u32),
+    /// a whole number read into name; fmt is C's scanf format
+    Read { name: String, fmt: Option<Vec<u8>>, line: u32 },
     Expr(Expr),
     Nothing,
 }
@@ -524,6 +527,8 @@ impl<'a> P<'a> {
             Kind::Continue => Stmt::Continue(line),
             Kind::Nothing => Stmt::Nothing,
             Kind::Print => Stmt::Print { style: f.style, args: c.args.pop().unwrap_or_default(), line },
+            Kind::Global => Stmt::Global(names.next().unwrap_or_default(), line),
+            Kind::Read => Stmt::Read { name: names.next().unwrap_or_default(), fmt: c.strs.pop(), line },
             Kind::Expr => Stmt::Expr(exprs.next().unwrap_or(Expr::Num(0, false))),
         };
         Parsed::Stmt(s)
@@ -562,7 +567,11 @@ impl<'a> P<'a> {
                 } else if let Some(&v) = l.bool_constants.get(&word) {
                     self.i += 1;
                     (Expr::Num(v, true), false)
-                } else if matches!(t, T::Ident(_)) && !l.keywords.contains(&word) {
+                } else if matches!(t, T::Ident(_))
+                    && (!l.keywords.contains(&word)
+                        // a type called like a function: Python's int(...)
+                        || (l.type_words.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "(")))
+                {
                     self.i += 1;
                     if self.eat("(") {
                         let a = self.args()?;

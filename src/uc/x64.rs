@@ -14,6 +14,8 @@ pub enum Target {
     Import(String),
     /// bytes in the read-only data
     Data(Vec<u8>),
+    /// an offset in the zeros the program writes (.bss)
+    Writable(u32),
 }
 
 /// A function's machine code, and the 32-bit fields still to be filled with
@@ -24,7 +26,7 @@ pub struct Code {
     pub relocs: Vec<(u32, Target)>,
 }
 
-pub const IMPORTS: [&str; 3] = ["GetStdHandle", "WriteFile", "ExitProcess"];
+pub const IMPORTS: [&str; 4] = ["GetStdHandle", "WriteFile", "ExitProcess", "ReadFile"];
 
 pub(super) struct Asm {
     pub(super) b: Vec<u8>,
@@ -186,6 +188,25 @@ pub fn compile(f: &Func) -> Code {
                 a.e(&[0x58]);
                 sext_reg(&mut a, 0, *n);
                 a.e(&[0x50]);
+            }
+            Op::LoadG(g) => {
+                a.e(&[0x48, 0x8B, 0x05]); // mov rax, [global]
+                a.reloc(global(*g));
+                a.e(&[0x50]);
+                depth += 1;
+            }
+            Op::StoreG(g) => {
+                a.e(&[0x58, 0x48, 0x89, 0x05]); // pop rax; mov [global], rax
+                a.reloc(global(*g));
+                depth -= 1;
+            }
+            Op::ReadToken => {
+                call(&mut a, "rt.read_token", 0, &mut depth, false);
+                a.e(&[0x50, 0x52]); // push rax (the number); push rdx (whether there was one)
+                depth += 2;
+            }
+            Op::ReadLine => {
+                call(&mut a, "rt.read_line", 0, &mut depth, true);
             }
             Op::Un(u) => {
                 a.e(&[0x58]);
@@ -387,6 +408,10 @@ pub fn runtime(entry: &str) -> Vec<(String, Code)> {
         ("rt.print_str".into(), print_str),
         ("rt.print_int".into(), print_int),
         ("rt.overflow".into(), overflow()),
+        ("rt.fail".into(), fail()),
+        ("rt.getc".into(), getc()),
+        ("rt.read_token".into(), read_token()),
+        ("rt.read_line".into(), read_line()),
     ]
 }
 
@@ -447,22 +472,234 @@ pub(super) fn trap(a: &mut Asm, at: u32) {
 /// What rt.overflow says, on standard error, before the program stops
 /// with exit code 1.
 pub const OVERFLOW: &[u8] = b"strike: a number grew past 64 bits here; this language's numbers do not stop there, and Strike has no larger numbers yet, so the program stops\n";
+const NOT_A_NUMBER: &[u8] = b"strike: the line read is not a whole number, so the program stops (Python's int() would raise ValueError)\n";
+const NO_LINE: &[u8] = b"strike: there was no line to read, so the program stops (Python's input() would raise EOFError)\n";
 
-fn overflow() -> Code {
+/// The zeros the program writes (.bss): the input buffer, where in it the
+/// next byte is and how many it holds, then the globals.
+const BUF: u32 = 0;
+const BUF_SIZE: i32 = 4096;
+const POS: u32 = 4096;
+const LEN: u32 = 4104;
+pub const GLOBALS: u32 = 4112;
+
+/// The place of global g in the zeros.
+pub fn global(g: u32) -> Target {
+    Target::Writable(GLOBALS + 8 * g)
+}
+
+/// rt.fail(rcx = message, rdx = its length): the message on standard
+/// error, then exit code 1.
+fn fail() -> Code {
     let mut a = Asm::new();
     a.e(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 56
+    a.e(&[0x48, 0x89, 0x4C, 0x24, 0x28]); // mov [rsp+40], rcx
+    a.e(&[0x48, 0x89, 0x54, 0x24, 0x30]); // mov [rsp+48], rdx
     a.e(&[0x48, 0xC7, 0xC1, 0xF4, 0xFF, 0xFF, 0xFF]); // mov rcx, -12 (standard error)
     a.call_import("GetStdHandle");
     a.e(&[0x48, 0x89, 0xC1]); // mov rcx, rax
-    a.e(&[0x48, 0x8D, 0x15]); // lea rdx, [rip + OVERFLOW]
-    a.reloc(Target::Data(OVERFLOW.to_vec()));
-    a.e(&[0x49, 0xC7, 0xC0]); // mov r8, len
-    a.d32(OVERFLOW.len() as i32);
+    a.e(&[0x48, 0x8B, 0x54, 0x24, 0x28]); // mov rdx, [rsp+40]
+    a.e(&[0x4C, 0x8B, 0x44, 0x24, 0x30]); // mov r8, [rsp+48]
     a.e(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9, [rsp+40]
     a.e(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+32], 0
     a.call_import("WriteFile");
     a.e(&[0xB9, 1, 0, 0, 0]); // mov ecx, 1
     a.call_import("ExitProcess");
+    a.e(&[0xCC]);
+    a.finish()
+}
+
+/// Calls rt.fail with a message (the stack aligned for a call).
+fn fail_with(a: &mut Asm, msg: &[u8]) {
+    a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [rip + msg]
+    a.reloc(Target::Data(msg.to_vec()));
+    a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, len
+    a.d32(msg.len() as i32);
+    a.call("rt.fail");
+}
+
+fn overflow() -> Code {
+    let mut a = Asm::new();
+    a.e(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 40
+    fail_with(&mut a, OVERFLOW);
+    a.e(&[0xCC]);
+    a.finish()
+}
+
+/// rt.getc: the next byte of standard input in rax, or -1 at its end. The
+/// input is read 4096 bytes at a time.
+fn getc() -> Code {
+    let mut a = Asm::new();
+    let (have, end) = (a.label(), a.label());
+    a.e(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 56
+    a.e(&[0x48, 0x8B, 0x05]); // mov rax, [pos]
+    a.reloc(Target::Writable(POS));
+    a.e(&[0x48, 0x3B, 0x05]); // cmp rax, [len]
+    a.reloc(Target::Writable(LEN));
+    a.jcc(0xC, have); // jl
+    // empty: read more
+    a.e(&[0x31, 0xC0, 0x48, 0x89, 0x05]); // xor eax, eax; mov [len], rax
+    a.reloc(Target::Writable(LEN));
+    a.e(&[0x48, 0xC7, 0xC1, 0xF6, 0xFF, 0xFF, 0xFF]); // mov rcx, -10 (standard input)
+    a.call_import("GetStdHandle");
+    a.e(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+    a.e(&[0x48, 0x8D, 0x15]); // lea rdx, [buf]
+    a.reloc(Target::Writable(BUF));
+    a.e(&[0x49, 0xC7, 0xC0]); // mov r8, 4096
+    a.d32(BUF_SIZE);
+    a.e(&[0x4C, 0x8D, 0x0D]); // lea r9, [len] (ReadFile writes 32 bits of it)
+    a.reloc(Target::Writable(LEN));
+    a.e(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov qword [rsp+32], 0
+    a.call_import("ReadFile");
+    a.e(&[0x31, 0xC0, 0x48, 0x89, 0x05]); // xor eax, eax; mov [pos], rax
+    a.reloc(Target::Writable(POS));
+    a.e(&[0x48, 0x3B, 0x05]); // cmp rax, [len]
+    a.reloc(Target::Writable(LEN));
+    a.jcc(0xC, have);
+    a.e(&[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rax, -1
+    a.jmp(end);
+    a.bind(have);
+    a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [buf]
+    a.reloc(Target::Writable(BUF));
+    a.e(&[0x0F, 0xB6, 0x04, 0x01]); // movzx eax, byte [rcx + rax]
+    a.e(&[0x48, 0xFF, 0x05]); // inc qword [pos]
+    a.reloc(Target::Writable(POS));
+    a.bind(end);
+    a.e(&[0x48, 0x83, 0xC4, 0x38, 0xC3]); // add rsp, 56; ret
+    a.finish()
+}
+
+/// Gives back the byte rt.getc returned last (not at the input's end).
+fn unget(a: &mut Asm) {
+    a.e(&[0x48, 0xFF, 0x0D]); // dec qword [pos]
+    a.reloc(Target::Writable(POS));
+}
+
+/// rt.read_token: blanks skipped, then an optional sign and digits.
+/// rax = the number and rdx = 1, or rdx = 0 where there is none (the byte
+/// that is not a digit stays to be read, as C's scanf leaves it).
+fn read_token() -> Code {
+    let mut a = Asm::new();
+    let (skip, not_minus, first, digits, done, positive, fail_unget, fail, out) =
+        (a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label());
+    a.e(&[0x53, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x20]); // push rbx, rsi, rdi; sub rsp, 32
+    a.bind(skip);
+    a.call("rt.getc");
+    a.e(&[0x48, 0x83, 0xF8, 0xFF]); // cmp rax, -1
+    a.jcc(4, fail);
+    for blank in [32u8, 9, 10, 13, 11, 12] {
+        a.e(&[0x48, 0x83, 0xF8, blank]);
+        a.jcc(4, skip);
+    }
+    a.e(&[0x31, 0xF6]); // xor esi, esi (not negative)
+    a.e(&[0x48, 0x83, 0xF8, b'-']);
+    a.jcc(5, not_minus);
+    a.e(&[0xBE, 1, 0, 0, 0]); // mov esi, 1
+    a.call("rt.getc");
+    a.jmp(first);
+    a.bind(not_minus);
+    a.e(&[0x48, 0x83, 0xF8, b'+']);
+    a.jcc(5, first);
+    a.call("rt.getc");
+    a.bind(first);
+    a.e(&[0x48, 0x89, 0xC7, 0x48, 0x83, 0xEF, 0x30, 0x48, 0x83, 0xFF, 0x09]); // rdi = rax - '0'; cmp rdi, 9
+    a.jcc(7, fail_unget); // above, unsigned: not a digit
+    a.e(&[0x31, 0xDB]); // xor ebx, ebx
+    a.bind(digits);
+    a.e(&[0x48, 0x6B, 0xDB, 0x0A, 0x48, 0x01, 0xFB]); // rbx = rbx * 10 + rdi
+    a.call("rt.getc");
+    a.e(&[0x48, 0x89, 0xC7, 0x48, 0x83, 0xEF, 0x30, 0x48, 0x83, 0xFF, 0x09]);
+    a.jcc(6, digits); // below or equal, unsigned: a digit
+    a.e(&[0x48, 0x83, 0xF8, 0xFF]);
+    a.jcc(4, done);
+    unget(&mut a);
+    a.bind(done);
+    a.e(&[0x48, 0x89, 0xD8, 0x48, 0x85, 0xF6]); // mov rax, rbx; test rsi, rsi
+    a.jcc(4, positive);
+    a.e(&[0x48, 0xF7, 0xD8]); // neg rax
+    a.bind(positive);
+    a.e(&[0xBA, 1, 0, 0, 0]); // mov edx, 1
+    a.jmp(out);
+    a.bind(fail_unget);
+    a.e(&[0x48, 0x83, 0xF8, 0xFF]);
+    a.jcc(4, fail);
+    unget(&mut a);
+    a.bind(fail);
+    a.e(&[0x31, 0xC0, 0x31, 0xD2]); // xor eax, eax; xor edx, edx
+    a.bind(out);
+    a.e(&[0x48, 0x83, 0xC4, 0x20, 0x5F, 0x5E, 0x5B, 0xC3]); // add rsp, 32; pop rdi, rsi, rbx; ret
+    a.finish()
+}
+
+/// rt.read_line: one line, which must be a whole number with blanks
+/// around it at most, as Python's int(input()) takes it; anything else
+/// stops the program with Python's reason, and a number past 64 bits with
+/// the overflow's.
+fn read_line() -> Code {
+    let mut a = Asm::new();
+    let (next, ws, read, not_minus, digit, end_line, positive, bad, no_line, too_big) =
+        (a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label());
+    // rbx the number, rsi negative, rdi how many digits, r12 where: 0
+    // before it, 1 in it, 2 after it
+    a.e(&[0x53, 0x56, 0x57, 0x41, 0x54, 0x48, 0x83, 0xEC, 0x28]); // push rbx, rsi, rdi, r12; sub rsp, 40
+    a.e(&[0x31, 0xDB, 0x31, 0xF6, 0x31, 0xFF, 0x45, 0x31, 0xE4]);
+    a.call("rt.getc");
+    a.e(&[0x48, 0x83, 0xF8, 0xFF]);
+    a.jcc(4, no_line);
+    a.bind(next);
+    a.e(&[0x48, 0x83, 0xF8, 0x0A]); // cmp rax, '\n'
+    a.jcc(4, end_line);
+    a.e(&[0x48, 0x83, 0xF8, 0xFF]);
+    a.jcc(4, end_line);
+    for blank in [32u8, 9, 13, 11, 12] {
+        a.e(&[0x48, 0x83, 0xF8, blank]);
+        a.jcc(4, ws);
+    }
+    a.e(&[0x49, 0x83, 0xFC, 0x02]); // cmp r12, 2: something after the number
+    a.jcc(4, bad);
+    a.e(&[0x48, 0x83, 0xF8, b'-']);
+    a.jcc(5, not_minus);
+    a.e(&[0x49, 0x83, 0xFC, 0x00]); // a sign only before it
+    a.jcc(5, bad);
+    a.e(&[0xBE, 1, 0, 0, 0, 0x41, 0xBC, 1, 0, 0, 0]); // mov esi, 1; mov r12d, 1
+    a.jmp(read);
+    a.bind(not_minus);
+    a.e(&[0x48, 0x83, 0xF8, b'+']);
+    a.jcc(5, digit);
+    a.e(&[0x49, 0x83, 0xFC, 0x00]);
+    a.jcc(5, bad);
+    a.e(&[0x41, 0xBC, 1, 0, 0, 0]);
+    a.jmp(read);
+    a.bind(digit);
+    a.e(&[0x48, 0x89, 0xC1, 0x48, 0x83, 0xE9, 0x30, 0x48, 0x83, 0xF9, 0x09]); // rcx = rax - '0'; cmp rcx, 9
+    a.jcc(7, bad);
+    a.e(&[0x48, 0x6B, 0xDB, 0x0A]); // imul rbx, rbx, 10
+    a.jcc(0, too_big);
+    a.e(&[0x48, 0x01, 0xCB]); // add rbx, rcx
+    a.jcc(0, too_big);
+    a.e(&[0x48, 0xFF, 0xC7, 0x41, 0xBC, 1, 0, 0, 0]); // inc rdi; mov r12d, 1
+    a.jmp(read);
+    a.bind(ws);
+    a.e(&[0x49, 0x83, 0xFC, 0x01]); // blanks after the number end it
+    a.jcc(5, read);
+    a.e(&[0x41, 0xBC, 2, 0, 0, 0]);
+    a.bind(read);
+    a.call("rt.getc");
+    a.jmp(next);
+    a.bind(end_line);
+    a.e(&[0x48, 0x85, 0xFF]); // test rdi, rdi: no digit
+    a.jcc(4, bad);
+    a.e(&[0x48, 0x89, 0xD8, 0x48, 0x85, 0xF6]); // mov rax, rbx; test rsi, rsi
+    a.jcc(4, positive);
+    a.e(&[0x48, 0xF7, 0xD8]);
+    a.bind(positive);
+    a.e(&[0x48, 0x83, 0xC4, 0x28, 0x41, 0x5C, 0x5F, 0x5E, 0x5B, 0xC3]); // add rsp, 40; pop r12, rdi, rsi, rbx; ret
+    a.bind(bad);
+    fail_with(&mut a, NOT_A_NUMBER);
+    a.bind(no_line);
+    fail_with(&mut a, NO_LINE);
+    a.bind(too_big);
+    a.call("rt.overflow");
     a.e(&[0xCC]);
     a.finish()
 }

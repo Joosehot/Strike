@@ -128,7 +128,7 @@ struct Frame {
 }
 
 /// Runs the program from its entry; None when it cannot be finished here.
-pub fn run(funcs: &[Func], entry: &str, lim: &Limits) -> Option<Done> {
+pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Done> {
     let index: HashMap<&str, usize> = funcs.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
     let labels: Vec<Vec<usize>> = funcs
         .iter()
@@ -149,6 +149,7 @@ pub fn run(funcs: &[Func], entry: &str, lim: &Limits) -> Option<Done> {
     let mut locals: Vec<i64> = vec![0; funcs[first].slots as usize];
     let mut frames = vec![Frame { func: first, pc: 0, base: 0 }];
     let mut stack: Vec<i64> = Vec::new();
+    let mut global = vec![0i64; globals as usize];
     let mut output = Vec::new();
     let mut steps = 0u64;
     loop {
@@ -180,6 +181,11 @@ pub fn run(funcs: &[Func], entry: &str, lim: &Limits) -> Option<Done> {
                 });
             }
             Op::Dup => stack.push(*stack.last()?),
+            // what the program reads is not known here; a global is not kept
+            // what the program reads is not known here
+            Op::ReadToken | Op::ReadLine => return None,
+            Op::LoadG(g) => stack.push(global[*g as usize]),
+            Op::StoreG(g) => global[*g as usize] = stack.pop()?,
             Op::Sext(n) => {
                 let x = stack.pop()?;
                 stack.push(super::ir::sext(x, *n));

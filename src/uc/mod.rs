@@ -139,10 +139,15 @@ fn save(c: &Code) -> Vec<u8> {
     b.extend_from_slice(&(c.relocs.len() as u32).to_le_bytes());
     for (at, t) in &c.relocs {
         b.extend_from_slice(&at.to_le_bytes());
+        let offset: [u8; 4];
         let (kind, data) = match t {
             Target::Func(s) => (0u8, s.as_bytes()),
             Target::Import(s) => (1, s.as_bytes()),
             Target::Data(d) => (2, d.as_slice()),
+            Target::Writable(o) => {
+                offset = o.to_le_bytes();
+                (3, &offset[..])
+            }
         };
         b.push(kind);
         b.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -176,6 +181,7 @@ fn load(b: &[u8]) -> Option<Code> {
                 0 => Target::Func(String::from_utf8(data).ok()?),
                 1 => Target::Import(String::from_utf8(data).ok()?),
                 2 => Target::Data(data),
+                3 => Target::Writable(u32::from_le_bytes(data.try_into().ok()?)),
                 _ => return None,
             },
         ));
@@ -260,8 +266,12 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     let mut low = low;
     // --release: a program that reads nothing, worked out now
     let mut evaluated = None;
+    // a program that reads its input is never worked out while compiling:
+    // what it does depends on what it is given
+    let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine)));
+    let evaluate = evaluate && !reads;
     if gen == Gen::Release && evaluate {
-        if let Some(d) = eval::run(&low.funcs, &low.entry, &rules.release.evaluate) {
+        if let Some(d) = eval::run(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {
             let mut code = Vec::new();
             if !d.output.is_empty() {
                 code.push(ir::Op::PrintStr(d.output));

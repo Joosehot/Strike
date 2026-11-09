@@ -927,6 +927,18 @@ impl G {
         }
     }
 
+    /// rax made free for a new value: flags on top become a number first,
+    /// and a result already in rax is pushed.
+    fn fresh_rax(&mut self) {
+        if let Some(&V::Flags(cc)) = self.v.last() {
+            self.v.pop();
+            self.need_rax();
+            self.setcc_rax(cc);
+            self.v.push(V::Rax);
+        }
+        self.need_rax();
+    }
+
     fn sext(&mut self, n: u8) {
         match self.pop() {
             V::Imm(c) => self.v.push(V::Imm(super::ir::sext(c, n))),
@@ -1279,6 +1291,9 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 Op::Push(_) | Op::Load(_) | Op::Dup => 1,
                 Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret => -1,
                 Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) => 0,
+                Op::LoadG(_) | Op::ReadLine => 1,
+                Op::StoreG(_) => -1,
+                Op::ReadToken => 2,
                 Op::Call(_, n) => 1 - *n as i32,
             };
             match &code[i] {
@@ -1360,6 +1375,31 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             Op::Bin(b) => g.bin(*b, &mut new_label),
             Op::Un(u) => g.un(*u),
             Op::Sext(n) => g.sext(*n),
+            Op::LoadG(gl) => {
+                g.fresh_rax();
+                g.a.e(&[0x48, 0x8B, 0x05]); // mov rax, [global]
+                g.a.reloc(super::x64::global(*gl));
+                g.v.push(V::Rax);
+            }
+            Op::StoreG(gl) => {
+                let x = g.pop();
+                let r = if x == V::Rax { RAX } else { g.to_reg(x, R11); R11 };
+                g.a.e(&[rex(r, 0), 0x89, 0x05 | (r & 7) << 3]); // mov [global], r
+                g.a.reloc(super::x64::global(*gl));
+            }
+            Op::ReadToken => {
+                g.flush();
+                g.call_runtime("rt.read_token");
+                g.push_r(RAX);
+                g.v.push(V::Stack);
+                g.mov_rr(RAX, 2);
+                g.v.push(V::Rax);
+            }
+            Op::ReadLine => {
+                g.flush();
+                g.call_runtime("rt.read_line");
+                g.v.push(V::Rax);
+            }
             Op::Dup => match g.v.last().copied() {
                 Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..))) => g.push(x),
                 _ => {

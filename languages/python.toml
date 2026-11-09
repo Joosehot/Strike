@@ -18,6 +18,8 @@ chained_comparisons = "error"
 # Python's integers have no upper bound; Strike's are 64 bits, so where a
 # number would not fit the program stops with an error, never wrapping
 overflow = "error"
+# int(input()): a line read from standard input as a whole number
+read_line = ["int", "input"]
 bool_print = ["True", "False"]
 
 [bool_constants]
@@ -88,6 +90,10 @@ pattern = "continue $end"
 [[form]]
 kind = "nothing"
 pattern = "pass $end"
+
+[[form]]
+kind = "global"
+pattern = "global $name $end"
 
 [[form]]
 kind = "print"

@@ -43,6 +43,8 @@ struct Raw {
     #[serde(default)]
     overflow: Option<String>,
     #[serde(default)]
+    read_line: Option<[String; 2]>,
+    #[serde(default)]
     promote: Option<u8>,
     #[serde(default)]
     literals: Option<String>,
@@ -99,6 +101,10 @@ pub enum Kind {
     Nothing,
     Print,
     Expr,
+    /// Python's `global x`: x is the module's in this function
+    Global,
+    /// a whole number read from standard input into a variable
+    Read,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,6 +184,8 @@ pub struct Lang {
     pub promote: u8,
     /// a literal takes the width of what it meets (Go) instead of its own
     pub untyped_literals: bool,
+    /// the call that reads a whole line as a number: outer(inner())
+    pub read_line: Option<(String, String)>,
     pub bool_print: Option<(String, String)>,
     pub bool_constants: HashMap<String, i64>,
     pub binary: HashMap<String, (u8, BinOp)>,
@@ -279,6 +287,8 @@ impl Lang {
                 "nothing" => Kind::Nothing,
                 "print" => Kind::Print,
                 "expr" => Kind::Expr,
+                "global" => Kind::Global,
+                "read" => Kind::Read,
                 k => return Err(err(format!("unknown kind {k}"))),
             };
             let place = match f.place.as_deref() {
@@ -387,6 +397,7 @@ impl Lang {
                 c => return Err(err(format!("unknown chained_comparisons {c}"))),
             },
             int_widths: r.int_widths.clone().into_iter().collect(),
+            read_line: r.read_line.clone().map(|[a, b]| (a, b)),
             promote: r.promote.unwrap_or(0),
             untyped_literals: match r.literals.as_deref() {
                 None | Some("typed") => false,

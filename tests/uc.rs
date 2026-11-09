@@ -55,6 +55,77 @@ fn python_prints_what_python_prints() {
     runs_as_the_real_one("suite.py", "Python");
 }
 
+/// Builds a suite file in every mode and runs it with the given input:
+/// what it prints must be what the real toolchain printed for that input.
+fn runs_with_input_as_the_real_one(file: &str, input: &str) {
+    let want = std::fs::read(suite(&format!("{file}.out"))).unwrap();
+    let stdin = std::fs::read(suite(input)).unwrap();
+    let r = root(&format!("in-{file}"));
+    for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+        let exe = r.join("a.exe");
+        let o = compile_with(&r, &suite(file), &exe, &mode, None);
+        assert!(o.status.success(), "{file}: {}", text(&o));
+        let got = run_with(&exe, &stdin);
+        assert_eq!(String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&want), "{file} {mode:?}");
+    }
+}
+
+fn run_with(exe: &Path, stdin: &[u8]) -> Output {
+    use std::io::Write;
+    let mut c = Command::new(exe).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(stdin).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+#[test]
+fn globals_are_what_clang_go_and_python_make_of_them() {
+    for (file, lang) in [("globals.c", "C"), ("globals.go", "Go"), ("globals.py", "Python")] {
+        runs_as_the_real_one(file, lang);
+    }
+}
+
+#[test]
+fn input_is_read_as_clang_go_and_python_read_it() {
+    runs_with_input_as_the_real_one("input.c", "input.in");
+    runs_with_input_as_the_real_one("input.go", "input.in");
+    runs_with_input_as_the_real_one("input.py", "input.py.in");
+}
+
+#[test]
+fn a_program_that_reads_is_never_worked_out_while_compiling() {
+    let r = root("reads");
+    let exe = r.join("a.exe");
+    let o = compile_with(&r, &suite("input.c"), &exe, &["--release"], None);
+    assert!(o.status.success() && !text(&o).contains("reads nothing"), "{}", text(&o));
+    assert_eq!(String::from_utf8_lossy(&run_with(&exe, b"2 40 2").stdout), "42\n");
+    assert_eq!(String::from_utf8_lossy(&run_with(&exe, b"3 1 1 1").stdout), "3\n");
+    assert_eq!(String::from_utf8_lossy(&run_with(&exe, b"").stdout), "0\n"); // scanf finds nothing: n stays 0
+}
+
+#[test]
+fn python_stops_on_a_line_that_is_not_a_number_as_python_does() {
+    let r = root("py-input");
+    let p = r.join("read.py");
+    std::fs::write(&p, "x = int(input())\nprint(x * 2)\n").unwrap();
+    let exe = r.join("a.exe");
+    assert!(compile_with(&r, &p, &exe, &[], None).status.success());
+    for (input, out, code, says) in [
+        (&b"21\n"[..], "42\n", 0, ""),
+        (b"  -7  \r\n", "-14\n", 0, ""),
+        (b"+5", "10\n", 0, ""),
+        (b"4 2\n", "", 1, "not a whole number"),
+        (b"abc\n", "", 1, "not a whole number"),
+        (b"\n", "", 1, "not a whole number"),
+        (b"", "", 1, "no line to read"),
+        (b"99999999999999999999\n", "", 1, "grew past 64 bits"),
+    ] {
+        let got = run_with(&exe, input);
+        assert_eq!(String::from_utf8_lossy(&got.stdout), out, "{input:?}");
+        assert_eq!(got.status.code(), Some(code), "{input:?}");
+        assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{input:?}: {}", String::from_utf8_lossy(&got.stderr));
+    }
+}
+
 #[test]
 fn c_integers_have_clangs_widths_in_every_mode() {
     let want = std::fs::read(suite("widths.c.out")).unwrap();
@@ -181,12 +252,18 @@ impl Gen {
     }
     fn program(&mut self) -> String {
         let mut out = String::from("#include <stdio.h>\n");
+        // two globals every function may read and change
+        out += &format!("long long g0 = {};\nlong long g1;\n", self.constant());
         let mut funcs: Vec<(String, usize)> = Vec::new();
         for k in 0..6 {
             let n = self.below(7) as usize;
             let params: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
             let mut names = params.clone();
+            names.extend(["g0".to_string(), "g1".to_string()]);
             let mut body = String::new();
+            if self.below(2) == 0 {
+                body += &format!("    g{} = g{} + {};\n", k % 2, (k + 1) % 2, self.expr(&names, &funcs, 2));
+            }
             for v in 0..self.below(4) {
                 body += &format!("    long x{v} = {};\n", self.expr(&names, &funcs, 3));
                 names.push(format!("x{v}"));
@@ -278,6 +355,7 @@ impl Gen {
         for (f, depth) in &recs {
             out += &format!("    printf(\"%lld\\n\", {f}({}, {}));\n", self.below(*depth), self.constant());
         }
+        out += "    printf(\"%lld %lld\\n\", g0, g1);\n";
         out + "    return 0;\n}\n"
     }
 }
@@ -421,6 +499,8 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("unsigned.c", "int main() { unsigned int x = 1; return x; }\n", "unsigned numbers are not in Strike yet"),
         ("pointer.c", "int f(int *p) { return 0; }\nint main() { return 0; }\n", "pointers and arrays are not in Strike yet"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
+        ("unbound.py", "n = 1\ndef f():\n    print(n)\n    n = 2\nf()\n", "read before this function assigns it"),
+        ("string.py", "x = input()\nprint(x)\n", "strings are not in Strike yet"),
     ] {
         let p = r.join(name);
         std::fs::write(&p, src).unwrap();

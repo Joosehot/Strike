@@ -76,6 +76,15 @@ place = "top"
 pattern = "func $name ( $params ) [ $type ] $block"
 
 [[form]]
+kind = "var"
+place = "top"
+pattern = "var $name [ $type ] [ = $expr ] $end"
+
+[[form]]
+kind = "read"
+pattern = "fmt . Scan ( & $name ) $end"
+
+[[form]]
 kind = "return"
 pattern = "return [ $expr ] $end"
 
