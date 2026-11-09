@@ -589,6 +589,96 @@ The last row is a stress test: every function has two expressions of up
 to 31 leaves over four names. The beam keeps 4 states for up to 8 rounds,
 and judges at most 30 states for each expression, fewer for a large one.
 
+### Work across statements, and the ranges of locals
+
+Two more passes run in `--release`, after the simplifier.
+
+[src/uc/values.rs](src/uc/values.rs) runs after loops are rotated and
+unrolled, so the copies of an unrolled loop are one straight stretch of
+code. It does four things:
+
+- **Known low bits.** For every local, it finds how many of its lowest bits
+  are known to be zero, from every value ever stored into it. A counter
+  that starts at 0 and goes up by 2 is even. If x has t zero bits and
+  0 <= c < 2^t, then x + c has no carry, so these hold exactly:
+  - `(x + c) >> k = (x >> k) + (c >> k)`
+  - `(x + c) ^ d = x ^ (c ^ d)`
+  - `(x + c) & d = (x & d) + (c & d)`
+
+  This is how a second copy's `(i + 1) >> 1` becomes the first copy's
+  `i >> 1`, as clang finds it.
+- **Value numbering.** Every store gives a local a new version, and a
+  local's value is known as an expression of the versions it read. A store
+  of what the local already holds is left out. A value that another local
+  holds is read from that local.
+- **Common subexpressions.** An expression that two statements of the same
+  straight code work out from the same versions is worked out once, into a
+  new local, before the first of them.
+- **A waiting operand worked out first.** x64opt works an expression out
+  in rax. When both operands of an operation must be worked out, the left
+  one waits on the machine's stack, with every value under it. Instead, the
+  right operand is worked out first into a new local, unless it reads the
+  local the statement stores (that would lengthen a loop's chain).
+
+Only expressions that cannot fail are moved or shared. Float operations
+are left where they are. Each rewrite is also checked against the original
+on 200 sets of inputs, which keep each local's known zero bits.
+
+[src/uc/ranges.rs](src/uc/ranges.rs) finds every local's interval: the
+union of what is ever stored into it. A loop entered only at its top, whose
+test is `c < bound` and which stores c once, bounds c where the body reads
+it. Bounds that keep moving are widened and then narrowed again. A
+`Sext(n)` whose operand's interval fits n bits changes nothing, so it is
+left out. Nothing is assumed from undefined behaviour: an operation that
+could wrap gives "anything". This generalizes `opt::counters`.
+
+Each pass has its tests:
+
+- unit tests of the rules, checked on every even number, and of each pass;
+- an interval test: in 2000 random expressions, every value evaluated
+  lies in its interval;
+- [tests/uc/values.c](tests/uc/values.c) and `values.go` print what clang
+  and Go print, in every mode;
+- the random differential test now also writes functions with unrolled
+  counters, locals made again, shared expressions and bounded C ints.
+
+**Running times**, against master at a9e5700, which has the simplifier.
+Each program ran 11 times, interleaved, and the times are min / median in
+seconds:
+
+| | master | **now** | clang -O2 | clang scalar | go |
+|---|---|---|---|---|---|
+| poly.c | 0.151 / 0.153 | **0.125 / 0.131** | 0.138 / 0.140 | | |
+| poly.go | 0.151 / 0.155 | **0.125 / 0.129** | | | 0.223 / 0.228 |
+| factor.c | 0.194 / 0.196 | **0.179 / 0.182** | 0.126 / 0.129 | 0.093 / 0.095 | |
+| factor.go | 0.191 / 0.196 | **0.178 / 0.181** | | | 0.316 / 0.320 |
+| intexpr.c | 0.204 / 0.213 | **0.155 / 0.157** | 0.071 / 0.073 | 0.128 / 0.135 | |
+| chain.c | 0.205 / 0.208 | 0.207 / 0.208 | 0.196 / 0.198 | | |
+| intchain.c | 0.377 / 0.380 | 0.377 / 0.381 | 0.273 / 0.276 | | |
+| index.c | 0.020 / 0.020 | 0.019 / 0.020 | 0.012 / 0.012 | 0.016 / 0.016 | |
+
+poly.c is now **faster than clang -O2: by 10% at the minimum and 6% at
+the median**. walk.c was
+already faster. The other C benchmarks are still slower than clang:
+
+- factor.c is still slower, even than clang's scalar code. What is left is
+  in x64opt, not in the IR. A shift into a register takes `mov rax, x;
+  sar rax, k; mov r, rax`, three instructions for two. With seven saved
+  registers, the eighth local of factor.c's loop goes to memory.
+- intexpr.c and index.c: clang vectorizes them.
+- intchain.c and chain.c are dependency chains. clang works the next
+  time round's x into y algebraically, and it leaves out intchain's cuts,
+  because C's signed overflow is undefined. Those cuts are needed for the
+  exact result, and the range analysis keeps them.
+
+Compile time, minimum of the rounds, against master:
+
+| programs | master | now |
+|---|---|---|
+| suite.c, algebra.c, arrays.c and values.c | 0.018 s | 0.018 s |
+| the 100 random test programs | 1.48 s | 1.59 s |
+| genbig.py's 2000 functions | 1.63 s | 1.71 s |
+
 ### Measured
 
 A whole build of one program of 2000 functions, from source to
