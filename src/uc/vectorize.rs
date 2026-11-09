@@ -318,7 +318,11 @@ struct Vz<'a> {
     bases: std::collections::HashMap<String, Op>,
     /// how many uses of each node are still to be compiled
     uses: Vec<u32>,
-    induction: Option<(u8, u8)>,
+    /// affine values of the counter: (key, a register per copy, the step's)
+    induction: Vec<(String, Vec<u8>, u8)>,
+    /// how many vectors' worth each time round, and which one is compiled
+    unroll: i64,
+    copy: i64,
 }
 
 impl<'a> Vz<'a> {
@@ -490,7 +494,7 @@ impl<'a> Vz<'a> {
 
     /// The scalar code of an element's address in the vector loop: lane
     /// 0's, unit stride (the counter times the element's width).
-    fn address(&mut self, n: usize, w: u8) -> Option<Vec<Op>> {
+    fn address(&mut self, n: usize, w: u8, store: bool) -> Option<Vec<Op>> {
         let a = self.affine(n)?;
         if a.coef != w as i64 || a.terms.is_empty() {
             return None;
@@ -523,13 +527,16 @@ impl<'a> Vz<'a> {
                 b
             }
         };
+        let _ = store;
         let mut out = vec![base, Op::Load(self.sh.c)];
         if w > 1 {
             out.extend([Op::Push(w.trailing_zeros() as i64), Op::Bin(BinOp::Shl)]);
         }
         out.push(Op::Bin(BinOp::Add));
-        if a.disp != 0 {
-            out.extend([Op::Push(a.disp), Op::Bin(BinOp::Add)]);
+        // copy m of an unrolled body: m vectors further
+        let disp = a.disp.checked_add(self.copy * self.lanes * w as i64)?;
+        if disp != 0 {
+            out.extend([Op::Push(disp), Op::Bin(BinOp::Add)]);
         }
         Some(out)
     }
@@ -573,31 +580,27 @@ impl<'a> Vz<'a> {
             return Some(v);
         }
         let k = self.k;
-        let v = match self.nodes[n].clone() {
-            N::Load(s) if s == self.sh.c => {
-                if let Some((v, _)) = self.induction {
-                    return Some(v);
-                }
-                // the lanes c, c + 1, ...; each time round, the lanes' count added
-                let v = self.alloc(true)?;
-                let step = self.alloc(true)?;
-                let iota: Vec<i64> = (0..4).collect();
-                let i = from_lanes(k, &iota);
-                let st = splat(k, self.lanes);
-                self.pre.extend([Op::Load(s), Op::VSplat(k, v), Op::VConst(step, i[0] as i64, i[1] as i64), Op::VBin(k, BinOp::Add, v, v, step)]);
-                self.pre.push(Op::VConst(step, st[0] as i64, st[1] as i64));
-                self.induction = Some((v, step));
-                return Some(v);
+        // an affine function of the counter (c, c + r, 8c + 3...): its own
+        // lanes, one register per copy, stepped each time round
+        if let Some(a) = self.affine(n) {
+            if a.coef != 0 {
+                return self.induction(n, a);
             }
+        }
+        let v = match self.nodes[n].clone() {
             N::LoadM(w, a) => {
                 if w != k.width() {
                     return None;
                 }
-                let addr = self.address(a, w)?;
+                let addr = self.address(a, w, false)?;
                 let d = self.alloc(false)?;
                 self.body.extend(addr);
                 self.body.push(Op::VLoad(l, d));
                 d
+            }
+            N::Bin(BinOp::Mul, x, y) if matches!((&self.nodes[x], &self.nodes[y]), (_, N::Push(_)) | (N::Push(_), _)) && self.by_shifts(x, y).is_some() => {
+                let (o, c) = self.by_shifts(x, y)?;
+                self.mul_const(o, c)?
             }
             N::Bin(b, x, y) => {
                 let lanes = if b.is_float() { Lanes::F64 } else { k };
@@ -681,6 +684,113 @@ impl<'a> Vz<'a> {
             _ => return None,
         };
         Some(v)
+    }
+
+    /// The register of copy `self.copy` of an affine value a = coef c +
+    /// terms + disp: worked out before the loop as splat(a at c) + coef
+    /// (m L + lane), stepped by coef U L each time round (wrapping: the
+    /// lanes are exact modulo their width).
+    fn induction(&mut self, n: usize, a: Aff) -> Option<u8> {
+        let mut keys: Vec<String> = a.terms.iter().map(|&t| self.key(t)).collect();
+        keys.sort();
+        let key = format!("{} * c + {} + {}", a.coef, keys.join(" + "), a.disp);
+        let _ = n;
+        if let Some((_, regs, _)) = self.induction.iter().find(|x| x.0 == key) {
+            return Some(regs[self.copy as usize]);
+        }
+        let k = self.k;
+        let step = self.splat_const(k, a.coef.wrapping_mul(self.lanes * self.unroll))?;
+        let mut base = vec![Op::Load(self.sh.c)];
+        if a.coef != 1 {
+            base.extend([Op::Push(a.coef), Op::Bin(BinOp::Mul)]);
+        }
+        for &t in &a.terms {
+            self.scalar(t, &mut base);
+            base.push(Op::Bin(BinOp::Add));
+        }
+        if a.disp != 0 {
+            base.extend([Op::Push(a.disp), Op::Bin(BinOp::Add)]);
+        }
+        let mut regs = Vec::new();
+        for _ in 0..self.unroll {
+            regs.push(self.alloc(true)?);
+        }
+        let tmp = self.alloc(true)?;
+        for (m, &r) in regs.iter().enumerate() {
+            self.pre.extend(base.iter().cloned());
+            self.pre.push(Op::VSplat(k, r));
+            let lanes: Vec<i64> = (0..4).map(|i| a.coef.wrapping_mul(m as i64 * self.lanes + i)).collect();
+            let x = from_lanes(k, &lanes);
+            self.pre.extend([Op::VConst(tmp, x[0] as i64, x[1] as i64), Op::VBin(k, BinOp::Add, r, r, tmp)]);
+        }
+        self.used[tmp as usize] = false;
+        self.pinned[tmp as usize] = false;
+        let r = regs[self.copy as usize];
+        self.induction.push((key, regs, step));
+        Some(r)
+    }
+
+    /// A product by a constant that two shifts and an add or a subtraction
+    /// make (and a negation): (the other operand, the constant).
+    fn by_shifts(&self, x: usize, y: usize) -> Option<(usize, i64)> {
+        let (o, c) = match (&self.nodes[x], &self.nodes[y]) {
+            (_, N::Push(c)) => (x, *c),
+            (N::Push(c), _) => (y, *c),
+            _ => return None,
+        };
+        let m = c.checked_abs()? as u64;
+        if m == 0 {
+            return None;
+        }
+        let lo = m.trailing_zeros();
+        let rest = m >> lo;
+        let bits = 8 * self.k.width() as u32;
+        let top = if rest == 1 {
+            lo
+        } else if (rest - 1).is_power_of_two() {
+            (rest - 1).trailing_zeros() + lo
+        } else if (rest + 1).is_power_of_two() {
+            (rest + 1).trailing_zeros() + lo
+        } else {
+            return None;
+        };
+        (m > 1 && top < bits).then_some((o, c))
+    }
+
+    /// o * c as by_shifts makes it: (o << a) ± (o << b), negated for c < 0;
+    /// exact modulo the lane's width.
+    fn mul_const(&mut self, o: usize, c: i64) -> Option<u8> {
+        let k = self.k;
+        let m = c.unsigned_abs();
+        let lo = m.trailing_zeros() as u8;
+        let rest = m >> lo;
+        let rx = self.value(o, k)?;
+        let low = if lo == 0 {
+            rx
+        } else {
+            let d = self.alloc(false)?;
+            self.body.push(Op::VShift(k, BinOp::Shl, d, rx, lo));
+            d
+        };
+        let r = if rest == 1 {
+            low
+        } else {
+            let (a, op) = if (rest - 1).is_power_of_two() { ((rest - 1).trailing_zeros() as u8 + lo, BinOp::Add) } else { ((rest + 1).trailing_zeros() as u8 + lo, BinOp::Sub) };
+            let hi = self.alloc(false)?;
+            self.body.push(Op::VShift(k, BinOp::Shl, hi, rx, a));
+            self.body.push(Op::VBin(k, op, hi, hi, low));
+            if low != rx {
+                self.used[low as usize] = false;
+            }
+            hi
+        };
+        self.release(o, rx);
+        if c > 0 {
+            return Some(r);
+        }
+        let zero = self.splat_const(k, 0)?;
+        self.body.push(Op::VBin(k, BinOp::Sub, r, zero, r));
+        Some(r)
     }
 
     /// Counts every node's uses as a value.
@@ -786,7 +896,7 @@ fn reaches(nodes: &[N], n: usize, target: &N) -> usize {
 
 /// The loop vectorized: the code to put before its top (the vector loop,
 /// and after it the reductions' lanes added in), and the slots it made.
-fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
+fn vectorize(f: &Func, sh: &Shape, prov: &[Prov], unroll: i64) -> Option<(Vec<Op>, u32)> {
     let code = &f.code;
     let (nodes, stmts) = read(code, sh)?;
     let stored: Vec<u32> = stmts.iter().filter_map(|s| if let S::Store(x, _) = s { Some(*x) } else { None }).collect();
@@ -889,7 +999,9 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
         memo: Default::default(),
         splats: Default::default(),
         bases: Default::default(),
-        induction: None,
+        induction: Vec::new(),
+        unroll,
+        copy: 0,
     };
     let _ = z.f;
     // the loads of a local made in the body are of nodes, not of the local
@@ -958,27 +1070,50 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
     let top = sh.top;
     let labels = super::ir::label_count(code);
     let (vtop, vend) = (labels, labels + 1);
+    let step = lanes * unroll;
     let limit = match sh.bound {
-        Op::Push(n) => Op::Push(n.checked_sub(lanes - 1)?),
+        Op::Push(n) => Op::Push(n.checked_sub(step - 1)?),
         Op::Load(nb) => {
             if !z.narrow[nb as usize] {
                 // a bound this low leaves the vector loop out
-                z.pre.extend([Op::Load(nb), Op::Push(i64::MIN + lanes - 1), Op::Bin(BinOp::Lt), Op::Jnz(top)]);
+                z.pre.extend([Op::Load(nb), Op::Push(i64::MIN + step - 1), Op::Bin(BinOp::Lt), Op::Jnz(top)]);
             }
             let s = z.slots;
             z.slots += 1;
-            z.pre.extend([Op::Load(nb), Op::Push(lanes - 1), Op::Bin(BinOp::Sub), Op::Store(s)]);
+            z.pre.extend([Op::Load(nb), Op::Push(step - 1), Op::Bin(BinOp::Sub), Op::Store(s)]);
             Op::Load(s)
         }
         _ => return None,
     };
     // the accumulators start at the operation's identity
-    let mut accs = Vec::new();
+    // (one for each copy of an unrolled body: their chains are apart)
+    let mut accs: Vec<Vec<u8>> = Vec::new();
     for r in z.reductions.clone() {
-        let v = z.alloc(true)?;
-        let id = if r.2 == BinOp::Band { -1 } else { 0 };
-        z.pre.push(Op::VConst(v, id, id));
-        accs.push(v);
+        let mut each = Vec::new();
+        for _ in 0..unroll {
+            let v = z.alloc(true)?;
+            let id = if r.2 == BinOp::Band { -1 } else { 0 };
+            z.pre.push(Op::VConst(v, id, id));
+            each.push(v);
+        }
+        accs.push(each);
+    }
+    for m in 0..unroll {
+    z.copy = m;
+    if m > 0 {
+        z.uses.iter_mut().for_each(|u| *u = 0);
+        for (i, s) in z.stmts.clone().iter().enumerate() {
+            let vals: Vec<usize> = match s {
+                S::Store(..) => match z.reductions.iter().find(|r| r.0 == i) {
+                    Some(r) => vec![r.3],
+                    None => vec![],
+                },
+                S::StoreM(_, _, v) | S::OpM(_, _, _, v) => vec![*v],
+            };
+            for v in vals {
+                z.count(v);
+            }
+        }
     }
     for (i, s) in z.stmts.clone().iter().enumerate() {
         match s {
@@ -987,7 +1122,7 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
                     let r = z.reductions[ri];
                     let x = z.value(r.3, k)?;
                     z.release(r.3, x);
-                    let acc = accs[ri];
+                    let acc = accs[ri][m as usize];
                     z.body.push(Op::VBin(k, if r.2 == BinOp::Sub { BinOp::Sub } else { r.2 }, acc, acc, x));
                 } else if !addr_nodes.contains(v) && z.uses[*v] > 0 {
                     // worked out here, where the scalar code works it out
@@ -1010,7 +1145,7 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
                 }
                 let x = z.value(*v, l)?;
                 z.release(*v, x);
-                let addr = z.address(*a, *w)?;
+                let addr = z.address(*a, *w, true)?;
                 z.body.extend(addr);
                 z.body.push(Op::VStore(l, x));
             }
@@ -1026,13 +1161,14 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
                 }
                 let l = if b.is_float() { Lanes::F64 } else { k };
                 let x = z.value(*v, l)?;
-                let addr = z.address(*a, *w)?;
+                let addr = z.address(*a, *w, false)?;
+                let back = z.address(*a, *w, true)?;
                 let d = z.alloc(false)?;
-                z.body.extend(addr.iter().cloned());
+                z.body.extend(addr);
                 z.body.push(Op::VLoad(l, d));
                 z.body.push(Op::VBin(l, *b, d, d, x));
                 z.release(*v, x);
-                z.body.extend(addr);
+                z.body.extend(back);
                 z.body.push(Op::VStore(l, d));
                 z.used[d as usize] = false;
             }
@@ -1047,27 +1183,50 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov]) -> Option<(Vec<Op>, u32)> {
             }
         }
     }
+    }
     let mut out = std::mem::take(&mut z.pre);
     out.push(Op::Label(vtop));
     out.extend([Op::Load(sh.c), limit, Op::Bin(BinOp::Lt), Op::Jz(vend)]);
     out.extend(std::mem::take(&mut z.body));
-    if let Some((v, step)) = z.induction {
-        out.push(Op::VBin(k, BinOp::Add, v, v, step));
+    for (_, regs, step) in &z.induction {
+        for &v in regs {
+            out.push(Op::VBin(k, BinOp::Add, v, v, *step));
+        }
     }
-    out.extend([Op::Load(sh.c), Op::Push(lanes), Op::Bin(BinOp::Add)]);
+    out.extend([Op::Load(sh.c), Op::Push(step), Op::Bin(BinOp::Add)]);
     if sh.cut {
         out.push(Op::Sext(32));
     }
     out.extend([Op::Store(sh.c), Op::Jmp(vtop), Op::Label(vend)]);
     for (ri, r) in z.reductions.iter().enumerate() {
         let op = if r.2 == BinOp::Sub { BinOp::Add } else { r.2 };
-        out.extend([Op::Load(r.1), Op::VReduce(k, op, accs[ri]), Op::Bin(op)]);
+        let a = accs[ri][0];
+        for &b in &accs[ri][1..] {
+            out.push(Op::VBin(k, op, a, a, b));
+        }
+        out.extend([Op::Load(r.1), Op::VReduce(k, op, a), Op::Bin(op)]);
         if r.4 {
             out.push(Op::Sext(32));
         }
         out.push(Op::Store(r.1));
     }
     Some((out, z.slots))
+}
+
+/// The vector loop put before the scalar one's top.
+fn insert(f: &mut Func, sh: &Shape, vector: Vec<Op>, slots: u32, done: &mut Vec<u32>) {
+    // the vector loop's labels are not tried again
+    for op in &vector {
+        if let Op::Label(l) = op {
+            done.push(*l);
+        }
+    }
+    let mut code = Vec::with_capacity(f.code.len() + vector.len());
+    code.extend_from_slice(&f.code[..sh.t]);
+    code.extend(vector);
+    code.extend_from_slice(&f.code[sh.t..]);
+    f.code = code;
+    f.slots = slots;
 }
 
 /// Vectorizes the function's innermost counted loops; returns how many.
@@ -1092,19 +1251,28 @@ pub fn run(f: &mut Func) -> usize {
                 continue;
             }
             done.push(sh.top);
-            let Some((vector, slots)) = vectorize(f, &sh, &prov) else { continue };
-            // the vector loop's labels are not tried again
-            for op in &vector {
-                if let Op::Label(l) = op {
-                    done.push(*l);
+            // four or two vectors each time round (independent work, one
+            // test for all), or one where the registers do not suffice; after
+            // an unrolled loop, a loop of one vector each time round takes
+            // what is left of whole vectors
+            let mut made = None;
+            for u in [4, 2, 1] {
+                if let Some(v) = vectorize(f, &sh, &prov, u) {
+                    made = Some((v, u));
+                    break;
                 }
             }
-            let mut code = Vec::with_capacity(f.code.len() + vector.len());
-            code.extend_from_slice(&f.code[..sh.t]);
-            code.extend(vector);
-            code.extend_from_slice(&f.code[sh.t..]);
-            f.code = code;
-            f.slots = slots;
+            let Some(((vector, slots), u)) = made else { continue };
+            insert(f, &sh, vector, slots, &mut done);
+            if u > 1 {
+                let prov = provenance(f);
+                let again = (0..f.code.len()).find_map(|j| shape(&f.code, j).filter(|s| s.top == sh.top));
+                if let Some(sh) = again {
+                    if let Some((vector, slots)) = vectorize(f, &sh, &prov, 1) {
+                        insert(f, &sh, vector, slots, &mut done);
+                    }
+                }
+            }
             count += 1;
             continue 'again;
         }

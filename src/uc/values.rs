@@ -306,6 +306,11 @@ fn common(f: &mut Func) -> usize {
                 if ops < SHARE_OPS || !has || floats(part) || tree(part).is_none_or(|e| fallible(&e)) {
                     continue;
                 }
+                // a vector's address that x64opt makes an address mode as it
+                // is: a local would only cost a lea (vectorize.rs)
+                if matches!(code.get(re + 1), Some(Op::VLoad(..) | Op::VStore(..))) && tree(part).is_some_and(|e| lazy(&e).is_some()) {
+                    continue;
+                }
                 places.last_mut().unwrap().entry(key(part, &ver)).or_default().push((s, i, rs));
             }
         }
