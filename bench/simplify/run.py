@@ -14,7 +14,7 @@ clang = r"C:\Program Files\LLVM\bin\clang.exe"
 out = os.path.join(here, "out")
 os.makedirs(out, exist_ok=True)
 rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 11
-names = sys.argv[2:] or sorted(f for f in os.listdir(here) if f.endswith((".c", ".go", ".py")) and f not in ("run.py", "compile_time.py"))
+names = sys.argv[2:] or sorted(f for f in os.listdir(here) if f.endswith((".c", ".go", ".py")) and f not in ("run.py", "compile_time.py", "genbig.py"))
 
 
 def build(src):

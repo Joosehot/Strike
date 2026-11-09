@@ -1242,7 +1242,7 @@ fn consumers(code: &[Op]) -> Vec<Option<(usize, usize)>> {
     let mut st: Vec<Option<usize>> = Vec::new();
     for (i, op) in code.iter().enumerate() {
         let (pops, pushes) = match op {
-            Op::Push(_) | Op::Load(_) | Op::AddrG(_) | Op::Frame(_) | Op::LoadG(_) | Op::ReadLine => (0, 1),
+            Op::Push(_) | Op::Load(_) | Op::AddrG(_) | Op::Frame(_) | Op::LoadG(_) | Op::ReadLine | Op::Data(_) => (0, 1),
             Op::Dup => (1, 2),
             Op::Store(_) | Op::StoreG(_) | Op::Pop | Op::PrintInt | Op::Jz(_) | Op::Jnz(_) | Op::Ret => (1, 0),
             Op::Bin(_) => (2, 1),

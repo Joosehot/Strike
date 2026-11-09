@@ -61,7 +61,7 @@ pub struct Target {
 
 impl Target {
     pub fn host() -> Result<Target, String> {
-        let out = std::process::Command::new("rustc").args(["--print", "cfg"]).output().map_err(|e| e.to_string())?;
+        let out = crate::daemon::rustc(&["--print", "cfg"])?;
         let mut cfg = BTreeSet::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             match line.split_once('=') {
@@ -69,7 +69,7 @@ impl Target {
                 None => cfg.insert((line.to_string(), None)),
             };
         }
-        let vv = std::process::Command::new("rustc").arg("-vV").output().map_err(|e| e.to_string())?;
+        let vv = crate::daemon::rustc(&["-vV"])?;
         let triple = String::from_utf8_lossy(&vv.stdout)
             .lines()
             .find_map(|l| l.strip_prefix("host: ").map(str::to_string))

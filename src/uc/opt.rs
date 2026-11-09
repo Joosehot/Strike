@@ -57,7 +57,7 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 st.pop();
                 st.pop();
             }
-            Op::Dup | Op::LoadG(_) | Op::ReadLine => st.push(None),
+            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Data(_) => st.push(None),
             Op::Fail(..) => st.iter_mut().for_each(|x| *x = None),
             Op::ReadToken => {
                 st.push(None);
@@ -254,11 +254,24 @@ pub fn constants(f: &mut Func) -> usize {
             _ => Some(None),
         };
     }
+    // a local starts at zero: a constant other than zero counts only where
+    // it is stored before anything reads the local, on the straight way
+    // from the start (nothing jumps there, so every other load comes later)
+    let mut first = vec![false; f.slots as usize];
+    let mut read = vec![false; f.slots as usize];
+    for (k, op) in f.code.iter().enumerate() {
+        match op {
+            Op::Load(s) => read[*s as usize] = true,
+            Op::Store(s) if !read[*s as usize] && matches!(k.checked_sub(1).map(|p| &f.code[p]), Some(Op::Push(_))) => first[*s as usize] = true,
+            Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret | Op::Fail(..) => break,
+            _ => {}
+        }
+    }
     let mut n = 0;
     for op in f.code.iter_mut() {
         if let Op::Load(s) = op {
             if *s >= f.params {
-                if let Some(Some(c)) = value[*s as usize] {
+                if let Some(Some(c)) = value[*s as usize].filter(|v| *v == Some(0) || first[*s as usize]) {
                     *op = Op::Push(c);
                     n += 1;
                 }

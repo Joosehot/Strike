@@ -1,0 +1,21 @@
+== strings ==
+keep it exact
+a literal
+hello ab pointer|2 6 []
+hoz
+2 3 0 0
+HELLO
+HELLO|HELLO
+OLLEH
+-1 1 0 -1 -1
+13 13 0
+pointer
+unsigned: -1 is the largest size_t
+unsigned again
+-2
+[abc] 0 1
+B|lit|C|A
+0:ann(3) 1:bo(2) 2:cyrus(5) 
+bb
+0/1 7/1 -42/3 1234567890123/13 -9223372036854775808/20 
+level is a palindrome

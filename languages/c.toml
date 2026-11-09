@@ -14,7 +14,6 @@ name = "C"
 extensions = ["c", "h"]
 line_comments = ["//"]
 block_comments = [["/*", "*/"]]
-skip_lines = ["#"]
 string_quotes = ["\""]
 char_quotes = ["'"]
 blocks = "braces"
@@ -22,7 +21,7 @@ statement_end = ";"
 scope = "block"
 entry = "main"
 param_name = "last"
-type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "const", "int64_t", "int32_t"]
+type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "extern", "const", "int64_t", "int32_t"]
 chained_comparisons = "allow"
 bool_print = []
 # integers as clang makes them on Windows (x86-64): long is 32 bits there.
@@ -34,6 +33,70 @@ literals = "typed"
 # {1, 2, 3} gives an array its first values; an index is not checked,
 # as C does not check it
 brace_lists = true
+# a string is chars ended by a zero byte: a literal is the address of its
+# chars (read-only), a char array holds its own
+strings = "c"
+
+[builtins]
+strlen = "c_strlen"
+strcmp = "c_strcmp"
+
+# several files are translation units: a name outside a function is shared
+# by every file unless it is static; a directory is every .c file in it
+[program]
+model = "units"
+directory = "*.c"
+
+# the preprocessor runs before C is cut into tokens (src/uc/cpp.rs). The
+# macros clang defines itself come first; a header Strike knows gives what
+# is written here: printf, puts, scanf, strlen and strcmp are Strike's
+# own (stdio.h's and string.h's), and the macros
+# are the values of clang's headers, written so Strike can read them. Any
+# other header is refused.
+[preprocessor]
+marker = "#"
+predefined = "c-predefined.h"
+
+[preprocessor.headers]
+"stdio.h" = """
+#define EOF (-1)
+"""
+"string.h" = ""
+"stdlib.h" = """
+#define EXIT_SUCCESS 0
+#define EXIT_FAILURE 1
+"""
+"stdbool.h" = """
+#define bool _Bool
+#define true 1
+#define false 0
+#define __bool_true_false_are_defined 1
+"""
+"stdint.h" = """
+#define INT8_MIN (-127 - 1)
+#define INT8_MAX 127
+#define INT16_MIN (-32767 - 1)
+#define INT16_MAX 32767
+#define INT32_MIN (-2147483647 - 1)
+#define INT32_MAX 2147483647
+#define INT64_MIN (-9223372036854775807 - 1)
+#define INT64_MAX 9223372036854775807
+"""
+"limits.h" = """
+#define CHAR_BIT 8
+#define SCHAR_MIN (-127 -1)
+#define SCHAR_MAX 127
+#define CHAR_MIN (-127 -1)
+#define CHAR_MAX 127
+#define SHRT_MIN (-32767 -1)
+#define SHRT_MAX 32767
+#define INT_MIN (-2147483647 -1)
+#define INT_MAX 2147483647
+#define LONG_MIN (-2147483647 -1)
+#define LONG_MAX 2147483647
+#define LLONG_MIN (-9223372036854775807 -1)
+#define LLONG_MAX 9223372036854775807
+"""
 
 [int_widths]
 int = 32
