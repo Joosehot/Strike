@@ -19,6 +19,7 @@
 //! files that Strike does not do the same way is refused.
 
 use super::cpp;
+use super::hot;
 use super::ir::BinOp;
 use super::lang::{Lang, Model};
 use super::lex;
@@ -29,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 /// Why a description could not make the program: the file and line, why,
 /// and how far into its file the reading got (0 to 1).
+#[derive(Clone, Debug)]
 pub struct Fail {
     pub file: PathBuf,
     pub line: u32,
@@ -71,7 +73,7 @@ impl Reader<'_> {
     /// A file read to its universal syntax (preprocessed first, where the
     /// language has a preprocessor).
     fn read(&mut self, path: &Path) -> Result<Program, Fail> {
-        let text = std::fs::read_to_string(path).map_err(|e| Fail { file: path.to_path_buf(), line: 0, message: e.to_string(), reach: 0.0 })?;
+        let text = hot::read_file(path).map_err(|e| Fail { file: path.to_path_buf(), line: 0, message: e.to_string(), reach: 0.0 })?;
         let base = self.at.len() as u32;
         let text = match &self.l.preprocessor {
             Some(p) => {
@@ -112,9 +114,7 @@ pub fn units(l: &Lang, files: &[PathBuf], dir: Option<&Path>) -> Vec<PathBuf> {
     let rule = &l.program;
     match rule.directory.strip_prefix("*.") {
         Some(ext) => {
-            let mut v: Vec<PathBuf> = std::fs::read_dir(d)
-                .map(|r| r.filter_map(|e| e.ok().map(|e| e.path())).collect())
-                .unwrap_or_default();
+            let mut v: Vec<PathBuf> = hot::list(d);
             v.retain(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) && !rule.skip_suffixes.iter().any(|s| name.ends_with(s.as_str()))
@@ -124,7 +124,7 @@ pub fn units(l: &Lang, files: &[PathBuf], dir: Option<&Path>) -> Vec<PathBuf> {
         }
         None => {
             let p = d.join(&rule.directory);
-            if p.is_file() {
+            if hot::is_file(&p) {
                 vec![p]
             } else {
                 Vec::new()
@@ -177,6 +177,9 @@ struct Walk<'a> {
     block: bool,
     /// x.name(...) on a value is a method (Python's lists)
     methods: bool,
+    /// pkg.name of the language's own packages that Strike provides
+    /// (strconv.Itoa): left for the lowering
+    own: HashSet<String>,
     /// the names of each block (or comprehension) in, innermost last; a C
     /// static one has its name in the program
     scopes: Vec<HashMap<String, Option<String>>>,
@@ -435,6 +438,8 @@ impl Walk<'_> {
                     self.expr(a)?;
                 }
                 match module {
+                    // strconv.Itoa(...): the language's own, which the lowering knows
+                    Some(a) if self.sp().standard.contains(&a) && self.own.contains(&format!("{a}.{m}")) => {}
                     // m.f(...), pkg.F(...): a function of another module
                     Some(a) => {
                         let t = self.module(&a, m, *line)?;
@@ -519,6 +524,7 @@ fn walker<'a>(spaces: &'a [Space], me: usize, l: &Lang) -> Walk<'a> {
         me,
         block: l.block_scope,
         methods: !l.methods.is_empty(),
+        own: l.qualified.keys().cloned().collect(),
         scopes: Vec::new(),
         locals: HashSet::new(),
         func: None,
@@ -666,7 +672,7 @@ fn link_packages(r: &mut Reader, units: &[PathBuf]) -> Result<Program, Fail> {
         let mut d = Some(abs.as_path());
         while let Some(x) = d {
             let f = x.join(name);
-            if f.is_file() {
+            if hot::is_file(&f) {
                 g.module = Some(read_go_mod(&f)?);
                 break;
             }
@@ -760,7 +766,7 @@ fn link_packages(r: &mut Reader, units: &[PathBuf]) -> Result<Program, Fail> {
 /// go.mod: the module's path, from its root. What else it may say that
 /// would change the program (another module required) is refused.
 fn read_go_mod(f: &Path) -> Result<(PathBuf, String), Fail> {
-    let text = std::fs::read_to_string(f).map_err(|e| Fail { file: f.to_path_buf(), line: 0, message: e.to_string(), reach: 1.0 })?;
+    let text = hot::read_file(f).map_err(|e| Fail { file: f.to_path_buf(), line: 0, message: e.to_string(), reach: 1.0 })?;
     let mut path = None;
     for (i, line) in text.lines().enumerate() {
         let line = line.split("//").next().unwrap_or("").trim();
@@ -1047,7 +1053,7 @@ impl Modules {
         if r.l.program.found_first.iter().any(|x| x == t) {
             return Err(r.fail((line, format!("{t} is one of Python's own modules, which Python finds before any file, and those are not in Strike yet")), 1.0));
         }
-        if !path.is_file() {
+        if !hot::is_file(&path) {
             return Err(r.fail((line, format!("there is no {t}.py next to {main}, and Python's own modules are not in Strike yet")), 1.0));
         }
         self.load(r, t, &path)

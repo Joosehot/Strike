@@ -10,7 +10,7 @@
 //! by zero (which must fail when the program runs, as it would): the
 //! program is compiled as it is.
 
-use super::ir::{label_count, BinOp, Func, Op, UnOp, ALLOC};
+use super::ir::{label_count, BinOp, Func, Op, UnOp, ALLOC, GETC, PRINT};
 use std::collections::HashMap;
 
 #[derive(serde::Deserialize, Clone)]
@@ -131,11 +131,16 @@ struct Frame {
     mem: usize,
 }
 
-/// The program's memory as the runner keeps it: the globals, the heap and
-/// the functions' own memory, each a region of addresses of its own.
+/// The program's memory as the runner keeps it: the globals, the heap,
+/// the functions' own memory and the read-only data (Op::Data), each a
+/// region of addresses of its own.
 struct Memory {
-    regions: [Vec<u8>; 3],
+    regions: [Vec<u8>; 4],
+    /// where each Op::Data's bytes are in the read-only region
+    data: HashMap<Vec<u8>, i64>,
 }
+
+const READ_ONLY: usize = 3;
 
 const REGION: u32 = 44;
 /// the most the heap may grow to here
@@ -154,12 +159,26 @@ impl Memory {
         Some(super::ir::sext(i64::from_le_bytes(v), w * 8))
     }
     fn store(&mut self, addr: i64, w: u8, v: i64) -> Option<()> {
+        // a write to the read-only data faults when the program runs
+        if (addr as u64 >> REGION) as usize == READ_ONLY + 1 {
+            return None;
+        }
         let b = self.place(addr, w as usize)?;
         b.copy_from_slice(&v.to_le_bytes()[..w as usize]);
         Some(())
     }
     fn address(region: usize, at: usize) -> i64 {
         (((region as u64 + 1) << REGION) | at as u64) as i64
+    }
+    fn data(&mut self, d: &[u8]) -> i64 {
+        if let Some(&a) = self.data.get(d) {
+            return a;
+        }
+        let r = &mut self.regions[READ_ONLY];
+        let a = Memory::address(READ_ONLY, r.len());
+        r.extend_from_slice(d);
+        self.data.insert(d.to_vec(), a);
+        a
     }
 }
 
@@ -185,7 +204,7 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
     let mut locals: Vec<i64> = vec![0; funcs[first].slots as usize];
     let mut frames = vec![Frame { func: first, pc: 0, base: 0, mem: 0 }];
     let mut stack: Vec<i64> = Vec::new();
-    let mut m = Memory { regions: [vec![0u8; globals as usize * 8], Vec::new(), vec![0u8; funcs[first].frame as usize]] };
+    let mut m = Memory { regions: [vec![0u8; globals as usize * 8], Vec::new(), vec![0u8; funcs[first].frame as usize], Vec::new()], data: HashMap::new() };
     let mut output = Vec::new();
     let mut steps = 0u64;
     loop {
@@ -225,6 +244,7 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 m.store(Memory::address(0, *g as usize * 8), 8, v)?;
             }
             Op::AddrG(g) => stack.push(Memory::address(0, *g as usize * 8)),
+            Op::Data(d) => stack.push(m.data(d)),
             Op::Frame(n) => stack.push(Memory::address(2, fr.mem + *n as usize)),
             Op::LoadM(w) => {
                 let a = stack.pop()?;
@@ -234,6 +254,12 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 let v = stack.pop()?;
                 let a = stack.pop()?;
                 m.store(a, *w, v)?;
+            }
+            Op::OpM(b, w) => {
+                let v = stack.pop()?;
+                let a = stack.pop()?;
+                let old = m.load(a, *w)?;
+                m.store(a, *w, bin(*b, old, v)?)?;
             }
             // a program that stops so must stop so when it runs
             Op::Fail(..) => return None,
@@ -270,6 +296,17 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 stack.push(Memory::address(1, heap.len()));
                 heap.resize(heap.len() + n, 0);
             }
+            // a string's bytes, printed where they are
+            Op::Call(sym, 2) if sym == PRINT => {
+                let n = usize::try_from(stack.pop()?).ok()?;
+                let a = stack.pop()?;
+                if n > lim.max_output {
+                    return None;
+                }
+                output.extend_from_slice(m.place(a, n)?);
+                stack.push(0);
+            }
+            Op::Call(sym, _) if sym == GETC => return None,
             Op::Call(sym, n) => {
                 if frames.len() >= lim.max_depth {
                     return None;

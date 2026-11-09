@@ -14,18 +14,23 @@ end_after = [")", "]", "}", "++", "--", "return", "break", "continue"]
 scope = "block"
 entry = "main"
 param_name = "first"
-type_words = ["int", "int64", "int32", "int16", "int8", "bool", "uint", "uint64", "uint32", "uint16", "uint8", "byte"]
+type_words = ["int", "int64", "int32", "int16", "int8", "bool", "uint", "uint64", "uint32", "uint16", "uint8", "byte", "rune", "string"]
 chained_comparisons = "allow"
 bool_print = ["true", "false"]
 # Go's integers wrap at their own width; a literal takes the width of what
-# it meets. uint is refused, not guessed.
+# it meets. byte (uint8) wraps at 256; the other unsigned types are
+# refused, not guessed.
 literals = "untyped"
 # an index out of range panics: Go stops with exit code 2
 index_error = [2, "panic: runtime error: index out of range\n"]
 composite_literals = true
-# pkg.Name: a name of an imported package
-qualified = true
 list_print = ["[", " ", "]"]
+# a string is bytes: s[i] is a byte, range decodes UTF-8 as Go does
+strings = "bytes"
+
+# pkg.name(...) of Go's own packages that Strike provides
+[qualified]
+"strconv.Itoa" = "itoa"
 
 # a directory is a package (its .go files but the tests); a package of the
 # same module is imported by its path under go.mod's module path, and only
@@ -35,7 +40,7 @@ model = "packages"
 directory = "*.go"
 skip_suffixes = ["_test.go"]
 module_file = "go.mod"
-standard = ["fmt"]
+standard = ["fmt", "strconv"]
 
 [builtins]
 len = "len"
@@ -49,6 +54,7 @@ int64 = 64
 int32 = 32
 int16 = 16
 int8 = 8
+rune = 32
 bool = 8
 
 [bool_constants]

@@ -493,7 +493,7 @@ impl<'a> P<'a> {
                 Pat::Cap(Cap::Place) => {
                     let mut n = self.name()?;
                     // pkg.X = v, m.x = v: a name of another module
-                    if self.l.qualified && self.text() == Some(".") {
+                    if self.l.dotted() && self.text() == Some(".") {
                         self.i += 1;
                         let m = self.name()?;
                         n = format!("{n}.{m}");
@@ -710,7 +710,7 @@ impl<'a> P<'a> {
                     let Some(i) = lo else { return self.miss("an index") };
                     e = Expr::Index(Box::new(e), i, line);
                 }
-            } else if (!self.l.methods.is_empty() || self.l.qualified) && self.text() == Some(".") {
+            } else if (!self.l.methods.is_empty() || self.l.dotted()) && self.text() == Some(".") {
                 self.i += 1;
                 let name = match self.peek().clone() {
                     T::Ident(s) => {
@@ -720,7 +720,7 @@ impl<'a> P<'a> {
                     _ => return self.miss("a method's name"),
                 };
                 // m.x, pkg.X: a name of another module, not a call
-                if self.l.qualified && self.text() != Some("(") {
+                if self.l.dotted() && self.text() != Some("(") {
                     if let Expr::Var(n, l) = &e {
                         e = Expr::Var(format!("{n}.{name}"), *l);
                         continue;
@@ -810,7 +810,7 @@ impl<'a> P<'a> {
             }
             T::Str(s) => {
                 self.i += 1;
-                (Expr::Str(s), false)
+                (self.postfix(Expr::Str(s))?, false)
             }
             T::Punct(p) if p == "(" => {
                 self.i += 1;
@@ -853,7 +853,7 @@ impl<'a> P<'a> {
                         // a type called like a function: Python's int(...)
                         || (l.type_words.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "("))
                         // a package a form names, used otherwise: fmt.Sprint(x)
-                        || (l.qualified && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == ".")))
+                        || (l.dotted() && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == ".")))
                 {
                     self.i += 1;
                     let e = if self.eat("(") {

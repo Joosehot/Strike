@@ -29,24 +29,24 @@ pub const MAX_LEN: i64 = 1 << 40;
 pub const OUT_OF_MEMORY: &[u8] = b"strike: out of memory: a list or slice that large is not made, so the program stops\n";
 
 /// A function being written: its code, its labels and its slots.
-struct B {
-    code: Vec<Op>,
+pub(super) struct B {
+    pub(super) code: Vec<Op>,
     labels: u32,
 }
 
 impl B {
-    fn new() -> B {
+    pub(super) fn new() -> B {
         B { code: Vec::new(), labels: 0 }
     }
-    fn label(&mut self) -> u32 {
+    pub(super) fn label(&mut self) -> u32 {
         self.labels += 1;
         self.labels - 1
     }
-    fn o(&mut self, ops: &[Op]) {
+    pub(super) fn o(&mut self, ops: &[Op]) {
         self.code.extend_from_slice(ops);
     }
     /// The word at slot s plus off bytes.
-    fn field(&mut self, s: u32, off: i64) {
+    pub(super) fn field(&mut self, s: u32, off: i64) {
         self.code.push(Op::Load(s));
         if off != 0 {
             self.o(&[Op::Push(off), Op::Bin(BinOp::Add)]);
@@ -65,7 +65,7 @@ impl B {
         let ok = self.label();
         self.o(&[Op::Load(n), Op::Push(MAX_LEN), Op::Bin(BinOp::Ule), Op::Jnz(ok), Op::Fail(1, OUT_OF_MEMORY.to_vec()), Op::Label(ok)]);
     }
-    fn done(self, name: &str, params: u32, slots: u32) -> Func {
+    pub(super) fn done(self, name: &str, params: u32, slots: u32) -> Func {
         Func::new(name, params, slots, self.code)
     }
 }
@@ -95,7 +95,7 @@ pub fn make(printers: &BTreeMap<String, Printer>, basics: &std::collections::Has
     out.into_values().collect()
 }
 
-fn call(name: &str, n: u32) -> Op {
+pub(super) fn call(name: &str, n: u32) -> Op {
     Op::Call(name.to_string(), n)
 }
 
@@ -315,7 +315,7 @@ fn basic(name: &str) -> Option<Func> {
             b.o(&[Op::Load(nd), Op::Load(nl), Op::Load(nc), call("lib.header", 3), Op::Ret]);
             b.done(name, 5, 10)
         }
-        _ => return None,
+        _ => return super::strs::make(name),
     })
 }
 
@@ -343,6 +343,8 @@ pub enum Elem {
     /// a list or slice: the element's own printer; true where the element
     /// is held in place (an array), not by its address
     Nested(String, bool),
+    /// a string: true where it is shown as Python's repr, false as it is
+    Str(bool),
 }
 
 fn print(name: &str, p: &Printer) -> Func {
@@ -377,6 +379,7 @@ fn print(name: &str, p: &Printer) -> Func {
             b.o(&[call(f, 1), Op::Pop]);
         }
         Elem::Int => b.o(&[Op::LoadM(p.width), Op::PrintInt]),
+        Elem::Str(repr) => b.o(&[Op::LoadM(8), call(if *repr { "lib.py_repr_print" } else { "lib.str_print" }, 1), Op::Pop]),
         Elem::Bool => {
             let (yes, no) = p.words.clone().unwrap_or((b"1".to_vec(), b"0".to_vec()));
             let (other, done) = (b.label(), b.label());

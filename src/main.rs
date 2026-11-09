@@ -8,9 +8,11 @@
 //!   strike fetch <url> <file> [--sha256 HASH]
 //!   strike arc devices|receive|send   ArcStrike: folders to a nearby device
 //!   strike compile <files|dir> [-o EXE]   the universal compiler
+//!   strike daemon start|stop|status   keeps work hot between commands
 
 mod arc;
 mod builder;
+mod daemon;
 mod fstrike;
 mod graph;
 mod jvm;
@@ -33,6 +35,7 @@ const USAGE: &str = "usage:
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
   strike compile <file>... | <dir> [-o EXE] [-I DIR] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
+  strike daemon start [--idle SECONDS] | stop | status | watch <dir> | unwatch <dir>
   strike brand";
 
 fn main() -> ExitCode {
@@ -158,6 +161,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "arc" => arc_command(&args[1..]),
+        "daemon" => daemon::command(&args[1..]),
         "compile" => {
             let mut files: Vec<PathBuf> = Vec::new();
             let mut include = Vec::new();
@@ -196,7 +200,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             let shown = if files.len() > 1 { files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" ") } else { first.display().to_string() };
             let out = out.unwrap_or_else(|| first.with_extension("exe"));
             let input = uc::Input { files, dir, include };
-            let r = uc::compile(&input, &out, brands, gen, evaluate)?;
+            let r = daemon::compile(&input, &out, brands, gen, evaluate)?;
             if explain {
                 for line in &r.explain {
                     println!("  {line}");

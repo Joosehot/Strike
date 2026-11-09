@@ -24,7 +24,8 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
     for (i, op) in code.iter().enumerate() {
         let pop = |st: &mut Vec<Option<usize>>| st.pop().flatten();
         match op {
-            Op::Push(_) | Op::Load(_) => {
+            // a global's or the frame's address is a constant of the function
+            Op::Push(_) | Op::Load(_) | Op::AddrG(_) | Op::Frame(_) => {
                 st.push(Some(i));
                 at[i] = Some(i);
             }
@@ -52,11 +53,11 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 st.pop();
                 st.push(None);
             }
-            Op::StoreM(_) => {
+            Op::StoreM(_) | Op::OpM(..) => {
                 st.pop();
                 st.pop();
             }
-            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => st.push(None),
+            Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Data(_) => st.push(None),
             Op::Fail(..) => st.iter_mut().for_each(|x| *x = None),
             Op::ReadToken => {
                 st.push(None);
@@ -170,13 +171,14 @@ pub fn hoist(f: &mut Func) -> usize {
             let mut best: Option<(usize, usize)> = None;
             for i in t + 1..j {
                 let Some(s) = st[i] else { continue };
-                if s <= t || !matches!(code[i], Op::Bin(_) | Op::Un(_) | Op::Sext(_)) {
+                if s <= t || !matches!(code[i], Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)) {
                     continue;
                 }
                 let run = &code[s..=i];
-                let plain = run.iter().all(|o| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_)));
+                let plain = run.iter().all(|o| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)));
                 let invariant = run.iter().all(|o| !matches!(o, Op::Load(x) if stored.contains(x)));
-                let has_load = run.iter().any(|o| matches!(o, Op::Load(_)));
+                // a row's address (a global array plus a row offset) is worth a register
+                let has_load = run.iter().any(|o| matches!(o, Op::Load(_) | Op::AddrG(_) | Op::Frame(_)));
                 if plain && invariant && has_load && cannot_fail(run) && best.is_none_or(|(bs, bi)| i - s > bi - bs) {
                     best = Some((s, i));
                 }
@@ -198,6 +200,151 @@ pub fn hoist(f: &mut Func) -> usize {
         }
         return moved;
     }
+}
+
+/// The locals that only ever hold numbers that fit 32 bits: every store
+/// into one is of a value cut to 32 bits or less, a constant that fits, a
+/// comparison, a narrow element, or another such local. Parameters are not
+/// known to be.
+fn narrow32(f: &Func) -> Vec<bool> {
+    let mut narrow: Vec<bool> = (0..f.slots).map(|s| s >= f.params).collect();
+    loop {
+        let mut changed = false;
+        for (k, op) in f.code.iter().enumerate() {
+            let Op::Store(s) = op else { continue };
+            if !narrow[*s as usize] {
+                continue;
+            }
+            let fits = match k.checked_sub(1).map(|p| &f.code[p]) {
+                Some(Op::Sext(w)) => *w <= 32,
+                Some(Op::Push(c)) => i32::try_from(*c).is_ok(),
+                Some(Op::Load(t)) => narrow[*t as usize],
+                Some(Op::LoadM(w)) => *w <= 4,
+                Some(Op::Bin(b)) => b.is_comparison(),
+                _ => false,
+            };
+            if !fits {
+                narrow[*s as usize] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return narrow;
+        }
+    }
+}
+
+/// A local every store of which gives it the same constant (C's
+/// `int n = 300`) is read as that constant: its loops' counts become known.
+/// (Before its first store a C local holds nothing it may be read for, and
+/// Go and Python never read a variable before its first value.) Returns
+/// how many loads it replaced.
+pub fn constants(f: &mut Func) -> usize {
+    let mut value: Vec<Option<Option<i64>>> = vec![None; f.slots as usize];
+    for (k, op) in f.code.iter().enumerate() {
+        let Op::Store(s) = op else { continue };
+        let c = match k.checked_sub(1).map(|p| &f.code[p]) {
+            Some(Op::Push(c)) => Some(*c),
+            _ => None,
+        };
+        let v = &mut value[*s as usize];
+        *v = match (*v, c) {
+            (None, c) => Some(c),
+            (Some(Some(a)), Some(b)) if a == b => Some(Some(a)),
+            _ => Some(None),
+        };
+    }
+    // a local starts at zero: a constant other than zero counts only where
+    // it is stored before anything reads the local, on the straight way
+    // from the start (nothing jumps there, so every other load comes later)
+    let mut first = vec![false; f.slots as usize];
+    let mut read = vec![false; f.slots as usize];
+    for (k, op) in f.code.iter().enumerate() {
+        match op {
+            Op::Load(s) => read[*s as usize] = true,
+            Op::Store(s) if !read[*s as usize] && matches!(k.checked_sub(1).map(|p| &f.code[p]), Some(Op::Push(_))) => first[*s as usize] = true,
+            Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret | Op::Fail(..) => break,
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for op in f.code.iter_mut() {
+        if let Op::Load(s) = op {
+            if *s >= f.params {
+                if let Some(Some(c)) = value[*s as usize].filter(|v| *v == Some(0) || first[*s as usize]) {
+                    *op = Op::Push(c);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// The largest constant a local is ever given, where every store into it
+/// is of a constant (a C `int n = 20000000` used as a bound).
+fn most(f: &Func, s: u32) -> Option<i64> {
+    if s < f.params {
+        return None;
+    }
+    let mut m: Option<i64> = None;
+    for (k, op) in f.code.iter().enumerate() {
+        if *op == Op::Store(s) {
+            let Some(Op::Push(c)) = k.checked_sub(1).map(|p| &f.code[p]) else { return None };
+            m = Some(m.map_or(*c, |x| x.max(*c)));
+        }
+    }
+    // never stored: it holds zero
+    Some(m.unwrap_or(0))
+}
+
+/// A C int counter (`for (int i = 0; i < n; i++)`) is cut back to 32 bits
+/// after every `i + 1`; where the loop has just found i below a number
+/// that fits 32 bits, i + 1 fits too, and the cut changes nothing. Such a
+/// cut is left out (clang leaves it out because a signed overflow cannot
+/// happen; here it is shown not to). Returns how many.
+pub fn counters(f: &mut Func) -> usize {
+    let narrow = narrow32(f);
+    let code = &f.code;
+    let mut label_at = vec![usize::MAX; label_count(code) as usize];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            label_at[*l as usize] = i;
+        }
+    }
+    let mut cut = Vec::new();
+    for (j, op) in code.iter().enumerate() {
+        let Op::Jmp(top) = op else { continue };
+        let t = label_at[*top as usize];
+        if t >= j || j < 5 || t + 5 > j {
+            continue;
+        }
+        // top: Load c; a bound that fits 32 bits; Lt (or Le with a bound
+        // below the largest int); Jz end
+        let (Op::Load(c), bound, Op::Bin(cmp @ (BinOp::Lt | BinOp::Le)), Op::Jz(_)) = (&code[t + 1], &code[t + 2], &code[t + 3], &code[t + 4]) else { continue };
+        let fits = match (cmp, bound) {
+            (BinOp::Lt, Op::Push(n)) => i32::try_from(*n).is_ok(),
+            (BinOp::Lt, Op::Load(n)) => narrow[*n as usize],
+            (_, Op::Push(n)) => (i32::MIN as i64..i32::MAX as i64).contains(n),
+            (_, Op::Load(n)) => most(f, *n).is_some_and(|m| m < i32::MAX as i64) && narrow[*n as usize],
+            _ => false,
+        };
+        // bottom: Load c; Push 1; Add; Sext 32; Store c
+        if !fits || !narrow[*c as usize] || code[j - 5..j] != [Op::Load(*c), Op::Push(1), Op::Bin(BinOp::Add), Op::Sext(32), Op::Store(*c)] {
+            continue;
+        }
+        // c is changed only there, and the loop is entered only by its top
+        let stores = code[t..j].iter().filter(|o| **o == Op::Store(*c)).count();
+        let inside = |l: u32| (t..=j).contains(&label_at[l as usize]);
+        let entered = code.iter().enumerate().any(|(k, o)| matches!(o, Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) if inside(*l) && *l != *top && !(t..=j).contains(&k)));
+        if stores == 1 && !entered {
+            cut.push(j - 2);
+        }
+    }
+    for &k in cut.iter().rev() {
+        f.code.remove(k);
+    }
+    cut.len()
 }
 
 #[cfg(test)]

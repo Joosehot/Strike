@@ -114,8 +114,9 @@ file, not a new compiler. There are three today: C, Go and Python.
 
 Integers and truth values, functions and recursion, if/else, while, for,
 Python's `range`, break and continue, printing (print, Println, puts,
-and printf with `%d`, `%s` and `%v`), global variables, and whole numbers
-read from standard input.
+and printf with `%d`, `%s`, `%c`, `%q` and `%v`), global variables, arrays,
+lists and slices, strings, and whole numbers and lines read from standard
+input.
 
 - **Globals.** C's and Go's variables outside functions get their first
   values before main runs. Python's module names are read by functions, and
@@ -128,6 +129,57 @@ read from standard input.
   line at all, or a number past 64 bits stops the program, with Python's
   reason. Input is read 4096 bytes at a time. A program that reads its input
   is never worked out while compiling.
+- **Arrays, lists and slices** ([src/uc/lib.rs](src/uc/lib.rs): what they
+  need beyond single operations is written in Strike IR, and branded,
+  inlined and optimized as the program's own functions are). The IR has
+  memory: loads and stores of 1, 2, 4 or 8 bytes, a function's own memory,
+  globals' addresses, and a stop with the language's exit code. New memory
+  comes from Strike's own allocator over VirtualAlloc; nothing is given
+  back yet. An element takes its own width: a C `char` 1 byte, an `int` 4,
+  a Go `int32` 4.
+  - **C:** arrays local (in the function's own memory) and global, 2D,
+    `{...}` initializers (the rest zero), array parameters (`int a[]`,
+    `int *a`, `int g[][10]`). An index is not checked, as C does not
+    check it.
+  - **Go:** slices (`make`, `[]T{...}`, `append` with Go 1.27's growth and
+    the allocator's size classes, so `cap` is Go's for a slice on the heap,
+    slicing, `len`, `cap`) and arrays as values (copied when assigned,
+    given or returned). `range` with an index, a value or both. An index
+    out of range panics with exit code 2. (Go 1.25 and later keep a small
+    slice that never leaves its function on the stack, where its first
+    capacity is 4; Strike does not follow Go's escape analysis.)
+  - **Python:** lists (`[...]`, `[x] * n`, comprehensions with `if`,
+    `append`, `pop`, `+`, `+=`, slices, negative indexes, `for x in`,
+    `len`, a list as a condition), printed as Python prints them. An index
+    out of range is IndexError, with exit code 1. The kind of an empty
+    list's elements is learned from what is appended, in any function.
+- **Strings** ([src/uc/strs.rs](src/uc/strs.rs), written in Strike IR as
+  the rest of the library is). A Python or Go string is the address of its
+  length and its bytes, never changed once made; a literal lives in the
+  read-only data (`Op::Data`), and a copy of a string is a copy of its
+  address.
+  - **Python:** literals, `+`, `*`, `len`, `s[i]` and negative indexes,
+    slices, the comparisons, `in`, `for c in s`, `str()`, `int()` of a
+    string (blanks around it, a sign, underscores between digits, else
+    ValueError), `ord`, `chr`, `input()` (with a prompt too), and
+    `upper`, `lower`, `strip`, `split()`, `join`, `startswith`, `find`. A
+    string in a list prints as Python's repr, quotes chosen as Python
+    chooses them. Strike holds Python's strings to ASCII, so a code point is
+    a byte: a literal past ASCII is refused, and `chr()` past it or a line
+    read that holds one stops the program with the reason.
+  - **Go:** bytes. `s[i]` is a `byte` (uint8, which wraps at 256),
+    `range` decodes UTF-8 as Go does (U+FFFD and one byte where it is not
+    UTF-8), `string(r)` encodes it, and slicing out of range panics with
+    exit code 2. Printf's `%s`, `%v`, `%c` and `%q` print as Go prints;
+    `%q` of a string past ASCII stops the program (which characters Go
+    keeps as they are is Unicode's table). `strconv.Itoa` is there,
+    `strconv.Atoi` (two results) is not.
+  - **C:** `char s[] = "abc"` and `char s[10] = "ab"` (the zero byte where
+    there is room), a pointer variable given a literal or an array to point
+    at, `s[i]`, `while (s[i])`, printf's `%s` and `%c`, `puts`, `strlen` and
+    `strcmp` (-1, 0 or 1, as Windows' C library gives it). strlen's
+    `size_t` is unsigned: it is compared unsigned, as C converts the other
+    side, and dividing or shifting it is refused.
 
 Integers are exactly what each language says they are:
 
@@ -202,8 +254,10 @@ a value.
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
-- strings as values, arrays, floats, structs, pointers, `unsigned` and
-  `uint`;
+- floats, structs, pointer arithmetic, `&` and `*`, and the unsigned
+  types other than Go's `byte`;
+- a Python string past ASCII, a string changed in place, `split` with a
+  separator, Go's `[]byte`;
 - a chained comparison in Python;
 - a function whose value is used but which can end without one;
 - a Python variable that changes between a number and a truth value.
@@ -241,7 +295,15 @@ the line and the reason, and never guessed. Refused today:
   preprocessor alone gives, token for token, what `clang -E -P` gives for
   [tests/uc/cpp/](tests/uc/cpp/): the standard's own macro examples,
   conditionals, and includes through guards, `#pragma once` and `-I`.
-- 39 tests in all, in about 30 s.
+- Arrays, lists and slices are checked the same way (tests/uc/arrays.*),
+  with each index error and its exit code, in every mode; the random C
+  programs have local and global arrays and arrays given to functions.
+- Strings are checked the same way (tests/uc/strings.*, and lines read by
+  Python), with each error a string can stop on (IndexError, ValueError,
+  TypeError, EOFError, Go's panics) and each refusal. The random C
+  programs make strings in char arrays too, and compare them with strlen
+  and strcmp.
+- 67 tests in all (every target of `cargo test --release`), in about 45 s.
 
 The tests have found real bugs, all fixed:
 
@@ -249,7 +311,9 @@ The tests have found real bugs, all fixed:
 - a panic in release builds, from jumps left in code that folding made
   unreachable;
 - a crash on frames larger than a page;
-- Python's 25! and C's `int` overflow coming out wrong with no warning.
+- Python's 25! and C's `int` overflow coming out wrong with no warning;
+- Go's `x := int32(y)` (and `c := s[0]`) taking int's width, not the
+  value's, so x did not wrap at 32 bits.
 
 ### Code generation
 
@@ -311,7 +375,18 @@ these is also something clang -O2 does:
   gets the counter's last value.
 - **Loop rotation and unrolling** ([src/uc/rotate.rs](src/uc/rotate.rs)).
   The test moves to the bottom, and a short body with no jump goes round
-  twice per jump back.
+  twice (a very short one four times) per jump back. A counted loop whose
+  count four or two divides has its copies with no test between them, and
+  copy m reads the counter plus m, so the copies differ only by their
+  addresses' displacement.
+- **Array loops.** A local every store of which gives one constant is read
+  as it (so `int n = 300` makes a loop's count known). A global array's
+  address and a row's leave the loop. `a[i] += x` is one instruction on
+  the memory, an element only tested is one `cmp` with zero, and an
+  element's address is `[base + index * size + d]`. A C `int` counter's
+  cut back to 32 bits is left out where the loop has just found it below a
+  bound that fits: clang leaves it out because signed overflow cannot
+  happen, Strike shows that it cannot.
 - **Inlining callees of up to 200 operations.**
 - **A program that reads nothing is worked out while compiling**
   ([src/uc/eval.rs](src/uc/eval.rs)). Strike's IR runner tries first,
@@ -350,6 +425,20 @@ computes the same numbers.
 | invariant loops | 0.0275 s | 0.0260 s | 0.028 s | 6% slower |
 | a sum loop | 0.0047 s | 0.0053 s | 0.042 s | as fast (both closed it) |
 
+Arrays, fastest and median of interleaved runs (the machine busy with other
+builds, so a few percent either way is noise):
+
+| | Strike | clang -O2 | Strike against clang -O2 |
+|---|---|---|---|
+| 600x600 matrix product (`long long`) | 0.053 s | 0.056 s | 6% faster |
+| 300x300 matrix product | 0.0122 s | 0.0128 s | 5% faster |
+| sieve of 100 million (`char`) | 0.648 / 0.678 s | 0.617 / 0.690 s | as fast |
+
+clang vectorizes the matrix product with SSE2, but x86 has no 64-bit
+vector multiplication, so its three `pmuludq` per two elements lose to
+Strike's four copies of one `imul` and one `add` on the memory. The sieve
+is bound by memory, and its loops are now the same as clang's.
+
 On these five, Strike's code is as fast as clang -O2's, and some are
 faster. The calls benchmark is a C `long` loop. It cuts each result to 32
 bits, because C's `long` is 32 bits on Windows. clang does not cut,
@@ -365,9 +454,8 @@ take 0.2 s.
 To compile ordinary programs, these are still missing, in the order they
 are planned:
 
-1. Arrays and strings, with a heap and an allocator under them (then
-   command-line arguments, which are strings).
-2. Floats.
+1. Command-line arguments, which are strings now there are strings.
+2. Floats (being built).
 3. Structs and classes.
 4. ~~Several files and modules, and C's preprocessor.~~ Done: see
    above.
@@ -377,6 +465,100 @@ After those come garbage collection (for Python's and Go's objects),
 debug information, and other platforms (ELF, Mach-O, ARM). Next to clang,
 Go and CPython, Strike covers a small part of each language. Within that
 part it is checked against them and gives their answers.
+
+## The daemon
+
+```
+strike daemon start [--idle SECONDS]   one per user and Strike home (idle exit: 30 min)
+strike daemon stop | status
+strike daemon watch <dir> | unwatch <dir>
+```
+
+A resident Strike that keeps work hot between commands. `strike compile`
+and `strike build` use it when it runs, and work alone when it does not,
+or when it does not answer. The executables are byte for byte the same
+either way. `STRIKE_DAEMON=off` never uses it; `STRIKE_DAEMON=auto` also
+starts one in the background when none runs.
+
+What it keeps was chosen by measuring where a small command's time goes.
+Parsing the language descriptions takes 0.4 ms and opening the brand pack
+0.07 ms, so they are not kept. Three things are:
+
+- **Readings.** A description's reading of a program (preprocess, lex,
+  parse, the files made one, lower) is 65 of the 73 ms of compiling a
+  program of 2000 functions. It is kept under the hash of the description
+  and the files given, with their contents. A reading also pulls in other
+  files (headers, imported modules and packages, go.mod) and looks for
+  some that are not there. Each of those looks is kept with it, and the
+  reading is used again only while every look finds the same.
+- **Evaluations** (`--release`). What Strike's IR runner made of a program
+  is kept under the hash of the whole IR and the runner's limits. What a
+  baking executable printed is kept under the hash of its bytes. A run
+  that did not end in time is not kept.
+- **rustc's facts.** `rustc --print cfg` and `rustc -vV` are 85 of the 90 ms
+  of a `strike build` where nothing changed. They are kept under the hash
+  of everything that decides which rustc answers:
+  - every RUST*, CARGO* and PATH variable;
+  - every rustc the search could find, by path, size and time;
+  - rustup's settings and each toolchain's rustc;
+  - the rust-toolchain files from the working folder up.
+
+  The build itself still runs in the client, with the client's own
+  environment.
+
+Everything kept is found by content, never by a file's name or time. An
+entry is either exactly what the work would give, or it is not found.
+
+`watch` reads a folder's files ahead: every file of a known language whose
+size or time changes is read within half a second, so the next compile
+finds its reading. Only the folders named are watched. Folders whose names
+start with a dot, `target`, `strike-out` and `node_modules` are skipped.
+
+### Safety
+
+- **The channel.** It is a named pipe that refuses remote clients, so
+  nothing listens on the network.
+- **The token.** Both sides prove they know a token kept in
+  `<home>/daemon/state.json`, which only the user can read. The proof is a
+  keyed BLAKE3 over a fresh nonce. A pipe someone else made is never
+  believed. A client without the token gets no answer and works alone.
+- **No impersonation.** The client opens the pipe at identification level,
+  so the daemon cannot act as its client.
+- **Another binary.** A daemon from another Strike binary is never used.
+  The binary is compared by content, and the language descriptions and
+  generator are inside it. The CLI says so on stderr and works alone, and
+  `start` replaces the old daemon.
+- **Rebuilding Strike.** The daemon runs from a copy of the binary
+  (`<home>/daemon/bin`), so Strike can be rebuilt while it runs. The
+  rebuilt binary is then another binary.
+- **The client's surroundings.** Each compile takes the client's working
+  folder and STRIKE_ variables, including the generator's rules
+  (`STRIKE_CODEGEN`, read on every compile). Compiles therefore run one at
+  a time.
+- **Ending.** The daemon goes back to its own folder after every compile.
+  It ends on `stop`, or after the idle time with no requests. It waits for
+  a compile that is running, and removes its state.
+- **Crashes.** A crashed daemon, or one that does not answer, never breaks
+  a build: the CLI works alone.
+
+### Measured
+
+Mean of 7 runs of the whole command, the brands warm both times:
+
+| | alone | daemon |
+|---|---|---|
+| `compile` tests/uc/suite.c (6 functions) | 37.7 ms | 31.5 ms |
+| `compile` tests/uc/suite.py | 37.5 ms | 30.7 ms |
+| `compile` a program of 2000 functions | 126.7 ms | 48.0 ms |
+| `compile --release` fib(27), worked out while compiling | 57.6 ms | 32.7 ms |
+| the 2000 functions, one line changed, not watched | 105.7 ms | 109.7 ms |
+| the 2000 functions, one line changed, folder watched | 105.7 ms | 43.4 ms |
+| `build` of a small crate, nothing changed | 117.5 ms | 40.4 ms |
+
+About 30 ms of every command is starting a process, and the daemon cannot
+save that. On a small file the daemon gains next to nothing. The time
+saved is work that depends on content: reading a big file, evaluating, and
+asking rustc.
 
 ## fStrike: downloads
 

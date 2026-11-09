@@ -15,6 +15,7 @@
 mod cpp;
 mod eval;
 mod fold;
+pub mod hot;
 mod inline;
 mod tail;
 pub mod ir;
@@ -28,6 +29,7 @@ mod parse;
 mod pe;
 mod rotate;
 mod scev;
+mod strs;
 mod x64;
 mod x64opt;
 
@@ -108,6 +110,7 @@ pub struct Input {
     pub include: Vec<PathBuf>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub lang: String,
     /// every file read: the program's, the ones it imports or includes
@@ -257,7 +260,8 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
                 continue;
             }
         }
-        match modules::front(l, &units[i], &input.include) {
+        // in the daemon, from its memory (hot.rs)
+        match hot::front(l, &units[i], &input.include, modules::front) {
             Ok((low, read)) => {
                 let s = j.whole + ext_score(i) + j.reach;
                 let what = if read.len() > 1 { format!("all {} files", read.len()) } else { "the whole file".to_string() };
@@ -300,10 +304,10 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
     let mut evaluated = None;
     // a program that reads its input is never worked out while compiling:
     // what it does depends on what it is given
-    let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine)));
+    let reads = low.funcs.iter().any(|f| f.code.iter().any(|o| matches!(o, ir::Op::ReadToken | ir::Op::ReadLine) || matches!(o, ir::Op::Call(s, _) if s == ir::GETC)));
     let evaluate = evaluate && !reads;
     if gen == Gen::Release && evaluate {
-        if let Some(d) = eval::run(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {
+        if let Some(d) = hot::eval(&low.funcs, &low.entry, low.globals, &rules.release.evaluate) {
             let mut code = Vec::new();
             if !d.output.is_empty() {
                 code.push(ir::Op::PrintStr(d.output));
@@ -321,8 +325,12 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
+            if opt::constants(f) > 0 {
+                fold::run(f);
+            }
             simplified += opt::simplify(f);
             hoisted += opt::hoist(f);
+            simplified += opt::counters(f);
             closed += scev::run(f);
             fold::run(f);
             rotate::run(f);
@@ -371,8 +379,9 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
         baking[0] = ("rt.start".to_string(), x64::bake_start(&low.entry));
         // a path with its folder: a bare name would be looked for on PATH
         let path = std::path::absolute(out.with_extension(format!("bake{}.exe", std::process::id()))).map_err(|e| e.to_string())?;
-        if std::fs::write(&path, pe::link(&baking, "rt.start", bss)?).is_ok() {
-            let result = eval::bake(&path, &rules.release.evaluate);
+        let baked = pe::link(&baking, "rt.start", bss)?;
+        if std::fs::write(&path, &baked).is_ok() {
+            let result = hot::bake(&baked, &path, &rules.release.evaluate);
             let _ = std::fs::remove_file(&path);
             if let Some((output, returned)) = result {
                 let mut code = Vec::new();

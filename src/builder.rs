@@ -40,8 +40,8 @@ pub struct Report {
 }
 
 pub fn rustc_version() -> Result<String, String> {
-    let out = Command::new("rustc").arg("-vV").output().map_err(|e| format!("rustc: {e}"))?;
-    if !out.status.success() {
+    let out = crate::daemon::rustc(&["-vV"]).map_err(|e| format!("rustc: {e}"))?;
+    if !out.ok {
         return Err("rustc -vV failed".into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())

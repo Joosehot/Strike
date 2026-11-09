@@ -472,20 +472,20 @@ impl Pp<'_> {
         }
         let here = &self.files[id as usize];
         let mut found = None;
-        if quoted && here.is_file() {
+        if quoted && super::hot::is_file(here) {
             if let Some(dir) = here.parent() {
                 let p = dir.join(&name);
-                if p.is_file() {
+                if super::hot::is_file(&p) {
                     found = Some(p);
                 }
             }
         }
         if found.is_none() {
-            found = self.include.iter().map(|d| d.join(&name)).find(|p| p.is_file());
+            found = self.include.iter().map(|d| d.join(&name)).find(|p| super::hot::is_file(p));
         }
         let (path, text) = match found {
             Some(p) => {
-                let text = std::fs::read_to_string(&p).map_err(|e| (at, format!("{}: {e}", p.display())))?;
+                let text = super::hot::read_file(&p).map_err(|e| (at, format!("{}: {e}", p.display())))?;
                 (p, text)
             }
             None => match self.rule.headers.get(&name) {
