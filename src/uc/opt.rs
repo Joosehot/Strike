@@ -441,8 +441,10 @@ pub fn counters(f: &mut Func) -> usize {
 
 /// Does the value operation p leaves only ever reach the low 32 bits of a
 /// result: on its way up (in straight code) only operations whose low bits
-/// depend only on their operands' low bits, until a cut to 32 bits or less?
-fn low_only(code: &[Op], used: &[Option<(usize, usize)>], p: usize) -> bool {
+/// depend only on their operands' low bits, until a cut to 32 bits or less,
+/// or a store into a local whose own cut was moved to the loop's exits
+/// (ree: every read of it is such a read too, and it is cut there)?
+fn low_only(code: &[Op], used: &[Option<(usize, usize)>], p: usize, free: &[u32]) -> bool {
     let mut at = p;
     loop {
         let Some((c, place)) = used[at] else { return false };
@@ -451,6 +453,7 @@ fn low_only(code: &[Op], used: &[Option<(usize, usize)>], p: usize) -> bool {
         }
         match &code[c] {
             Op::Sext(n) if *n <= 32 => return true,
+            Op::Store(z) if free.contains(z) => return true,
             Op::Sext(_) | Op::Un(UnOp::Neg | UnOp::Bnot | UnOp::Plus) => {}
             Op::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor) => {}
             // shifted left by a constant: the value is the left side (place 1)
@@ -472,6 +475,8 @@ fn low_only(code: &[Op], used: &[Option<(usize, usize)>], p: usize) -> bool {
 pub fn defer_cuts(f: &mut Func) -> usize {
     let mut moved = 0;
     let mut done: Vec<u32> = Vec::new();
+    // the locals whose cut is already at each loop's exits, by its top
+    let mut free: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     'again: loop {
         let code = &f.code;
         let mut label_at = vec![usize::MAX; label_count(code) as usize];
@@ -540,7 +545,10 @@ pub fn defer_cuts(f: &mut Func) -> usize {
                 if stores.is_empty() {
                     continue;
                 }
-                let reads_ok = (t..=j).all(|k| code[k] != Op::Load(x) || low_only(code, &used, k));
+                let mine = free.get(&top).cloned().unwrap_or_default();
+                let mut also = mine.clone();
+                also.push(x);
+                let reads_ok = (t..=j).all(|k| code[k] != Op::Load(x) || low_only(code, &used, k, &also));
                 if !reads_ok {
                     continue;
                 }
@@ -559,6 +567,7 @@ pub fn defer_cuts(f: &mut Func) -> usize {
                 }
                 f.code = out;
                 moved += stores.len();
+                free.entry(top).or_default().push(x);
                 done.pop();
                 continue 'again;
             }

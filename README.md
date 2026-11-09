@@ -486,7 +486,7 @@ the line and the reason, and never guessed. Refused today:
   `--release --no-evaluate`, and must print the same. Each was checked to
   fail with the rule it guards broken (the calls' or divisions' registers,
   the alias test, the cut at a loop's way out).
-- 101 tests in all (every target of `cargo test --release`), in about 70 s.
+- 102 tests in all (every target of `cargo test --release`), in about 70 s.
 
 The tests have found real bugs, all fixed:
 
@@ -913,9 +913,9 @@ min / median in seconds; the machine was busy, so a few percent is noise.
 | n-body | 0.088 / 0.090 | **0.047 / 0.048** | 0.053 / 0.055 | | **12% faster** (was 1.7 times as slow) |
 | factor.c | 0.179 / 0.181 | **0.104 / 0.105** | 0.108 / 0.118 | | **4-11% faster** (was 1.7 times as slow) |
 | factor.go | 0.180 / 0.188 | **0.106 / 0.120** | | 0.316 / 0.318 | 3 times as fast as Go |
-| intchain.c | 0.375 / 0.379 | **0.340 / 0.342** | 0.274 / 0.278 | | 24% slower (was 37%) |
+| intchain.c | 0.375 / 0.379 | **0.267 / 0.271** | 0.277 / 0.281 | | **4% faster** (was 37% slower) |
 | invariant loops | 0.0258 / 0.0263 | 0.0244 / 0.0258 | 0.0244 / 0.0257 | | as fast (was 6% slower) |
-| chain.c | 0.203 / 0.206 | 0.203 / 0.206 | 0.194 / 0.196 | | 5% slower |
+| chain.c | 0.203 / 0.206 | 0.201 / 0.202 | 0.196 / 0.198 | | 2-3% slower |
 | poly.c | 0.127 / 0.129 | 0.128 / 0.130 | 0.140 / 0.142 | | 9% faster |
 | walk.c | 0.056 / 0.057 | 0.055 / 0.057 | 0.059 / 0.061 | | 7% faster |
 | fib(36) | 0.0287 / 0.0298 | 0.0289 / 0.0299 | 0.0301 / 0.0308 | | 3-4% faster |
@@ -938,17 +938,25 @@ What made the difference:
   read once per `i`, and the three copies of `m[i]` are one.
 - **factor.c**: the shifts go straight into their locals' registers, and
   the eighth local has r8 instead of memory.
-- **intchain.c**: x's and y's cuts moved out of the loop take an
-  instruction off each step of the chain.
+- **intchain.c**: both cuts are out of the loop. x's was moved first; y's
+  value goes only into x and y, so it is read for its low 32 bits too, and
+  its cut moves as well (a value going into a local whose cut is at the
+  loop's exits counts as read for its low bits). And in `y = 7y - 2x + 11`
+  the constant goes in before the x just worked out, so x is one addition
+  from y, not two. Both together: 0.340 s to 0.267 s, faster than clang.
+- **chain.c**: `3x + 5` is one `lea [x + x * 2 + 5]` wherever a constant
+  follows `3x`, `5x` or `9x` (the constant move above had turned it into
+  `imul` and `add`, four cycles on the chain).
 
 What is left, and why:
 
-- **intchain.c and chain.c** are dependency chains. clang works the next
-  time round's x into y and reassociates across the copies of the unrolled
-  loop (it computes `3x' + 5` from the product before `+ i`). Substituting
-  x into y by hand in the source made Strike only 4% faster (0.361 s), so
-  what is left is clang's reassociation across iterations, and for
-  intchain its 32-bit registers, which need no cut at all.
+- **chain.c** is a dependency chain through x, 2-3% behind clang. clang
+  works x's new value into y's (`y' = y(5P + 6) + 5i + 1` from the same
+  `P = x(3x + 5) + 7`), so y' does not wait for x'. Written so by hand,
+  Strike's code is slower (0.214 s): the generator keeps one value in rax
+  and the others wait on the machine's stack, so two values worked out side
+  by side cost a push and a pop. Holding a second value in a register is
+  what is left.
 - **intexpr.c, index.c and the double matrix product** are vectorized by
   clang (`pmulld`, `mulpd`). intexpr.c is also slower than clang's scalar
   code (0.127 s): clang works in 32-bit registers. Removing the cut of `s`
