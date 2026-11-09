@@ -27,6 +27,7 @@ mod modules;
 mod opt;
 mod parse;
 mod pe;
+mod alias;
 mod ranges;
 mod rotate;
 mod scev;
@@ -174,6 +175,10 @@ fn save(c: &Code) -> Vec<u8> {
                 offset = o.to_le_bytes();
                 (3, &offset[..])
             }
+            Target::Abs(o) => {
+                offset = o.to_le_bytes();
+                (4, &offset[..])
+            }
         };
         b.push(kind);
         b.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -208,6 +213,7 @@ fn load(b: &[u8]) -> Option<Code> {
                 1 => Target::Import(String::from_utf8(data).ok()?),
                 2 => Target::Data(data),
                 3 => Target::Writable(u32::from_le_bytes(data.try_into().ok()?)),
+                4 => Target::Abs(u32::from_le_bytes(data.try_into().ok()?)),
                 _ => return None,
             },
         ));
@@ -330,6 +336,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
     let (mut simplified, mut hoisted, mut closed, mut vectorized) = (0, 0, 0, 0);
+    let globals = low.globals;
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
@@ -338,7 +345,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             }
             simplified += opt::simplify(f);
             simplified += simplify::run(f, rules.loop_weight);
-            hoisted += opt::hoist(f);
+            hoisted += opt::hoist(f, globals);
             simplified += opt::counters(f);
             simplified += ranges::run(f);
             closed += scev::run(f);
@@ -346,6 +353,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             vectorized += vectorize::run(f);
             rotate::run(f);
             simplified += values::run(f);
+            simplified += opt::defer_cuts(f);
             fold::run(f);
         }
     }

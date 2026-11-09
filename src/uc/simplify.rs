@@ -1256,7 +1256,7 @@ pub(super) fn same_masked(a: &[Op], b: &[Op], mask: &dyn Fn(u32) -> i64) -> bool
 
 /// What pops the value each operation leaves, and in which place from the
 /// top: (the consumer, its operand) per operation, within straight code.
-fn consumers(code: &[Op]) -> Vec<Option<(usize, usize)>> {
+pub(super) fn consumers(code: &[Op]) -> Vec<Option<(usize, usize)>> {
     let mut used = vec![None; code.len()];
     let mut st: Vec<Option<usize>> = Vec::new();
     for (i, op) in code.iter().enumerate() {

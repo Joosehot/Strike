@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-17 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-21 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -99,6 +99,52 @@ const R11: u8 = 11;
 /// rbx, rsi, rdi, r12 to r15: kept across calls (Windows x64)
 const SAVED: [u8; 7] = [3, 6, 7, 12, 13, 14, 15];
 const ARGS: [u8; 4] = [1, 2, 8, 9];
+/// r10, r9, r8, rdx: not kept across calls, so a local lives in one only
+/// where no operation that writes it comes while the local is still to be
+/// read (`clobbers`); such a register costs nothing to save
+const VOL: [u8; 4] = [10, 9, 8, 2];
+
+/// Which of the VOL registers an operation may write (bit k for VOL[k]): a
+/// call takes all, a division and a checked shift rdx and r8.
+fn clobbers(op: &Op) -> u8 {
+    match op {
+        Op::Call(..) | Op::PrintInt | Op::PrintStr(_) | Op::PrintMem | Op::ReadToken | Op::ReadLine | Op::Fail(..) | Op::FailMem(_) => 0b1111,
+        Op::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor | BinOp::ShlOv) => 0b1100,
+        _ => 0,
+    }
+}
+
+/// For every local, the VOL registers it may live in (bit k for VOL[k]):
+/// none that an operation writes while the local is live after it, or
+/// while a value read from the local may still wait on the generator's
+/// stack (read since the IR's stack was last empty, as the values on it
+/// are worked out lazily).
+fn volatile_ok(code: &[Op], slots: u32, live: &[Vec<u64>], at_depth: &[Option<i32>]) -> Vec<u8> {
+    let mut ok = vec![0b1111u8; slots as usize];
+    let mut window: Vec<u32> = Vec::new();
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Load(s) = op {
+            window.push(*s);
+        }
+        let c = clobbers(op);
+        if c != 0 {
+            for s in 0..slots {
+                if live[i][s as usize / 64] & (1u64 << (s % 64)) != 0 {
+                    ok[s as usize] &= !c;
+                }
+            }
+            for &s in &window {
+                ok[s as usize] &= !c;
+            }
+        }
+        // nothing waits where the IR's stack is empty (on every way there),
+        // and at a label or a jump everything waiting is pushed or in rax
+        if at_depth.get(i + 1) == Some(&Some(0)) || matches!(op, Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret) {
+            window.clear();
+        }
+    }
+    ok
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum V {
@@ -126,6 +172,20 @@ enum V {
     /// float operation): the next float operation takes it there, anything
     /// else has it moved out
     X(u8),
+    /// a global's or the frame's memory plus d bytes: used where it is, as
+    /// [address] (an absolute displacement) or [rsp + d]
+    At(B, i32),
+    /// the same plus index << k, the index a local in a register:
+    /// [index * size + address], [rsp + index * size + d]
+    AtIdx(B, u32, u8, i32),
+}
+
+/// Memory whose address the code knows without a register: the zeros at a
+/// bss offset (a global), or the function's own memory at a frame offset.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum B {
+    G(u32),
+    F(i32),
 }
 
 /// The xmm registers floats wait in (volatile on Windows, so a call takes
@@ -138,6 +198,9 @@ const XMMS: std::ops::RangeInclusive<u8> = 2..=5;
 enum Addr {
     Base(u8, i32),
     Index(Option<u8>, u8, u8, i32),
+    /// an absolute address in the zeros (its bss offset, wrapping), plus
+    /// index << k
+    Abs(Option<(u8, u8)>, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +221,8 @@ enum Place {
     Mem,
     Gpr,
     Xmm,
+    /// VOL[k], a register nothing writes while the local is live
+    Vol(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -203,7 +268,7 @@ fn weights(f: &Func, r: &Rules) -> (Vec<f64>, Vec<f64>) {
 /// float operation's (a float there is moved to xmm for each), an xmm
 /// register those that are (a float in memory is an operand as it is, so a
 /// general register saves a float nothing).
-fn choose(f: &Func, r: &Rules) -> Vec<Place> {
+fn choose(f: &Func, r: &Rules, vol_ok: &[u8]) -> Vec<Place> {
     let (w, wf) = weights(f, r);
     // the vector locals take the last xmm registers (x64vec.rs)
     let float_regs = XSAVED.len() - super::ir::vector_locals(&f.code) as usize;
@@ -219,6 +284,18 @@ fn choose(f: &Func, r: &Rules) -> Vec<Place> {
                     let mut p = pick.clone();
                     p[s] = kind;
                     next.push((score + gain - r.save_cost, p));
+                }
+            }
+            // a volatile register saves the same uses and costs no saving;
+            // a parameter's own argument register spares its move too
+            if w[s] > 0.0 {
+                for k in 0..VOL.len() as u8 {
+                    if vol_ok[s] & (1 << k) != 0 && !pick.contains(&Place::Vol(k)) {
+                        let own = (s as u32) < f.params.min(4) && ARGS[s] == VOL[k as usize];
+                        let mut p = pick.clone();
+                        p[s] = Place::Vol(k);
+                        next.push((score + w[s] + if own { 0.5 } else { 0.0 }, p));
+                    }
                 }
             }
         }
@@ -278,6 +355,142 @@ fn live_after(code: &[Op], slots: u32) -> Vec<Vec<u64>> {
     }
 }
 
+/// Which operations can be reached from the start, and the depth of the
+/// IR's stack at each, found by following every way through the code: a
+/// label reached only by jumps from later on (a loop's top) is reached even
+/// where the code just before it is not, and a jump that is never reached
+/// decides nothing.
+pub(super) fn stack_depths(code: &[Op]) -> Vec<Option<i32>> {
+    let labels = super::ir::label_count(code);
+    let mut pos = vec![0usize; labels as usize];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            pos[*l as usize] = i;
+        }
+    }
+    let mut at: Vec<Option<i32>> = vec![None; code.len()];
+    let mut work = vec![(0usize, 0i32)];
+    while let Some((i, d)) = work.pop() {
+        if i >= code.len() || at[i].is_some() {
+            continue;
+        }
+        at[i] = Some(d);
+        let Some(effect) = super::ir::stack_effect(&code[i]) else { continue }; // a return or a stop
+        let after = d + effect;
+        match &code[i] {
+            Op::Jmp(l) => work.push((pos[*l as usize], after)),
+            Op::Jz(l) | Op::Jnz(l) => {
+                work.push((pos[*l as usize], after));
+                work.push((i + 1, after));
+            }
+            _ => work.push((i + 1, after)),
+        }
+    }
+    at
+}
+
+/// Locals that are never live at once share one slot, so HotMotor's beam
+/// chooses a register for them together: a local is "live" from a store to
+/// its last read, and also while a value read from it may still wait on the
+/// generator's stack (read since the IR's stack was last empty). Two locals
+/// meet where one is stored while the other is live. Parameters, and locals
+/// read before they are stored (they hold their zero from the start), keep
+/// their own slots; a float local shares only with float locals. The slots
+/// are numbered anew, the parameters first.
+fn coalesce(f: &Func) -> Func {
+    let n = f.slots as usize;
+    let words = n.div_ceil(64).max(1);
+    if n == 0 {
+        return f.clone();
+    }
+    let code = &f.code;
+    let live = live_after(code, f.slots);
+    let bit = |v: &[u64], s: usize| v[s / 64] & (1u64 << (s % 64)) != 0;
+    // live where the function begins
+    let mut entry = vec![0u64; words];
+    if let Some(after) = live.first() {
+        entry.clone_from(after);
+        match code[0] {
+            Op::Store(s) => entry[s as usize / 64] &= !(1u64 << (s % 64)),
+            Op::Load(s) => entry[s as usize / 64] |= 1u64 << (s % 64),
+            _ => {}
+        }
+    }
+    // float or not, by most of its uses
+    let fl = float_uses(code);
+    let mut votes = vec![0i64; n];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Load(s) | Op::Store(s) = op {
+            votes[*s as usize] += if fl[i] { 1 } else { -1 };
+        }
+    }
+    let mut meet = vec![vec![0u64; words]; n];
+    let at_depth = stack_depths(code);
+    let mut window: Vec<u32> = Vec::new();
+    for (i, op) in code.iter().enumerate() {
+        match op {
+            Op::Load(s) => window.push(*s),
+            Op::Store(b) => {
+                let b = *b as usize;
+                let mut with = live[i].clone();
+                for &a in &window {
+                    with[a as usize / 64] |= 1u64 << (a % 64);
+                }
+                for a in 0..n {
+                    if a != b && bit(&with, a) {
+                        meet[a][b / 64] |= 1u64 << (b % 64);
+                        meet[b][a / 64] |= 1u64 << (a % 64);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // the window as volatile_ok keeps it
+        if at_depth.get(i + 1) == Some(&Some(0)) || matches!(op, Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Ret) {
+            window.clear();
+        }
+    }
+    let mut rep = vec![usize::MAX; n];
+    // (the slot that stands for them, every slot met by one of them, float)
+    let mut groups: Vec<(usize, Vec<u64>, bool)> = Vec::new();
+    for s in 0..n {
+        if s < f.params as usize || bit(&entry, s) {
+            rep[s] = s;
+            continue;
+        }
+        let float = votes[s] > 0;
+        match groups.iter_mut().find(|(_, m, k)| *k == float && !bit(m, s)) {
+            Some((r, m, _)) => {
+                rep[s] = *r;
+                for w in 0..words {
+                    m[w] |= meet[s][w];
+                }
+            }
+            None => {
+                rep[s] = s;
+                groups.push((s, meet[s].clone(), float));
+            }
+        }
+    }
+    // numbered anew: the parameters, then each slot that stands for others
+    let mut new = vec![u32::MAX; n];
+    let mut next = 0u32;
+    for s in 0..n {
+        if rep[s] == s {
+            new[s] = next;
+            next += 1;
+        }
+    }
+    let mut g = f.clone();
+    g.slots = next;
+    for op in g.code.iter_mut() {
+        if let Op::Load(s) | Op::Store(s) = op {
+            *s = new[rep[*s as usize]];
+        }
+    }
+    g
+}
+
 /// For every Load and Store, whether it is a float operation's: the value
 /// loaded goes to one, or the value stored comes from one. Followed on the
 /// IR's stack between labels and jumps.
@@ -325,6 +538,22 @@ fn float_uses(code: &[Op]) -> Vec<bool> {
         }
         for _ in 0..outs {
             st.push(Some(i));
+        }
+    }
+    // an element stored into a local that only float operations read is a
+    // float's use too: it is loaded straight into the xmm register
+    let mut read = vec![(false, true); code.iter().filter_map(|o| if let Op::Load(s) | Op::Store(s) = o { Some(*s as usize + 1) } else { None }).max().unwrap_or(0)];
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Load(s) = op {
+            let r = &mut read[*s as usize];
+            *r = (true, r.1 && out[i]);
+        }
+    }
+    for i in 1..code.len() {
+        if let (Op::LoadM(8), Op::Store(s)) = (&code[i - 1], &code[i]) {
+            if read[*s as usize] == (true, true) {
+                out[i] = true;
+            }
         }
     }
     out
@@ -622,7 +851,7 @@ impl G {
         self.v.iter().rposition(|y| match y {
             V::Slot(t) | V::Lea(t, _) | V::Scaled(t, _, _) => *t == s,
             V::Index(b, i, _, _) => *b == s || *i == s,
-            V::RIdx(i, _, _) => *i == s,
+            V::RIdx(i, _, _) | V::AtIdx(_, i, _, _) => *i == s,
             _ => false,
         })
     }
@@ -639,10 +868,21 @@ impl G {
         let (b, x) = match at {
             Addr::Base(b, _) => (b, 0),
             Addr::Index(b, i, _, _) => (b.unwrap_or(0), i),
+            Addr::Abs(i, _) => (0, i.map_or(0, |(i, _)| i)),
         };
         self.a.e(&[0x40 | (wide as u8) << 3 | ((r >> 3) & 1) << 2 | ((x >> 3) & 1) << 1 | ((b >> 3) & 1)]);
         self.a.e(op);
         match at {
+            Addr::Abs(i, o) => {
+                // no base: mod 00, SIB base 101 is a 32-bit displacement;
+                // index 100 is none
+                let sib = match i {
+                    Some((i, k)) => k << 6 | (i & 7) << 3 | 5,
+                    None => 0x25,
+                };
+                self.a.e(&[0x04 | (r & 7) << 3, sib]);
+                self.a.reloc(Target::Abs(o));
+            }
             Addr::Base(b, d) => {
                 self.a.e(&[0x80 | (r & 7) << 3 | (b & 7)]);
                 if b & 7 == 4 {
@@ -730,6 +970,20 @@ impl G {
                 let yi = self.slot_reg(i);
                 self.mem(false, true, &[0x8D], r, Addr::Index(Some(RAX), yi, k, d));
             }
+            V::At(..) | V::AtIdx(..) => {
+                let at = self.address(x);
+                self.mem(false, true, &[0x8D], r, at);
+            }
+        }
+    }
+
+    /// Where global or frame memory is, plus index << k and d.
+    fn at_addr(&self, b: B, idx: Option<(u32, u8)>, d: i32) -> Addr {
+        let idx = idx.map(|(i, k)| (self.slot_reg(i), k));
+        match (b, idx) {
+            (B::G(o), idx) => Addr::Abs(idx, o.wrapping_add(d as u32)),
+            (B::F(off), None) => Addr::Base(4, self.at(off) + d),
+            (B::F(off), Some((i, k))) => Addr::Index(Some(4), i, k, self.at(off) + d),
         }
     }
 
@@ -761,7 +1015,7 @@ impl G {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
             }
-            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::RIdx(..) | V::X(_) => {
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::RIdx(..) | V::X(_) | V::At(..) | V::AtIdx(..) => {
                 self.to_reg(x, R11);
                 self.push_r(R11);
             }
@@ -904,6 +1158,18 @@ impl G {
                     let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
                     c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).map(|d| V::Index(base, i, k, d))
                 }
+                // global or frame memory: plus a constant, plus an index
+                (BinOp::Add | BinOp::Sub, V::At(m, d), V::Imm(c)) => {
+                    let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                    c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::At(m, d))
+                }
+                (BinOp::Add | BinOp::Sub, V::AtIdx(m, i, k, d), V::Imm(c)) => {
+                    let c = if b == BinOp::Sub { c.checked_neg() } else { Some(c) };
+                    c.and_then(|c| i32::try_from(c).ok()).and_then(|c| d.checked_add(c)).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, k, d))
+                }
+                (BinOp::Add, V::At(m, d), V::Scaled(i, k, e)) | (BinOp::Add, V::Scaled(i, k, e), V::At(m, d)) => d.checked_add(e).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, k, d)),
+                (BinOp::Add, V::At(m, d), V::Lea(i, e)) | (BinOp::Add, V::Lea(i, e), V::At(m, d)) => d.checked_add(e).filter(|d| d.unsigned_abs() < 1 << 30).map(|d| V::AtIdx(m, i, 0, d)),
+                (BinOp::Add, V::At(m, d), V::Slot(i)) | (BinOp::Add, V::Slot(i), V::At(m, d)) if reg(i) => Some(V::AtIdx(m, i, 0, d)),
                 _ => None,
             };
             if let Some(x) = lazy {
@@ -1033,7 +1299,7 @@ impl G {
                     // the remainder is n - q * d, and nothing more is needed
                     self.a.e(&[0x48, 0x69, 0xC0]); // imul rax, rax, d
                     self.a.d32(d);
-                    self.a.e(&[0x48, 0xF7, 0xD8, 0x4C, 0x01, 0xC0]); // neg rax; add rax, r8
+                    self.a.e(&[0x49, 0x29, 0xC0, 0x4C, 0x89, 0xC0]); // sub r8, rax; mov rax, r8 (one step shorter than neg, add)
                     self.v.push(V::Rax);
                     return;
                 }
@@ -1256,7 +1522,9 @@ impl G {
     /// An element that is at once the right side of float arithmetic: the
     /// operation takes it from memory (`mulsd xmm, [address]`). False, and
     /// nothing emitted, where the left side is not where this can be done.
-    fn load_into_op(&mut self, b: BinOp) -> bool {
+    /// With `into`, a float local in an xmm register the result is stored
+    /// into at once: worked out there (nothing is pushed then).
+    fn load_into_op(&mut self, b: BinOp, into: Option<u32>) -> bool {
         let op = match b {
             BinOp::FAdd => 0x58,
             BinOp::FMul => 0x59,
@@ -1270,6 +1538,21 @@ impl G {
         }
         let addr = self.pop();
         let left = self.pop();
+        if let Some(s) = into {
+            let Loc::Xmm(k) = self.loc[s as usize] else { unreachable!() };
+            if let Some(i) = self.reads(s) {
+                self.flush_to(i);
+            }
+            self.keep_xmm(k);
+            match left {
+                V::Slot(t) if t == s => {}
+                x => self.to_xmm_any(x, k),
+            }
+            let at = self.address(addr);
+            self.a.e(&[0xF2]);
+            self.mem(false, false, &[0x0F, op], k, at);
+            return true;
+        }
         let a = match left {
             V::X(k) => k,
             V::Slot(s) if matches!(self.loc[s as usize], Loc::Xmm(_)) && self.dead(s) => {
@@ -1385,6 +1668,17 @@ impl G {
     /// arguments). Arguments already on the machine's stack take the
     /// plain way.
     fn call_direct(&mut self, sym: &str, n: usize) {
+        // a comparison's flags waiting under a call of no arguments (`(a <
+        // b) ^ f()`) become a number first: the callee changes the flags
+        // (with arguments, pushing the first one has made it one already)
+        if n == 0 {
+            if let Some(&V::Flags(cc)) = self.v.last() {
+                self.v.pop();
+                self.need_rax();
+                self.setcc_rax(cc);
+                self.v.push(V::Rax);
+            }
+        }
         let at = self.v.len() - n;
         if self.v[at..].contains(&V::Stack) {
             self.flush();
@@ -1481,6 +1775,8 @@ impl G {
             BinOp::Sub => 5,
             BinOp::Bxor => 6,
             BinOp::Mul => 8,
+            BinOp::Shl => 9,
+            BinOp::Shr => 10,
             _ => return false,
         };
         let Loc::Reg(d) = self.loc[s as usize] else { return false };
@@ -1490,7 +1786,7 @@ impl G {
         }
         let (mut left, mut right) = (self.v[n - 2], self.v[n - 1]);
         // `acc = x + acc` is `acc += x`: these operations do not mind the order
-        if right == V::Slot(s) && left != V::Slot(s) && ext != 5 {
+        if right == V::Slot(s) && left != V::Slot(s) && !matches!(ext, 5 | 9 | 10) {
             std::mem::swap(&mut left, &mut right);
         }
         let fits = |x: V| match x {
@@ -1498,15 +1794,38 @@ impl G {
             V::Slot(_) | V::Rax => true,
             _ => false,
         };
-        if !fits(left) || !fits(right) || (right == V::Slot(s) && left != V::Slot(s)) {
+        // a shift takes a constant count (a variable one needs cl)
+        if !fits(left) || !fits(right) || (right == V::Slot(s) && left != V::Slot(s)) || (ext >= 9 && !matches!(right, V::Imm(_))) {
             return false;
         }
         self.v.truncate(n - 2);
         if let Some(i) = self.reads(s) {
             self.flush_to(i);
         }
+        // d = left * c in one imul, from where left is
+        if let (8, V::Slot(t), V::Imm(c)) = (ext, left, right) {
+            if t != s {
+                match self.loc[t as usize] {
+                    Loc::Reg(y) => self.rr(&[0x69], d, y),
+                    Loc::Mem(m) => self.rm(&[0x69], d, m),
+                    Loc::Xmm(k) => {
+                        self.movq_from_xmm(d, k);
+                        self.rr(&[0x69], d, d);
+                    }
+                }
+                self.a.d32(c as i32);
+                return true;
+            }
+        }
         if left != V::Slot(s) {
             self.to_reg(left, d);
+        }
+        if ext >= 9 {
+            let V::Imm(c) = right else { unreachable!() };
+            if c & 63 != 0 {
+                self.a.e(&[rex(0, d), 0xC1, 0xC0 | (if ext == 9 { 4 } else { 7 }) << 3 | (d & 7), (c & 63) as u8]);
+            }
+            return true;
         }
         let o = match right {
             V::Imm(c) => Opd::Imm(c as i32),
@@ -1544,6 +1863,8 @@ impl G {
             V::Scaled(s, k, d) => Addr::Index(None, self.slot_reg(s), k, d),
             V::Index(b, i, k, d) => Addr::Index(Some(self.slot_reg(b)), self.slot_reg(i), k, d),
             V::RIdx(i, k, d) => Addr::Index(Some(RAX), self.slot_reg(i), k, d),
+            V::At(b, d) => self.at_addr(b, None, d),
+            V::AtIdx(b, i, k, d) => self.at_addr(b, Some((i, k)), d),
             x => {
                 self.need_rax();
                 self.to_reg(x, RAX);
@@ -1555,8 +1876,9 @@ impl G {
     /// The w bytes at the address on top, sign-extended into rax.
     fn load_mem(&mut self, w: u8) {
         let x = self.pop();
-        let at = self.address(x);
+        // rax made free first: a push moves rsp, which a frame address counts
         self.need_rax();
+        let at = self.address(x);
         let op: &[u8] = match w {
             1 => &[0x0F, 0xBE],
             2 => &[0x0F, 0xBF],
@@ -1585,7 +1907,7 @@ impl G {
         };
         // an address that needs no register of its own leaves rax alone
         let in_place = match a {
-            V::Lea(..) | V::Scaled(..) | V::Index(..) => true,
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..) => true,
             V::Slot(s) => self.in_reg(s),
             _ => false,
         };
@@ -2017,7 +2339,13 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             eprintln!("  {i:4} {op:?}");
         }
     }
-    let place = choose(f, rules);
+    let merged = coalesce(f);
+    let f = &merged;
+    let labels = super::ir::label_count(&f.code);
+    let at_depth = stack_depths(&f.code);
+    let live = live_after(&f.code, f.slots);
+    let vol_ok = volatile_ok(&f.code, f.slots, &live, &at_depth);
+    let place = choose(f, rules, &vol_ok);
     // the call area at the bottom of the frame: shadow space and the stack
     // arguments of the widest call, so a call with nothing pushed needs no
     // rsp change
@@ -2050,6 +2378,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 loc.push(Loc::Xmm(k));
                 xused.push(k);
             }
+            Place::Vol(k) => loc.push(Loc::Reg(VOL[k as usize])),
             Place::Mem => {
                 loc.push(Loc::Mem(widest + 8 * mem));
                 mem += 1;
@@ -2068,7 +2397,6 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let live = if xused.is_empty() { Vec::new() } else { live_after(&f.code, f.slots) };
     let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, xsaved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory, live };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
@@ -2095,14 +2423,37 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     for (k, d) in g.xsaved.clone() {
         g.sse_rsp(None, 0x11, k, d); // movups [rsp + d], xmm
     }
+    // the parameters in rcx, rdx, r8, r9 go where they live; a register
+    // parameter may live in another's argument register, so none is written
+    // before every parameter it holds has been read (a cycle through r11)
+    let mut moves: Vec<(u8, u8)> = Vec::new();
+    for i in 0..f.params.min(4) {
+        let from = ARGS[i as usize];
+        match g.loc[i as usize] {
+            Loc::Reg(r) => moves.push((r, from)),
+            Loc::Mem(d) => g.rm(&[0x89], from, d),
+            Loc::Xmm(k) => g.movq_to_xmm(k, from),
+        }
+    }
+    moves.retain(|(d, s)| d != s);
+    while !moves.is_empty() {
+        if let Some(k) = moves.iter().position(|(d, _)| !moves.iter().any(|(_, s)| s == d)) {
+            let (d, s) = moves.remove(k);
+            g.mov_rr(d, s);
+        } else {
+            let s = moves[0].1;
+            g.mov_rr(R11, s);
+            for m in moves.iter_mut() {
+                if m.1 == s {
+                    m.1 = R11;
+                }
+            }
+        }
+    }
     for i in 0..f.params {
         let l = g.loc[i as usize];
         if i < 4 {
-            match l {
-                Loc::Reg(r) => g.mov_rr(r, ARGS[i as usize]),
-                Loc::Mem(d) => g.rm(&[0x89], ARGS[i as usize], d),
-                Loc::Xmm(k) => g.movq_to_xmm(k, ARGS[i as usize]),
-            }
+            continue;
         } else {
             // above the frame, the pushes, the return address and the
             // caller's shadow space
@@ -2136,44 +2487,10 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         super::x64vec::rr(&mut g.a, 0x66, 0xEF, k, k); // pxor: a vector local starts at zero
     }
 
-    let labels = super::ir::label_count(&f.code);
     let labels_of: Vec<u32> = (0..labels).map(|_| g.a.label()).collect();
     // what each label expects: how much is pushed, and whether the top is
     // in rax
     let mut state: Vec<Option<(i32, bool)>> = vec![None; labels as usize];
-    // which operations can be reached from the start, and the depth of the
-    // IR's stack at each, found by following every way through the code: a
-    // label reached only by jumps from later on (a loop's top) is reached
-    // even where the code just before it is not, and a jump that is never
-    // reached decides nothing
-    let at_depth: Vec<Option<i32>> = {
-        let code = &f.code;
-        let mut pos = vec![0usize; labels as usize];
-        for (i, op) in code.iter().enumerate() {
-            if let Op::Label(l) = op {
-                pos[*l as usize] = i;
-            }
-        }
-        let mut at: Vec<Option<i32>> = vec![None; code.len()];
-        let mut work = vec![(0usize, 0i32)];
-        while let Some((i, d)) = work.pop() {
-            if i >= code.len() || at[i].is_some() {
-                continue;
-            }
-            at[i] = Some(d);
-            let Some(effect) = super::ir::stack_effect(&code[i]) else { continue }; // a return or a stop
-            let after = d + effect;
-            match &code[i] {
-                Op::Jmp(l) => work.push((pos[*l as usize], after)),
-                Op::Jz(l) | Op::Jnz(l) => {
-                    work.push((pos[*l as usize], after));
-                    work.push((i + 1, after));
-                }
-                _ => work.push((i + 1, after)),
-            }
-        }
-        at
-    };
     // the labels a later jump goes back to: loops' tops
     let mut loop_top = vec![false; labels as usize];
     {
@@ -2216,6 +2533,15 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             continue; // no way reaches here
         }
         g.op_at = at;
+        // a local in a register this operation writes holds zero no more
+        // (it is not live here, so it is stored before it is read again)
+        if clobbers(op) != 0 {
+            for (s, z) in zero.iter_mut().enumerate() {
+                if matches!(g.loc[s], Loc::Reg(r) if VOL.contains(&r)) {
+                    *z = false;
+                }
+            }
+        }
         match (op, f.code.get(at + 1)) {
             (Op::Push(0), Some(Op::Store(s))) if zero[*s as usize] => {
                 skip = 1;
@@ -2225,7 +2551,15 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             // operand
             (Op::LoadM(8), Some(Op::Bin(b))) if b.is_float() => {
                 g.op_at = at + 1;
-                if g.load_into_op(*b) {
+                // stored at once into a float local in an xmm register
+                if let Some(&Op::Store(s)) = f.code.get(at + 2) {
+                    if matches!(g.loc[s as usize], Loc::Xmm(_)) && g.load_into_op(*b, Some(s)) {
+                        zero[s as usize] = false;
+                        skip = 2;
+                        continue;
+                    }
+                }
+                if g.load_into_op(*b, None) {
                     skip = 1;
                     continue;
                 }
@@ -2329,19 +2663,9 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             Op::LoadM(w) => g.load_mem(*w),
             Op::StoreM(w) => g.store_mem(*w, None),
             Op::OpM(b, w) => g.store_mem(*w, Some(*b)),
-            Op::Frame(n) => {
-                g.fresh_rax();
-                let d = g.at(g.memory + *n as i32);
-                g.a.e(&[0x48, 0x8D, 0x84, 0x24]); // lea rax, [rsp + d]
-                g.a.d32(d);
-                g.v.push(V::Rax);
-            }
-            Op::AddrG(gl) => {
-                g.fresh_rax();
-                g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [global]
-                g.a.reloc(super::x64::global(*gl));
-                g.v.push(V::Rax);
-            }
+            // an address the code knows: it waits, and is used where it is
+            Op::Frame(n) => g.push(V::At(B::F(g.memory + *n as i32), 0)),
+            Op::AddrG(gl) => g.push(V::At(B::G(super::x64::GLOBALS + 8 * *gl), 0)),
             Op::Data(d) => {
                 g.fresh_rax();
                 g.a.e(&[0x48, 0x8D, 0x05]); // lea rax, [rip + data]
@@ -2362,7 +2686,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 live = false;
             }
             Op::Dup => match g.v.last().copied() {
-                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..))) => g.push(x),
+                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..))) => g.push(x),
                 _ => {
                     g.flush();
                     g.a.e(&[0xFF, 0x34, 0x24]);

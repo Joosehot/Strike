@@ -112,6 +112,13 @@ fn work_across_statements_is_what_clang_and_go_make_of_it() {
     }
 }
 
+/// A comparison waiting as flags under a call of no arguments: in every
+/// mode what clang prints (a bug of the optimizing generator, fixed).
+#[test]
+fn a_comparison_before_a_call_of_no_arguments_keeps_its_value() {
+    runs_in_every_mode_as_the_real_one("flags_call.c");
+}
+
 #[test]
 fn simplified_expressions_are_what_clang_and_go_make_of_them() {
     for file in ["algebra.c", "algebra.go"] {
@@ -119,10 +126,67 @@ fn simplified_expressions_are_what_clang_and_go_make_of_them() {
     }
 }
 
+/// C's bool is 0 or 1: a value going there becomes 1 where it is not
+/// zero, as clang converts it (in a variable, an array, a field, a
+/// parameter, from a float).
+/// <<=, >>=, &=, |= and ^= on variables and elements, in the three languages.
+#[test]
+fn bitwise_assignments_are_what_clang_go_and_python_make_of_them() {
+    for file in ["opassign.c", "opassign.go", "opassign.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+#[test]
+fn c_bool_is_what_clang_makes_of_it() {
+    runs_in_every_mode_as_the_real_one("cbool.c");
+}
+
 #[test]
 fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
     for file in ["arrays.c", "arrays.go", "arrays.py"] {
         runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+#[test]
+fn structs_and_classes_are_what_clang_go_and_python_make_of_them() {
+    for file in ["structs.c", "structs.go", "classes.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+/// 160 structs of random fields (tools/struct_layouts.py): every sizeof
+/// and offsetof Strike's executable prints is what clang's printed.
+#[test]
+fn c_structs_are_laid_out_as_clang_lays_them_out() {
+    runs_in_every_mode_as_the_real_one("layouts.c");
+}
+
+/// Go stops where a nil pointer is followed (exit code 2), Python where an
+/// attribute is read that the object has not been given (AttributeError,
+/// exit code 1), with what was printed before and nothing after.
+#[test]
+fn a_nil_pointer_and_a_missing_attribute_stop_the_program_as_go_and_python_stop_it() {
+    let r = root("struct-stops");
+    for (name, src, code, says) in [
+        ("nil.go", "package main\nimport \"fmt\"\ntype P struct {\n\tX int\n}\nfunc main() {\n\tvar p *P\n\tfmt.Println(1)\n\tfmt.Println(p.X)\n}\n", 2, "nil pointer dereference"),
+        ("nil_method.go", "package main\nimport \"fmt\"\ntype P struct {\n\tX int\n}\nfunc (p P) Get() int {\n\treturn p.X\n}\nfunc main() {\n\tvar p *P\n\tfmt.Println(1)\n\tfmt.Println(p.Get())\n}\n", 2, "nil pointer dereference"),
+        ("nil_set.go", "package main\nimport \"fmt\"\ntype N struct {\n\tV int\n\tNext *N\n}\nfunc main() {\n\tn := &N{V: 1}\n\tfmt.Println(n.V)\n\tn.Next.V = 2\n}\n", 2, "nil pointer dereference"),
+        ("attr.py", "class P:\n    def __init__(self):\n        self.x = 1\n\n    def later(self):\n        self.y = 2\n\n\np = P()\nprint(p.x)\nprint(p.y)\n", 1, "AttributeError: 'P' object has no attribute 'y'"),
+        ("attr_order.py", "class P:\n    def __init__(self):\n        print(1)\n        print(self.x)\n        self.x = 2\n\n\nP()\n", 1, "AttributeError"),
+    ] {
+        let p = r.join(name);
+        std::fs::write(&p, src).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"]] {
+            let exe = r.join("a.exe");
+            let o = compile_with(&r, &p, &exe, &mode, None);
+            assert!(o.status.success(), "{name}: {}", text(&o));
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(got.status.code(), Some(code), "{name} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout), "1\n", "{name} {mode:?}");
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+        }
     }
 }
 
@@ -437,6 +501,148 @@ impl Gen {
         out + "    return 0;\n}\n"
     }
 
+    /// A C program of integer functions with many locals (more than the
+    /// registers): leaf functions, whose locals HotMotor may put in the
+    /// volatile registers, and functions with calls, divisions (which take
+    /// rdx and r8) and shifts between their uses; parameters used in every
+    /// order, so they are moved between argument registers.
+    fn int_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n");
+        // h writes the volatile registers: its own locals, a division by a
+        // constant and by a variable
+        out += "long long h(long long a, long long b) {\n    long long q = a / 7 + b % 5;\n    long long r = (a ^ b) / ((b & 3) + 1);\n    long long t = q * 3 + r - (a >> 2);\n    return t * 3 - (b >> 2) + q;\n}\n";
+        // a function of no arguments that stays a call: a comparison
+        // waiting as flags before it must keep its value
+        out += "long long gz = 3;\nlong long z() {\n    if (gz > 0) {\n        gz = gz - 1;\n        return z() * 2 - 1;\n    }\n    gz = 3;\n    return -783;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..4 {
+            let np = 1 + self.below(6) as usize;
+            let params: Vec<String> = (0..np).map(|p| format!("p{p}")).collect();
+            let nl = 6 + self.below(10) as usize;
+            let calls = self.below(2) == 0;
+            // C int locals: each store cut to 32 bits (cuts a loop may
+            // leave to its way out)
+            let ty = ["long long", "int"][self.below(2) as usize];
+            let mut names = params.clone();
+            names.reverse();
+            let mut body = String::new();
+            for v in 0..nl {
+                body += &format!("    {ty} v{v} = {};\n", self.int_expr(&names, 2, false));
+                names.push(format!("v{v}"));
+            }
+            let locals: Vec<String> = (0..nl).map(|v| format!("v{v}")).collect();
+            let mut inner = String::new();
+            for _ in 0..3 + self.below(6) {
+                let a = &locals[self.below(nl as u64) as usize];
+                let b = locals[self.below(nl as u64) as usize].clone();
+                inner += &match self.below(8) {
+                    // a chain round the loop through a multiplication
+                    7 => format!("        {a} = {a} * ({b} + {}) + {} - i;\n", self.below(9), self.int_expr(&names, 1, false)),
+                    0 => format!("        {a} = {a} {} {};\n", ["+", "-", "*", "^", "&", "|"][self.below(6) as usize], self.int_expr(&names, 2, calls)),
+                    1 => format!("        {a} = ({}) / {};\n", self.int_expr(&names, 2, calls), [3, 7, -5, 1000003][self.below(4) as usize]),
+                    2 => format!("        {a} = ({}) % ((({}) & 7) + 1);\n", self.int_expr(&names, 2, calls), self.int_expr(&names, 1, false)),
+                    3 => format!("        {a} = ({}) {} {};\n", self.int_expr(&names, 2, calls), ["<<", ">>"][self.below(2) as usize], self.below(64)),
+                    4 => format!("        if ({}) {a} = {};\n", self.int_expr(&names, 1, false), self.int_expr(&names, 2, calls)),
+                    5 => format!("        {a} = {} * {};\n", self.int_expr(&names, 1, false), [3, 5, 9, 6, -7][self.below(5) as usize]),
+                    6 if calls => format!("        printf(\"%lld\\n\", (long long)({}));\n", self.int_expr(&names, 2, false)),
+                    _ => format!("        {a} = {};\n", self.int_expr(&names, 3, calls)),
+                };
+            }
+            body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", self.below(9));
+            let ret: Vec<String> = (0..3).map(|_| names[self.below(names.len() as u64) as usize].clone()).collect();
+            body += &if calls {
+                // a comparison as the left side of z(), straight in the return
+                format!("    return {} + (({} {} {}) {} z());\n", ret[0], ret[1], ["<", "<=", "==", "!="][self.below(4) as usize], ret[2], ["^", "+", "-"][self.below(3) as usize])
+            } else {
+                format!("    return {} + {} * 3 - {};\n", ret[0], ret[1], ret[2])
+            };
+            let decl: Vec<String> = params.iter().map(|p| format!("long long {p}")).collect();
+            out += &format!("long long f{k}({}) {{\n{body}}}\n", decl.join(", "));
+            funcs.push((format!("f{k}"), np));
+        }
+        out += "int main() {\n";
+        for (f, np) in &funcs {
+            for _ in 0..2 {
+                let args: Vec<String> = (0..*np).map(|_| self.constant()).collect();
+                out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));
+            }
+        }
+        out + "    return 0;\n}\n"
+    }
+
+    /// An integer expression of the names; with `calls`, h() in it too.
+    fn int_expr(&mut self, names: &[String], depth: u32, calls: bool) -> String {
+        if depth == 0 || self.below(3) == 0 {
+            return if self.below(4) > 0 { names[self.below(names.len() as u64) as usize].clone() } else { self.constant() };
+        }
+        let d = depth - 1;
+        match self.below(8) {
+            0..=3 => format!("({} {} {})", self.int_expr(names, d, calls), ["+", "-", "*", "^", "&", "|", "<", "=="][self.below(8) as usize], self.int_expr(names, d, calls)),
+            4 => format!("({} >> {})", self.int_expr(names, d, calls), self.below(8)),
+            5 if calls => match self.below(2) {
+                0 => format!("h({}, {})", self.int_expr(names, d, calls), self.int_expr(names, d, calls)),
+                _ => format!("(({} {} {}) {} z())", self.int_expr(names, d, false), ["<", "<=", "==", "!="][self.below(4) as usize], self.int_expr(names, d, false), ["^", "+", "-", "*"][self.below(4) as usize]),
+            },
+            6 => format!("-({})", self.int_expr(names, d, calls)),
+            _ => self.int_expr(names, d, calls),
+        }
+    }
+
+    /// A C program whose loops read elements other statements of the loop
+    /// may or may not write: adjacent global arrays (an index past the end
+    /// of one reaches the next), a local array, and an array given to the
+    /// function, which may be the very array the loop reads, also written
+    /// through another function. Every value the loops leave is printed.
+    fn alias_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n");
+        // pad first: an index a little below ga's start stays in the globals
+        out += "long long pad[4];\nlong long ga[16];\nlong long gb[16];\nlong long gc[8];\nlong long tail[16];\n";
+        out += "void put(long long v[], long long i, long long x) {\n    v[i & 15] = x;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..4 {
+            // an index in range, or (of a global array) one a little past
+            // either end; the frame's array is kept in range, as what lies
+            // next to it differs from mode to mode
+            let idx = |g: &mut Gen, v: &str, a: &str| -> String {
+                match if a == "la" { 0 } else { g.below(4) } {
+                    0 => format!("({v} & 15)"),
+                    1 => format!("(({v} & 7) + {})", g.below(12)),
+                    2 => format!("({v} - {})", g.below(3)),
+                    _ => format!("(({v} + {}) & 15)", g.below(16)),
+                }
+            };
+            let arrays = ["ga", "gb", "la", "v"];
+            let mut inner = String::new();
+            for _ in 0..2 + self.below(4) {
+                let (w, r) = (arrays[self.below(4) as usize], arrays[self.below(4) as usize]);
+                let wv = ["j", "i"][self.below(2) as usize];
+                let (wi, ri) = (idx(self, wv, w), idx(self, "i", r));
+                inner += &match self.below(5) {
+                    0 => format!("            {w}[{wi}] = {r}[{ri}] + j;\n"),
+                    1 => format!("            {w}[{wi}] += {r}[{ri}] * 3;\n"),
+                    2 => format!("            s = s + {r}[{ri}] - gc[{}];\n", self.below(8)),
+                    3 => format!("            put({w}, {wi}, s + {r}[{ri}]);\n"),
+                    _ => format!("            gc[(j + {}) & 7] = s ^ {r}[{ri}];\n", self.below(8)),
+                };
+            }
+            out += &format!(
+                "long long a{k}(long long v[], long long n) {{\n    long long la[16];\n    long long s = n;\n    for (long long q = 0; q < 16; q++) la[q] = q * {} + n;\n    for (long long i = {}; i < {}; i++) {{\n        for (long long j = 0; j < {}; j++) {{\n{inner}            s = s * 3 + la[i & 15];\n        }}\n    }}\n    for (long long q = 0; q < 16; q++) s = s * 7 + la[q];\n    return s;\n}}\n",
+                self.below(9),
+                self.below(3),
+                1 + self.below(6),
+                1 + self.below(5)
+            );
+            funcs.push(format!("a{k}"));
+        }
+        out += "int main() {\n    for (long long q = 0; q < 16; q++) {\n        ga[q] = q * 5 + 1;\n        gb[q] = 100 - q;\n    }\n";
+        for f in &funcs {
+            let arg = ["ga", "gb"][self.below(2) as usize];
+            out += &format!("    printf(\"%lld\\n\", {f}({arg}, {}));\n", self.constant());
+        }
+        out += "    long long t = 0;\n    for (long long q = 0; q < 16; q++) t = t * 31 + ga[q] * 7 + gb[q];\n    for (long long q = 0; q < 8; q++) t = t * 31 + gc[q];\n";
+        out + "    printf(\"%lld\\n\", t);\n    return 0;\n}\n"
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -547,6 +753,55 @@ impl Gen {
             10 => format!("({} {} {})", self.ring(names, d), ["/", "%"][self.below(2) as usize], [3, 7, -5, 1000003][self.below(4) as usize]),
             _ => format!("({} {} {})", self.ring(names, d), ["<", ">>", "^"][self.below(3) as usize], self.below(5) + 1),
         }
+    }
+
+    /// C structs: nested, with arrays of them and arrays in them, given
+    /// and returned by value (copies), changed through a pointer, copied
+    /// whole and element by element. Their code, and main's calls of them.
+    fn structs(&mut self) -> (String, String) {
+        let mut out = String::new();
+        out += "struct G0 {\n    long long a;\n    int b;\n    char c;\n    short d[3];\n};\nstruct G1 {\n    struct G0 in;\n    long long e;\n    struct G0 arr[2];\n};\n";
+        let n = ["n".to_string()];
+        let fields = ["s.a", "s.b", "s.c", "s.d[0]", "s.d[2]", "n"].map(String::from);
+        out += &format!(
+            "struct G0 gmk(long long n) {{\n    struct G0 s = {{{}, {}, {}, {{{}, {}}}}};\n    s.d[2] = {};\n    return s;\n}}\n",
+            self.expr(&n, &[], 2),
+            self.expr(&n, &[], 2),
+            self.expr(&n, &[], 1),
+            self.expr(&n, &[], 1),
+            self.expr(&n, &[], 1),
+            self.expr(&fields, &[], 2)
+        );
+        out += &format!(
+            "long long gsum(struct G0 s) {{\n    s.a += {};\n    s.d[1] = {};\n    return s.a + s.b * 3 + s.c + s.d[0] + s.d[1] + s.d[2];\n}}\n",
+            self.expr(&fields[..5], &[], 2),
+            self.expr(&fields[..5], &[], 2)
+        );
+        let bump: Vec<String> = ["k", "p->in.a", "p->arr[0].c", "p->e", "p->arr[1].d[1]"].iter().map(|s| s.to_string()).collect();
+        out += &format!(
+            "void gbump(struct G1 *p, long long k) {{\n    p->in.a += k;\n    p->arr[k & 1].b = {};\n    p->e = {};\n}}\n",
+            self.expr(&bump[..3], &[], 2),
+            self.expr(&bump, &[], 2)
+        );
+        let mut structs = Vec::new();
+        for k in 0..3 {
+            let outer: Vec<String> = ["n", "x.in.a", "x.e", "y.arr[1].b", "y.in.d[1]"].iter().map(|s| s.to_string()).collect();
+            let inner: Vec<String> = ["n", "i", "list[i].a", "list[(i + 1) & 3].c", "x.arr[i & 1].d[2]"].iter().map(|s| s.to_string()).collect();
+            out += &format!(
+                "long long st{k}(long long n) {{\n    struct G1 x = {{gmk(n), {}, {{gmk(n + 1), gmk(n - 1)}}}};\n    struct G1 y = x;\n    y.arr[0].a = {};\n    gbump(&y, n & 7);\n    struct G0 list[4] = {{{{0}}}};\n    for (long long i = 0; i < 4; i++) {{\n        list[i] = gmk(i * n);\n        list[i].d[i % 3] += {};\n    }}\n    list[n & 3] = y.arr[1];\n    y.arr[0] = list[{}];\n    return gsum(x.in) + gsum(y.in) * 7 + x.arr[0].a - y.arr[0].a + gsum(list[(n + 1) & 3]) + y.e + x.e + {};\n}}\n",
+                self.expr(&outer[..1], &[], 2),
+                self.expr(&outer, &[], 2),
+                self.expr(&inner, &[], 2),
+                self.below(4),
+                self.expr(&outer, &[], 3)
+            );
+            structs.push(format!("st{k}"));
+        }
+        let mut calls = String::new();
+        for f in &structs {
+            calls += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
+        }
+        (out, calls)
     }
 
     fn program(&mut self) -> String {
@@ -729,7 +984,12 @@ impl Gen {
             );
             rings.push(format!("q{k}"));
         }
+        // structs, from a generator of their own: the rest of each program
+        // is what it was before them
+        let (code, calls) = Gen(self.0 ^ 0xA076_1D64_78BD_642F).structs();
+        out += &code;
         out += "int main() {\n";
+        out += &calls;
         for f in &floats {
             let c = |g: &mut Gen| ["1.5", "-0.0", "1e308", "3", "0.1", "-2.5e-300"][g.below(6) as usize];
             out += &format!("    printf(\"%.17g %e %g\\n\", {f}({}, {}, {}), {f}(2, -1, 5), {f}({}, 0.5, -3));\n", c(self), c(self), self.constant(), c(self));
@@ -832,6 +1092,47 @@ fn float_locals_in_registers_print_what_the_plain_code_prints() {
             assert_eq!(&outs[0], o, "f{n}.c: mode {i} and the plain code differ");
         }
     }
+}
+
+/// Builds `n` random programs of `gen` in the plain mode, the default and
+/// --release --no-evaluate: each must print, and return, what the plain code
+/// does.
+fn every_mode_as_plain(dir: &str, seed: u64, n: usize, gen: fn(&mut Gen) -> String) {
+    let r = root(dir);
+    let mut g = Gen(seed);
+    for k in 0..n {
+        let src = r.join(format!("p{k}.c"));
+        std::fs::write(&src, gen(&mut g)).unwrap();
+        let mut outs = Vec::new();
+        for mode in [vec!["--plain"], vec![], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join(format!("p{k}.exe"));
+            let o = compile_with(&r, &src, &exe, &mode, None);
+            assert!(o.status.success(), "{dir}/p{k}.c: {}", text(&o));
+            let run = Command::new(&exe).output().unwrap();
+            outs.push((run.status.code(), run.stdout));
+        }
+        for (i, o) in outs.iter().enumerate().skip(1) {
+            assert_eq!(&outs[0], o, "{dir}/p{k}.c: mode {i} and the plain code differ");
+        }
+    }
+}
+
+/// Random C programs of integer functions with more locals than registers,
+/// leaf functions and functions with calls and divisions between the uses
+/// of their locals (so locals live in volatile registers only where nothing
+/// writes them): every mode prints what the plain code prints.
+#[test]
+fn integer_locals_in_every_register_print_what_the_plain_code_prints() {
+    every_mode_as_plain("int-locals", 0x1234_5678_9ABC_DEF1, 40, Gen::int_program);
+}
+
+/// Random C programs whose loops read elements that writes of the same
+/// loop may reach: adjacent globals (an index past an array's end), a local
+/// array, and an array given as a parameter that is the one the loop reads.
+/// An element moved out of a loop must never be one a write reaches.
+#[test]
+fn elements_moved_out_of_loops_are_never_ones_the_loop_writes() {
+    every_mode_as_plain("alias", 0x0DDB_A11C_AFE5_7EA5, 40, Gen::alias_program);
 }
 
 fn compile_with(home: &Path, src: &Path, exe: &Path, extra: &[&str], rules: Option<&Path>) -> Output {
@@ -942,6 +1243,31 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("nolang.txt", "SELECT * FROM t;\n", "no description reads the whole file"),
         ("unsigned.c", "int main() { unsigned int x = 1; return x; }\n", "unsigned numbers are not in Strike yet"),
         ("pointer.c", "int main() { int *p; return 0; }\n", "pointer variables are not in Strike yet"),
+        // structs and classes: what is not exact yet
+        ("float_field.c", "struct P { float f; };\nint main() { return 0; }\n", "a float field is not in Strike yet"),
+        ("holds_itself.c", "struct P { int a; struct P b; };\nint main() { return 0; }\n", "holds itself"),
+        ("struct_math.c", "struct P { int a; };\nint main() { struct P s; struct P *p = &s; p = p + 1; return 0; }\n", "this operator on a pointer"),
+        ("addr_int.c", "int main() { int x = 1; int *p = &x; return 0; }\n", "& of a number is not in Strike yet"),
+        ("struct_d.c", "#include <stdio.h>\nstruct P { int a; };\nint main() { struct P s = {1}; printf(\"%d\", s); return 0; }\n", "%d is given a struct P"),
+        ("tag.c", "struct P { int a; };\nint main() { P s; return 0; }\n", "P is a struct's tag: C writes it struct P"),
+        ("excess.c", "struct P { int a; };\nint main() { struct P s = {1, 2}; return s.a; }\n", "excess elements"),
+        ("arrow.c", "struct P { int a; };\nint main() { struct P s; struct P *p = &s; return p.a; }\n", "C reaches its fields with ->"),
+        ("sizeof_expr.c", "int main() { int a = 1; return sizeof(a + 1); }\n", "sizeof of this expression is not in Strike yet"),
+        ("ptr_print.go", "package main\nimport \"fmt\"\ntype N struct {\n\tV int\n\tNext *N\n}\nfunc main() {\n\tfmt.Println(N{})\n}\n", "which Go prints as its address"),
+        ("ptr_method.go", "package main\nimport \"fmt\"\ntype C struct {\n\tn int\n}\nfunc (c *C) Inc() {\n\tc.n++\n}\nfunc mk() C {\n\treturn C{}\n}\nfunc main() {\n\tmk().Inc()\n\tfmt.Println(1)\n}\n", "the value has no address"),
+        ("few.go", "package main\nimport \"fmt\"\ntype C struct {\n\tA, B int\n}\nfunc main() {\n\tfmt.Println(C{1})\n}\n", "too few values in struct literal"),
+        ("struct_eq.go", "package main\nimport \"fmt\"\ntype C struct {\n\tA int\n}\nfunc main() {\n\tfmt.Println(C{1} == C{1})\n}\n", "this operator on a struct C and a struct C"),
+        ("error_method.go", "package main\nimport \"fmt\"\ntype E struct {\n\tA int\n}\nfunc (e E) Error() string {\n\treturn \"e\"\n}\nfunc main() {\n\tfmt.Println(E{1})\n}\n", "has a Error method"),
+        ("nested_string.go", "package main\nimport \"fmt\"\ntype M struct {\n\tA int\n}\nfunc (m M) String() string {\n\treturn \"m\"\n}\nfunc main() {\n\tfmt.Println([]M{{1}})\n}\n", "has a String method"),
+        ("byte_field.go", "package main\nimport \"fmt\"\ntype B struct {\n\tX byte\n}\nfunc main() {\n\tfmt.Println(B{1})\n}\n", "a byte field is not in Strike yet"),
+        ("no_repr.py", "class P:\n    pass\n\n\nprint(P())\n", "an address Strike cannot give as Python does"),
+        ("str_list.py", "class P:\n    def __str__(self):\n        return \"p\"\n\n\nprint([P()])\n", "by its __repr__, and P has none"),
+        ("static.py", "class P:\n    def f():\n        return 1\n\n\nprint(1)\n", "a static method is not in Strike yet"),
+        ("isinstance.py", "class P:\n    pass\n\n\nprint(isinstance(P(), P))\n", "there is no function isinstance"),
+        ("obj_eq.py", "class P:\n    pass\n\n\nprint(P() == P())\n", "this operator on an object of class P"),
+        ("obj_kinds.py", "class P:\n    def __init__(self, x):\n        self.x = x\n\n\na = P(1)\nb = P(1.5)\nprint(a.x, b.x)\n", "a float in one place and a whole number in another"),
+        ("class_call.py", "class P:\n    def f(self):\n        return 1\n\n\nprint(P.f(P()))\n", "a method called on its class is not in Strike yet"),
+        ("obj_cond.py", "class P:\n    pass\n\n\nif P():\n    print(1)\n", "is not a condition"),
         ("vla.c", "int main() { int n = 3; int a[n]; return 0; }\n", "no variable-length arrays"),
         ("mixed.py", "a = [1, True]\nprint(a)\n", "one kind per list"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
@@ -1093,6 +1419,15 @@ fn what_several_files_cannot_do_yet_is_refused_not_guessed() {
         ("star", vec![("__main__.py", "from m import *\n"), ("m.py", "x = 1\n")], "from m import * is not in Strike yet"),
         ("module_line", vec![("__main__.py", "import m\n"), ("m.py", "x = 1\nprint(x ** 2)\n")], "m.py:2:"),
         ("module_value", vec![("__main__.py", "import m\nprint(m)\n"), ("m.py", "x = 1\n")], "m is a module"),
+        // structs and classes of other packages and modules, and one struct
+        // name given two shapes by two C files
+        (
+            "package_type",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n\tcalc.F()\n}\n"), ("calc/calc.go", "package calc\ntype T struct {\n\tA int\n}\nfunc F() {\n}\n")],
+            "calc/calc.go:2: a type of a package other than main is not in Strike yet",
+        ),
+        ("module_class", vec![("__main__.py", "import m\nprint(m.x)\n"), ("m.py", "class C:\n    pass\n\n\nx = 1\n")], "m.py:1: a class of a module other than the main one is not in Strike yet"),
+        ("two_shapes", vec![("a.c", "struct D { int z; };\nint main() { return 0; }\n"), ("b.c", "struct D { long long z; };\n")], "struct D is defined differently in two files"),
     ];
     for (name, files, says) in cases {
         let d = r.join(name);

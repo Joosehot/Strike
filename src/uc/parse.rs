@@ -4,7 +4,7 @@
 //! precedence reader with the language's operator table.
 
 use super::ir::{BinOp, UnOp};
-use super::lang::{Cap, End, Form, Kind, Lang, Pat, Place, Style};
+use super::lang::{Cap, End, Form, Kind, Lang, Pat, Place, Role, Style};
 use super::lex::{FloatLit, Tok, T};
 
 #[derive(Clone, Debug)]
@@ -36,6 +36,32 @@ pub enum Expr {
     Composite(Vec<String>, Vec<Expr>, u32),
     /// a type given as a value (Go's make([]int, n))
     Type(Vec<String>, u32),
+    /// a.name: a struct's field, an object's attribute
+    Field(Box<Expr>, String, u32),
+    /// &x
+    Addr(Box<Expr>, u32),
+    /// *p (C's p->x is (*p).x)
+    Deref(Box<Expr>, u32),
+    /// an element given to a field by its name: C's {.x = 1}, Go's P{X: 1}
+    Key(String, Box<Expr>, u32),
+    /// sizeof(type): the type's words
+    SizeOfType(Vec<String>, u32),
+    /// sizeof x
+    SizeOf(Box<Expr>, u32),
+    /// offsetof(type, field)
+    OffsetOf(Vec<String>, String, u32),
+}
+
+impl Expr {
+    /// The name a chain of fields and elements begins with (p.q[i].x is
+    /// p's), if it begins with a name.
+    pub fn root(&self) -> Option<&str> {
+        match self {
+            Expr::Var(n, _) => Some(n),
+            Expr::Field(b, _, _) | Expr::Index(b, _, _) | Expr::Slice(b, _, _, _) | Expr::Deref(b, _) => b.root(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +71,12 @@ pub enum Stmt {
     Var { name: String, ty: Vec<String>, dims: Vec<Option<Expr>>, value: Option<Expr>, line: u32 },
     /// name, or an element of it (index: the subscripts in order)
     Assign { name: String, index: Vec<Expr>, op: Option<BinOp>, value: Expr, line: u32 },
+    /// a place that is not a name with indexes: a field (p.x, p->a[i],
+    /// ps[i].x), or what a pointer points at (*p)
+    Set { target: Expr, op: Option<BinOp>, value: Expr, line: u32 },
+    /// Python's class statement: the class (Program.types) is made here,
+    /// its attributes given their values
+    Class(String, u32),
     /// for over the elements: their index, their value, or both
     ForEach { index: Option<String>, value: Option<String>, iter: Expr, body: Vec<Stmt>, line: u32 },
     If { cond: Expr, then: Vec<Stmt>, els: Vec<Stmt> },
@@ -71,6 +103,34 @@ pub struct FuncDef {
     pub param_types: Vec<Vec<String>>,
     pub ret: Vec<String>,
     pub body: Vec<Stmt>,
+    pub line: u32,
+    /// a method: the type whose method it is (its first parameter is the
+    /// value it is called on; its name is Type.name)
+    pub method_of: Option<String>,
+}
+
+/// A field of a struct: its name, its type's words, C's sizes after it.
+#[derive(Clone, Debug)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Vec<String>,
+    pub dims: Vec<Option<Expr>>,
+    pub line: u32,
+}
+
+/// A struct (C, Go) or a class (Python).
+#[derive(Clone, Debug)]
+pub struct TypeDef {
+    /// the name it is written by alone (Go's, Python's, C's typedef)
+    pub name: Option<String>,
+    /// C's struct tag: written after `struct`
+    pub tag: Option<String>,
+    /// Python's base class
+    pub base: Option<String>,
+    pub fields: Vec<FieldDef>,
+    /// Python: the methods and the class's own attributes (name = value)
+    pub methods: Vec<FuncDef>,
+    pub attrs: Vec<Stmt>,
     pub line: u32,
 }
 
@@ -101,6 +161,9 @@ pub struct Program {
     pub imports: Vec<Import>,
     /// Go's package clause
     pub package: Option<(String, u32)>,
+    /// the structs and classes, and C's second names for them
+    pub types: Vec<TypeDef>,
+    pub aliases: Vec<(String, String, u32)>,
 }
 
 /// Why a file could not be read: where the reading got furthest, and what
@@ -125,13 +188,22 @@ struct Caps {
     simples: Vec<Stmt>,
     strs: Vec<Vec<u8>>,
     types: Vec<Vec<String>>,
-    places: Vec<(String, Vec<Expr>)>,
+    places: Vec<Lv>,
     dims: Vec<Vec<Option<Expr>>>,
     imports: Vec<Import>,
+    fields: Vec<Vec<FieldDef>>,
+    members: Vec<(Vec<FuncDef>, Vec<Stmt>)>,
+}
+
+/// What an assignment changes: a name with indexes after it, or another
+/// place (a field, what a pointer points at).
+enum Lv {
+    Name(String, Vec<Expr>),
+    Target(Expr),
 }
 
 impl Caps {
-    fn mark(&self) -> [usize; 11] {
+    fn mark(&self) -> [usize; 13] {
         [
             self.exprs.len(),
             self.bodies.len(),
@@ -144,9 +216,13 @@ impl Caps {
             self.places.len(),
             self.dims.len(),
             self.imports.len(),
+            self.fields.len(),
+            self.members.len(),
         ]
     }
-    fn reset(&mut self, m: [usize; 11]) {
+    fn reset(&mut self, m: [usize; 13]) {
+        self.fields.truncate(m[11]);
+        self.members.truncate(m[12]);
         self.imports.truncate(m[10]);
         self.places.truncate(m[8]);
         self.dims.truncate(m[9]);
@@ -164,6 +240,8 @@ impl Caps {
 enum Parsed {
     Stmt(Stmt),
     Func(FuncDef),
+    Type(TypeDef),
+    Alias(String, String, u32),
     Import(Import),
     Package(String, u32),
     Ignore,
@@ -183,9 +261,15 @@ struct P<'a> {
     far: usize,
     far_msg: String,
     fatal: Option<(u32, String)>,
+    /// the file's own types (its structs and classes), found before it is read
+    types: std::collections::HashSet<String>,
 }
 
 impl<'a> P<'a> {
+    /// A word of a type: the language's, or a struct the file declares.
+    fn is_type(&self, s: &str) -> bool {
+        self.l.type_words.contains(s) || self.types.contains(s)
+    }
     fn peek(&self) -> &T {
         &self.t[self.i].t
     }
@@ -361,7 +445,7 @@ impl<'a> P<'a> {
             let mut ty = Vec::new();
             for t in piece {
                 match t {
-                    T::Ident(s) if self.l.type_words.contains(s) => ty.push(s.clone()),
+                    T::Ident(s) if self.is_type(s) => ty.push(s.clone()),
                     T::Ident(s) if !self.l.keywords.contains(s) => found.push(s.clone()),
                     T::Punct(p) if matches!(p.as_str(), "*" | "[" | "]") => ty.push(p.clone()),
                     // an array's size, in C after the name, in Go before the type
@@ -406,6 +490,11 @@ impl<'a> P<'a> {
 
     fn ty(&mut self) -> R<Vec<String>> {
         let start = self.i;
+        // C's type begins with a word (*p = v is no declaration); Go's *P
+        // begins with its star
+        if !self.l.param_first && self.text() == Some("*") {
+            return self.miss("a type");
+        }
         let mut words = Vec::new();
         loop {
             // Go's []T and [n]T: the brackets before the element's type
@@ -429,7 +518,7 @@ impl<'a> P<'a> {
                 continue;
             }
             match self.text() {
-                Some(s) if self.l.type_words.contains(s) || s == "*" => {
+                Some(s) if self.is_type(s) || s == "*" => {
                     words.push(s.to_string());
                     self.i += 1;
                 }
@@ -495,9 +584,30 @@ impl<'a> P<'a> {
                     _ => return self.miss("a simple statement"),
                 },
                 Pat::Cap(Cap::Place) => {
+                    let line = self.line();
+                    // *p = v: what a pointer points at
+                    if let Some(d) = self.l.records.as_ref().and_then(|r| r.deref.clone()) {
+                        if self.eat(&d) {
+                            let p = self.l.unary.values().map(|u| u.0).max().unwrap_or(0);
+                            let e = self.expr(p)?.0;
+                            caps.places.push(Lv::Target(Expr::Deref(Box::new(e), line)));
+                            continue;
+                        }
+                    }
+                    // (*p).x = v
+                    if self.l.records.is_some() && self.text() == Some("(") {
+                        let p = self.l.unary.values().map(|u| u.0).max().unwrap_or(0);
+                        let e = self.expr(p)?.0;
+                        if !matches!(e, Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)) {
+                            return self.miss("a place a value is given to");
+                        }
+                        caps.places.push(Lv::Target(e));
+                        continue;
+                    }
                     let mut n = self.name()?;
-                    // pkg.X = v, m.x = v: a name of another module
-                    if self.l.dotted() && self.text() == Some(".") {
+                    // pkg.X = v, m.x = v: a name of another module, or a
+                    // field (p.x = v): which, the program's files say
+                    while self.l.dotted() && self.text() == Some(".") && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Ident(_))) {
                         self.i += 1;
                         let m = self.name()?;
                         n = format!("{n}.{m}");
@@ -507,7 +617,43 @@ impl<'a> P<'a> {
                         index.push(self.expr(0)?.0);
                         self.expect("]")?;
                     }
-                    caps.places.push((n, index));
+                    // fields after that: ps[i].x, p->a[2]
+                    let arrow = self.l.records.as_ref().and_then(|r| r.arrow.clone());
+                    let field = |p: &Self| p.l.records.is_some() && (p.text() == Some(".") || (arrow.is_some() && p.text() == arrow.as_deref()));
+                    if field(self) {
+                        let mut e = Expr::Var(n, line);
+                        for i in index {
+                            e = Expr::Index(Box::new(e), Box::new(i), line);
+                        }
+                        loop {
+                            if self.eat("[") {
+                                let i = self.expr(0)?.0;
+                                self.expect("]")?;
+                                e = Expr::Index(Box::new(e), Box::new(i), line);
+                            } else if field(self) {
+                                let through = self.text() != Some(".");
+                                self.i += 1;
+                                let m = self.field_name()?;
+                                if through {
+                                    e = Expr::Deref(Box::new(e), line);
+                                }
+                                e = Expr::Field(Box::new(e), m, line);
+                            } else {
+                                break;
+                            }
+                        }
+                        caps.places.push(Lv::Target(e));
+                    } else {
+                        caps.places.push(Lv::Name(n, index));
+                    }
+                }
+                Pat::Cap(Cap::Fields) => {
+                    let f = self.fields()?;
+                    caps.fields.push(f);
+                }
+                Pat::Cap(Cap::Members) => {
+                    let m = self.members()?;
+                    caps.members.push(m);
                 }
                 Pat::Cap(Cap::Dims) => {
                     let mut dims = Vec::new();
@@ -576,6 +722,102 @@ impl<'a> P<'a> {
         Ok(())
     }
 
+    /// A field's name after `.` or `->` (a word, even one the language
+    /// keeps for itself elsewhere).
+    fn field_name(&mut self) -> R<String> {
+        match self.peek().clone() {
+            T::Ident(s) => {
+                self.i += 1;
+                Ok(s)
+            }
+            _ => self.miss("a field's name"),
+        }
+    }
+
+    /// A struct's fields to its closing brace: Go's `X, Y int` on lines of
+    /// their own, C's `int x, *p, a[3];`.
+    fn fields(&mut self) -> R<Vec<FieldDef>> {
+        let mut out = Vec::new();
+        loop {
+            self.skip_ends();
+            if self.text() == Some("}") {
+                return Ok(out);
+            }
+            let line = self.line();
+            if self.l.param_first {
+                let mut names = vec![self.name()?];
+                while self.eat(",") {
+                    names.push(self.name()?);
+                }
+                let ty = self.ty()?;
+                for name in names {
+                    out.push(FieldDef { name, ty: ty.clone(), dims: Vec::new(), line });
+                }
+                self.end()?;
+            } else {
+                // a * belongs to the name after it, not to the type
+                let mut base = self.ty()?;
+                let mut stars = 0;
+                while base.last().map(String::as_str) == Some("*") {
+                    base.pop();
+                    stars += 1;
+                }
+                loop {
+                    let mut ty = base.clone();
+                    ty.extend(std::iter::repeat_n("*".to_string(), stars));
+                    stars = 0;
+                    while self.eat("*") {
+                        ty.push("*".into());
+                    }
+                    let name = self.name()?;
+                    let mut dims = Vec::new();
+                    while self.eat("[") {
+                        dims.push(Some(self.expr(0)?.0));
+                        self.expect("]")?;
+                    }
+                    out.push(FieldDef { name, ty, dims, line });
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(";")?;
+            }
+        }
+    }
+
+    /// A class's indented block: its methods and its own attributes.
+    fn members(&mut self) -> R<(Vec<FuncDef>, Vec<Stmt>)> {
+        if !matches!(self.peek(), T::End) {
+            return self.miss("a new line and an indented block");
+        }
+        self.i += 1;
+        if !matches!(self.peek(), T::Indent) {
+            return self.miss("an indented block");
+        }
+        self.i += 1;
+        let (mut funcs, mut stmts) = (Vec::new(), Vec::new());
+        loop {
+            self.skip_ends();
+            match self.peek() {
+                T::Dedent => {
+                    self.i += 1;
+                    return Ok((funcs, stmts));
+                }
+                T::Eof => return Ok((funcs, stmts)),
+                _ => {
+                    let line = self.line();
+                    match self.statement(Ctx::Top)? {
+                        Parsed::Func(f) => funcs.push(f),
+                        Parsed::Stmt(s) => stmts.push(s),
+                        Parsed::Type(_) => return self.fatal(line, "a class inside a class is not in Strike yet".into()),
+                        Parsed::Import(_) => return self.fatal(line, "an import inside a class is not in Strike yet".into()),
+                        _ => return self.miss("a method or an attribute"),
+                    }
+                }
+            }
+        }
+    }
+
     fn statement(&mut self, ctx: Ctx) -> R<Parsed> {
         let l = self.l;
         let start = self.i;
@@ -615,7 +857,47 @@ impl<'a> P<'a> {
                     ret: c.types.first().cloned().unwrap_or_default(),
                     body: bodies.next().unwrap_or_default(),
                     line,
-                })
+                    method_of: None,
+                });
+            }
+            Kind::Method => {
+                // func (p *P) Move(dx int): the receiver is the first parameter
+                let mut ps = c.params.drain(..);
+                let (recv, recv_ty) = ps.next().unwrap_or_default();
+                let (params, param_types) = ps.next().unwrap_or_default();
+                let of: String = recv_ty.first().map(|t| t.iter().filter(|w| *w != "*").cloned().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                let name = names.next().unwrap_or_default();
+                return Parsed::Func(FuncDef {
+                    name: format!("{of}.{name}"),
+                    params: recv.into_iter().chain(params).collect(),
+                    param_types: recv_ty.into_iter().chain(param_types).collect(),
+                    ret: c.types.first().cloned().unwrap_or_default(),
+                    body: bodies.next().unwrap_or_default(),
+                    line,
+                    method_of: Some(of),
+                });
+            }
+            Kind::Struct => {
+                let (mut tag, mut name, mut base) = (None, None, None);
+                for role in &f.names {
+                    let n = names.next();
+                    match role {
+                        Role::Tag => tag = n,
+                        Role::Base => base = n,
+                        _ => name = n,
+                    }
+                }
+                let (methods, attrs) = c.members.pop().unwrap_or_default();
+                let of = name.clone().or(tag.clone()).unwrap_or_default();
+                let methods = methods
+                    .into_iter()
+                    .map(|m| FuncDef { name: format!("{of}.{}", m.name), method_of: Some(of.clone()), ..m })
+                    .collect();
+                return Parsed::Type(TypeDef { name, tag, base, fields: c.fields.pop().unwrap_or_default(), methods, attrs, line });
+            }
+            Kind::Alias => {
+                let (a, b) = (names.next().unwrap_or_default(), names.next().unwrap_or_default());
+                return Parsed::Alias(a, b, line);
             }
             Kind::Ignore => return Parsed::Ignore,
             Kind::Package => return Parsed::Package(names.next().unwrap_or_default(), line),
@@ -641,23 +923,23 @@ impl<'a> P<'a> {
                 line,
             },
             Kind::Assign => {
-                let (name, index) = match c.places.pop() {
-                    Some(p) => p,
-                    None => (names.next().unwrap_or_default(), Vec::new()),
-                };
                 let value = match f.value {
                     Some(v) => Expr::Num(v, false),
                     None => exprs.next().unwrap_or(Expr::Num(0, false)),
                 };
-                Stmt::Assign { name, index, op: f.op, value, line }
+                match c.places.pop() {
+                    Some(Lv::Target(target)) => Stmt::Set { target, op: f.op, value, line },
+                    Some(Lv::Name(name, index)) => Stmt::Assign { name, index, op: f.op, value, line },
+                    None => Stmt::Assign { name: names.next().unwrap_or_default(), index: Vec::new(), op: f.op, value, line },
+                }
             }
             Kind::ForEach => {
                 let (mut index, mut value) = (None, None);
                 for role in &f.names {
                     let n = names.next().filter(|n| n != "_");
                     match role {
-                        super::lang::Role::Index => index = n,
-                        super::lang::Role::Value => value = n,
+                        Role::Index => index = n,
+                        _ => value = n,
                     }
                 }
                 Stmt::ForEach { index, value, iter: exprs.next().unwrap_or(Expr::Num(0, false)), body: bodies.next().unwrap_or_default(), line }
@@ -714,7 +996,12 @@ impl<'a> P<'a> {
                     let Some(i) = lo else { return self.miss("an index") };
                     e = Expr::Index(Box::new(e), i, line);
                 }
-            } else if (!self.l.methods.is_empty() || self.l.dotted()) && self.text() == Some(".") {
+            } else if self.l.records.as_ref().and_then(|r| r.arrow.as_deref()).is_some_and(|a| self.text() == Some(a)) {
+                // p->x: the field of what p points at
+                self.i += 1;
+                let name = self.field_name()?;
+                e = Expr::Field(Box::new(Expr::Deref(Box::new(e), line)), name, line);
+            } else if (!self.l.methods.is_empty() || self.l.dotted() || self.l.records.is_some()) && self.text() == Some(".") {
                 self.i += 1;
                 let name = match self.peek().clone() {
                     T::Ident(s) => {
@@ -723,12 +1010,17 @@ impl<'a> P<'a> {
                     }
                     _ => return self.miss("a method's name"),
                 };
-                // m.x, pkg.X: a name of another module, not a call
+                // m.x, pkg.X: a name of another module, not a call (or a
+                // field, p.x: which, the program's files say)
                 if self.l.dotted() && self.text() != Some("(") {
                     if let Expr::Var(n, l) = &e {
                         e = Expr::Var(format!("{n}.{name}"), *l);
                         continue;
                     }
+                }
+                if self.l.records.is_some() && self.text() != Some("(") {
+                    e = Expr::Field(Box::new(e), name, line);
+                    continue;
                 }
                 self.expect("(")?;
                 let a = self.args()?;
@@ -786,7 +1078,28 @@ impl<'a> P<'a> {
                 return Ok(elems);
             }
             let line = self.line();
-            let e = if self.text() == Some("{") { Expr::Brace(self.braces()?, line) } else { self.expr(0)?.0 };
+            let keyed = self.l.records.as_ref().and_then(|r| r.keyed.clone());
+            let e = if self.text() == Some("{") {
+                Expr::Brace(self.braces()?, line)
+            } else if keyed.as_deref() == Some(".") && self.text() == Some(".") {
+                // C's designator: .x = value
+                self.i += 1;
+                let name = self.field_name()?;
+                self.expect("=")?;
+                let v = if self.text() == Some("{") { Expr::Brace(self.braces()?, line) } else { self.expr(0)?.0 };
+                Expr::Key(name, Box::new(v), line)
+            } else {
+                let e = self.expr(0)?.0;
+                match (&e, keyed.as_deref()) {
+                    // Go's key: X: value
+                    (Expr::Var(name, _), Some(k)) if k != "." && self.text() == Some(k) => {
+                        self.i += 1;
+                        let v = if self.text() == Some("{") { Expr::Brace(self.braces()?, line) } else { self.expr(0)?.0 };
+                        Expr::Key(name.clone(), Box::new(v), line)
+                    }
+                    _ => e,
+                }
+            };
             elems.push(e);
             while matches!(self.peek(), T::End) {
                 self.i += 1;
@@ -806,7 +1119,7 @@ impl<'a> P<'a> {
         let mut j = self.i + 1;
         let mut words = 0;
         while let Some(T::Ident(s) | T::Punct(s)) = self.t.get(j).map(|t| &t.t) {
-            if self.l.type_words.contains(s) || s == "*" {
+            if self.is_type(s) || s == "*" {
                 words += 1;
                 j += 1;
             } else {
@@ -873,7 +1186,41 @@ impl<'a> P<'a> {
                     T::Ident(s) | T::Punct(s) => s.clone(),
                     _ => return self.miss("an expression"),
                 };
-                if let Some(&(p, op)) = l.unary.get(&word) {
+                let top = l.unary.values().map(|u| u.0).max().unwrap_or(0);
+                let rec = l.records.as_ref();
+                if rec.and_then(|r| r.address_of.as_deref()) == Some(word.as_str()) {
+                    self.i += 1;
+                    let (e, _) = self.expr(top)?;
+                    (Expr::Addr(Box::new(e), line), false)
+                } else if rec.and_then(|r| r.deref.as_deref()) == Some(word.as_str()) {
+                    self.i += 1;
+                    let (e, _) = self.expr(top)?;
+                    (Expr::Deref(Box::new(e), line), false)
+                } else if rec.and_then(|r| r.sizeof.as_deref()) == Some(word.as_str()) {
+                    self.i += 1;
+                    if self.text() == Some("(") && self.cast_ahead() {
+                        self.i += 1;
+                        let ty = self.ty()?;
+                        self.expect(")")?;
+                        (Expr::SizeOfType(ty, line), false)
+                    } else {
+                        let (e, _) = self.expr(top)?;
+                        (Expr::SizeOf(Box::new(e), line), false)
+                    }
+                } else if rec.and_then(|r| r.offsetof.as_deref()) == Some(word.as_str()) {
+                    self.i += 1;
+                    self.expect("(")?;
+                    let ty = self.ty()?;
+                    self.expect(",")?;
+                    let f = self.field_name()?;
+                    self.expect(")")?;
+                    (Expr::OffsetOf(ty, f, line), false)
+                } else if l.composite_literals && self.types.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "{") {
+                    // Go's P{1, 2}: a struct's composite
+                    self.i += 1;
+                    let elems = self.braces()?;
+                    (self.postfix(Expr::Composite(vec![word], elems, line))?, false)
+                } else if let Some(&(p, op)) = l.unary.get(&word) {
                     self.i += 1;
                     let (e, _) = self.expr(p)?;
                     (Expr::Un(op, Box::new(e)), false)
@@ -920,8 +1267,53 @@ impl<'a> P<'a> {
     }
 }
 
+/// The names a file gives its types (struct P, type P, class P, and a
+/// typedef's last name), found before the file is read, so that a type is
+/// read as one wherever it is written.
+pub fn type_names(toks: &[Tok], l: &Lang) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(r) = &l.records else { return out };
+    let word = |i: usize| match toks.get(i).map(|t| &t.t) {
+        Some(T::Ident(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    for i in 0..toks.len() {
+        let Some(w) = word(i) else { continue };
+        if r.type_intro.iter().any(|x| x == w) {
+            if let Some(n) = word(i + 1) {
+                out.insert(n.to_string());
+            }
+        }
+        if r.typedef.as_deref() == Some(w) {
+            // the last name before the `;` that ends it, outside braces
+            let mut depth = 0;
+            let mut last = None;
+            for t in &toks[i + 1..] {
+                match &t.t {
+                    T::Punct(p) if p == "{" => depth += 1,
+                    T::Punct(p) if p == "}" => depth -= 1,
+                    T::Punct(p) if p == ";" && depth == 0 => break,
+                    T::Ident(s) if depth == 0 => last = Some(s.clone()),
+                    T::Eof => break,
+                    _ => {}
+                }
+            }
+            out.extend(last);
+        }
+    }
+    out
+}
+
 pub fn parse(toks: &[Tok], l: &Lang) -> Result<Program, Failure> {
-    let mut p = P { t: toks, i: 0, l, far: 0, far_msg: String::new(), fatal: None };
+    parse_with(toks, l, &std::collections::HashSet::new())
+}
+
+/// The file's tokens read, with the types other files of its package
+/// declare known as types too (Go's package of several files).
+pub fn parse_with(toks: &[Tok], l: &Lang, others: &std::collections::HashSet<String>) -> Result<Program, Failure> {
+    let mut types = type_names(toks, l);
+    types.extend(others.iter().cloned());
+    let mut p = P { t: toks, i: 0, l, far: 0, far_msg: String::new(), fatal: None, types };
     let mut prog = Program::default();
     let fail = |p: &P| {
         let reach = p.far as f64 / toks.len().max(1) as f64;
@@ -943,6 +1335,14 @@ pub fn parse(toks: &[Tok], l: &Lang) -> Result<Program, Failure> {
                 prog.imports.push(i);
             }
             Ok(Parsed::Package(n, line)) => prog.package = Some((n, line)),
+            Ok(Parsed::Type(t)) => {
+                // Python's class runs where it stands: its attributes are given there
+                if l.records.as_ref().is_some_and(|r| r.classes) {
+                    prog.top.push(Stmt::Class(t.name.clone().unwrap_or_default(), t.line));
+                }
+                prog.types.push(t);
+            }
+            Ok(Parsed::Alias(a, b, line)) => prog.aliases.push((a, b, line)),
             Ok(Parsed::Ignore) => {}
             Err(Miss) => return Err(fail(&p)),
         }

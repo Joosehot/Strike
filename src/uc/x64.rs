@@ -16,6 +16,10 @@ pub enum Target {
     Data(Vec<u8>),
     /// an offset in the zeros the program writes (.bss)
     Writable(u32),
+    /// the same, as its absolute address (the image's base is below 2^31,
+    /// so it fits a displacement: `[index * 8 + address]` needs no base
+    /// register); the offset wraps, so it may lie before the zeros' start
+    Abs(u32),
 }
 
 /// A function's machine code, and the 32-bit fields still to be filled with

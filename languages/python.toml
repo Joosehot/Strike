@@ -59,6 +59,17 @@ abs = "abs"
 [float_widths]
 float = 64
 
+# classes: objects on the heap, shared by every name that holds one;
+# __init__ gives them their attributes (self.x = ...), whose kinds are
+# learned as a list's elements are. A class's own attributes (count = 0),
+# a base class (each method lowered for the class it is called on, so an
+# override is found as Python finds it), super().m(). An object prints by
+# its __str__ or __repr__: without them it prints its address, which is
+# refused.
+[records]
+model = "classes"
+type_intro = ["class"]
+
 # module.name(...) of Python's own modules that Strike provides
 [qualified]
 "math.sqrt" = "py_sqrt"
@@ -110,6 +121,12 @@ False = 0
 kind = "function"
 place = "top"
 pattern = "def $name ( $params ) [ -> $type ] : $block"
+
+[[form]]
+kind = "struct"
+place = "top"
+names = ["alias", "base"]
+pattern = "class $name [ ( $name ) | ( ) ] : $members"
 
 [[form]]
 name = "spec"
@@ -205,6 +222,31 @@ pattern = "$place //= $expr $end"
 kind = "assign"
 op = "mod_floor"
 pattern = "$place %= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "shl"
+pattern = "$place <<= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "shr"
+pattern = "$place >>= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "band"
+pattern = "$place &= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "bor"
+pattern = "$place |= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "bxor"
+pattern = "$place ^= $expr $end"
 
 [[form]]
 kind = "assign"

@@ -276,6 +276,60 @@ against printf, Go and Python on 10,095 doubles (all the powers of 2 and
 10, random bit patterns, random decimals, subnormals, halfway cases):
 504,750 printf results, 353,325 Go Printf results, every repr, and every
 %v of float64 and float32 were all the same.
+
+### Structs and classes
+
+A description says how its language writes them, in its `[records]`
+table: the words that name a type (`struct`, `type`, `class`), `->`, `&`
+and `*`, how an element names its field (`.x =` or `X:`), and whether the
+values are structs or objects. The IR needed nothing new: a struct is
+memory, as an array is.
+
+- **C** ([c.toml](languages/c.toml)). A struct is laid out as clang lays
+  it out on x86-64: each field at the next multiple of its alignment, the
+  whole rounded up to the largest. It is held in place (the function's own
+  memory, or a global's words) and copied when it is assigned, given or
+  returned. A struct returned goes straight into memory its caller gives,
+  so nothing is made on the heap for it. `struct P`, `typedef struct ...
+  P`, `typedef struct P P`, nested structs, arrays of structs and arrays in
+  them, `{1, 2}` and `{.y = 2, 3}` (the rest zero), `&s`, `p->x`, `(*p).x`,
+  `*p = s`, a pointer to a struct as a parameter, a variable or a field
+  (`struct Node *next`), and an array of structs given as one. `sizeof` of
+  a type, a variable, a field or an element, and `offsetof`, count as clang
+  counts; `sizeof a / sizeof a[0]` is worked out while compiling, so its
+  unsigned division is exact.
+- **Go** ([go.toml](languages/go.toml)). A struct is a value too: assigned,
+  given and returned as a copy, and an array in it with it. `P{1, 2}`
+  gives every field, `P{X: 1}` the ones named, `[]P{{1, 2}}` leaves the
+  type out. `&P{...}` and `&v` make pointers, and what they point at lives
+  on the heap, new each time, as Go's escape analysis puts it: a variable
+  whose address is taken, or that a method wanting a pointer is called on,
+  is never the function's own memory. `p.X` follows a pointer, and a nil
+  one panics with exit code 2. Methods take a value (copied) or a pointer,
+  which Go takes of an addressable value by itself. A struct declared in
+  one file of the package is a type in all of them. Println and `%v` print
+  `{1 2 hi}`, `&{1 2}` and `<nil>`, `%+v` prints `{X:1 Y:2}`, and a String
+  method with a value receiver is what fmt prints. A slice of structs grows
+  by Go's own size of the struct, so `cap` is Go's.
+- **Python** ([python.toml](languages/python.toml)). An object is an
+  address on the heap, shared by every name that holds it. Its first word
+  says which attributes are set, and each attribute has a word of its own:
+  those any method of its class (or of a base) gives `self`, and those
+  given outside, learned round by round as kinds are. An attribute's kind
+  is learned as a list's elements are. Reading one that is not set is
+  Python's AttributeError, or the class's own attribute (`count = 0`; `P.a`
+  and `b = a + 1` in the body read the class's). A base class, overriding
+  and `super().m()` are Python's: each method is lowered for each class it
+  is called on, so `self.speak()` finds the override, as Python finds it.
+  `print` uses `__str__` or `__repr__`, and a list shows its objects by
+  `__repr__`.
+
+Checked as everything else is: tests/uc/structs.c, structs.go and
+classes.py print what clang, Go and Python print, in every mode, and
+[tools/struct_layouts.py](tools/struct_layouts.py) writes 160 structs of
+random fields whose every `sizeof` and `offsetof` Strike's executable
+prints as clang's does.
+
 ### Several files, modules and C's preprocessor
 
 `strike compile a.c b.c`, or a directory: `strike compile prog/`. Each
@@ -337,8 +391,21 @@ a value.
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
-- structs, pointer arithmetic, `&` and `*`, and the unsigned types other
-  than Go's `byte`;
+- pointer arithmetic, `&` and `*` of anything but a struct, and the
+  unsigned types other than Go's `byte`;
+- a C struct with a `float` field (Strike holds a float as a double, so its
+  four bytes are not where clang puts them), a struct that holds itself, a
+  Go `byte` field, `==` of structs, and `sizeof` of an expression other
+  than a variable, a field or an element;
+- printing what Go prints as an address (a pointer inside a struct or a
+  slice), a type with an Error, Format or GoString method, or one with a
+  String method inside another value; a pointer method called on a value
+  that has no address; a type of a package other than main;
+- printing a Python object that has no `__str__` or `__repr__` (it prints
+  its address), a list of objects without `__repr__`, an object as a
+  condition, `==` of objects, `isinstance`, a static method, a method called
+  on its class, a name holding objects of two classes, and a class of a
+  module other than the main one;
 - a Python string past ASCII, a string changed in place, `split` with a
   separator, Go's `[]byte`;
 - a chained comparison in Python;
@@ -405,7 +472,21 @@ the line and the reason, and never guessed. Refused today:
   TypeError, EOFError, Go's panics) and each refusal. The random C
   programs make strings in char arrays too, and compare them with strlen
   and strcmp.
-- 83 tests in all (every target of `cargo test --release`), in about 55 s.
+- Structs and classes: the three suites, the 160 random layouts, Go's nil
+  pointer and Python's AttributeError one by one, and each refusal. The
+  random C programs have structs too: nested, arrays of them and in them,
+  given and returned by value, changed through pointers, copied whole.
+- 40 more random C programs have integer functions with more locals than
+  registers: leaf functions, and ones with calls, printf and divisions
+  between the uses of their locals, C `int` and `long long`, chains round
+  their loops through multiplications, a function of no arguments right
+  of comparisons. 40 more have loops that read and write adjacent global
+  arrays (with indices a little past their ends), a local array and an
+  array parameter that is the array read. Each is built plain, default and
+  `--release --no-evaluate`, and must print the same. Each was checked to
+  fail with the rule it guards broken (the calls' or divisions' registers,
+  the alias test, the cut at a loop's way out).
+- 101 tests in all (every target of `cargo test --release`), in about 70 s.
 
 The tests have found real bugs, all fixed:
 
@@ -415,7 +496,15 @@ The tests have found real bugs, all fixed:
 - a crash on frames larger than a page;
 - Python's 25! and C's `int` overflow coming out wrong with no warning;
 - Go's `x := int32(y)` (and `c := s[0]`) taking int's width, not the
-  value's, so x did not wrap at 32 bits.
+  value's, so x did not wrap at 32 bits;
+- a Python parameter passed on to another function before its own kind
+  was known made that function's a whole number, so `super().__init__(name)`
+  (or any `f(s)` that calls `g(s)` with a string) was refused;
+- Go's `a[i] = -1` into a float slice refused, as if the constant could not
+  be a float;
+- in `(a < b) ^ f()`, with f taking no arguments, the comparison waited as
+  the machine's flags while f ran and changed them (found by the stage-4
+  tests; [tests/uc/flags_call.c](tests/uc/flags_call.c)).
 
 ### Code generation
 
@@ -431,6 +520,28 @@ numbers are in [codegen.toml](codegen.toml).
   memory operations a register saves, where a use in a loop weighs 8 times
   more per level, against the cost of saving the register. A beam keeps
   the best choices.
+- **The volatile registers too.** r10, r9, r8 and rdx are offered as well,
+  at no saving cost, to a local that nothing writes them over while it is
+  live: no call (and for rdx and r8 no division) comes between its store
+  and its last read, or while a value read from it still waits on the
+  generator's stack. A leaf function's locals live there first. The
+  parameters reach their registers by a parallel move. factor.c's eighth
+  local, which went to memory, now has r8.
+- **Locals that never meet share a slot.** Before the beam chooses, locals
+  whose live ranges do not meet (one is never stored while the other is
+  still to be read, or waits on the stack) are made one slot. A float
+  shares only with floats, and a local read before its first store keeps
+  its own. n-body's six short-lived `vx[i]` values now take one xmm
+  register, not six.
+- **Global and frame memory is addressed where it is.** The image's base
+  is 0x400000, so a global's absolute address fits a 32-bit displacement:
+  `x[j]` is `[j * 8 + x]` and a local array's element `[rsp + j * 8 + d]`,
+  with no register for the array's start (clang's Windows code keeps one
+  for each array).
+- **An operation into a local's register.** `x = y >> 2`, `x = y << 3` and
+  `x = y * 7` are worked out straight in x's register, and a float
+  element's operation stored into a float local (`dx = xi - x[j]`) is
+  worked out in that local's xmm register.
 - **The frame has no rbp.** Saved registers are pushed and popped, and
   locals are addressed from rsp, because the generator knows how much is
   pushed at every operation. Each frame reserves its call area once.
@@ -467,7 +578,32 @@ these is also something clang -O2 does:
 - **The algebraic simplifier** ([src/uc/simplify.rs](src/uc/simplify.rs)),
   in the way of Nuome's. See [below](#the-algebraic-simplifier).
 - **Loop-invariant code motion.** An expression that cannot fail, made of
-  locals the loop never stores, is worked out once before the loop.
+  locals the loop never stores, is worked out once before the loop. An
+  address that needs no register (a global's or the frame's plus an index
+  times its size) stays in the loop, as a moved one would only take a
+  register. The same expression moved out twice is worked out once.
+- **Elements read in a loop that no write of it can reach leave the
+  loop** ([src/uc/alias.rs](src/uc/alias.rs)). The alias analysis is exact:
+  it finds which bytes an access can touch from the program's own
+  addresses, a global's or the frame's address plus whole numbers whose
+  intervals [ranges.rs](src/uc/ranges.rs) knows (a loop's counter below
+  its bound where the body reads it). The globals are one block and the
+  frame is the function's own, so two runs of bytes that do not overlap
+  never meet, whatever the arrays are. A local holding an address is
+  followed back to its store in the same straight code. An address from a
+  parameter or from memory may be anywhere, and so may a call of the
+  program's own functions; nothing about C's types is assumed. The element
+  must also lie inside the globals or the frame, so reading it before the
+  loop, even one that never runs, cannot fault. n-body's `x[i]`, `y[i]`,
+  `z[i]` and `m[i]` are read once per `i`, as clang reads them.
+- **A C int cut on a chain through a multiplication moves to the loop's
+  way out.** A local the loop reads only for the low 32 bits of a result
+  that is cut again need not be cut where the loop stores it (the low 32
+  bits of a ring expression depend only on its inputs' low 32 bits). It is
+  cut once at every way out. HotMotor's judge, measured, takes this only
+  where the local's own value comes to the cut through a multiplication
+  (intchain.c: 0.377 s to 0.341 s); on a chain of additions alone the loop
+  measured slower (intexpr.c: 0.155 s to 0.177 s), so it keeps its cut.
 - **Division by a constant as a magic multiplication**, where HotMotor's
   judge takes it. A division whose value comes back round its loop into
   what it divides keeps the divider, which is faster there. Any other
@@ -484,8 +620,8 @@ these is also something clang -O2 does:
   copy m reads the counter plus m, so the copies differ only by their
   addresses' displacement.
 - **Array loops.** A local every store of which gives one constant is read
-  as it (so `int n = 300` makes a loop's count known). A global array's
-  address and a row's leave the loop. `a[i] += x` is one instruction on
+  as it (so `int n = 300` makes a loop's count known). A row's address
+  leaves the loop. `a[i] += x` is one instruction on
   the memory, an element only tested is one `cmp` with zero, and an
   element's address is `[base + index * size + d]`. A C `int` counter's
   cut back to 32 bits is left out where the loop has just found it below a
@@ -686,7 +822,9 @@ already faster. The other C benchmarks are still slower than clang:
 - factor.c is still slower, even than clang's scalar code. What is left is
   in x64opt, not in the IR. A shift into a register takes `mov rax, x;
   sar rax, k; mov r, rax`, three instructions for two. With seven saved
-  registers, the eighth local of factor.c's loop goes to memory.
+  registers, the eighth local of factor.c's loop goes to memory. (Both
+  are done now, and factor.c is faster than clang -O2: see
+  [Measured](#measured).)
 - intexpr.c and index.c: clang vectorizes them.
 - intchain.c and chain.c are dependency chains. clang works the next
   time round's x into y algebraically, and it leaves out intchain's cuts,
@@ -756,18 +894,70 @@ results.
 | 300x300 matrix product (`double`), 4 times | 0.031 / 0.032 s | 0.017 / 0.018 s | 1.8 times as slow |
 
 Float locals in xmm registers brought the n-body from 0.147 s to 0.087 s,
-and the integration from 0.097 s to 0.050 s.
+and the integration from 0.097 s to 0.050 s. The n-body is now faster than
+clang: see below.
 
 clang does no FMA here: x86-64 without `-march` has none, so the two do
-the same roundings. The rest of the gap is two things Strike does not do
-yet:
+the same roundings. clang vectorizes the matrix product with `mulpd` and
+`addpd`, two elements an instruction; Strike's loop is six scalar
+instructions an element.
 
-- **The matrix product.** clang vectorizes it with `mulpd` and `addpd`,
-  two elements an instruction. Strike's loop is six scalar instructions an
-  element.
-- **The n-body.** clang loads `x[i]` and `m[i]` once outside the inner
-  loop. Its alias analysis knows that the stores to `vx` cannot reach
-  them. Strike loads them every time round.
+**The gaps that are not vectorization.** Every benchmark above and in
+[bench/simplify/](bench/simplify/), `--release --no-evaluate`, against
+master at b33a0c6 (before the volatile registers, the shared slots, the
+absolute addresses, alias.rs and the moved cuts). 11 interleaved runs,
+min / median in seconds; the machine was busy, so a few percent is noise.
+
+| | master | **now** | clang -O2 | go | now against clang -O2 |
+|---|---|---|---|---|---|
+| n-body | 0.088 / 0.090 | **0.047 / 0.048** | 0.053 / 0.055 | | **12% faster** (was 1.7 times as slow) |
+| factor.c | 0.179 / 0.181 | **0.104 / 0.105** | 0.108 / 0.118 | | **4-11% faster** (was 1.7 times as slow) |
+| factor.go | 0.180 / 0.188 | **0.106 / 0.120** | | 0.316 / 0.318 | 3 times as fast as Go |
+| intchain.c | 0.375 / 0.379 | **0.340 / 0.342** | 0.274 / 0.278 | | 24% slower (was 37%) |
+| invariant loops | 0.0258 / 0.0263 | 0.0244 / 0.0258 | 0.0244 / 0.0257 | | as fast (was 6% slower) |
+| chain.c | 0.203 / 0.206 | 0.203 / 0.206 | 0.194 / 0.196 | | 5% slower |
+| poly.c | 0.127 / 0.129 | 0.128 / 0.130 | 0.140 / 0.142 | | 9% faster |
+| walk.c | 0.056 / 0.057 | 0.055 / 0.057 | 0.059 / 0.061 | | 7% faster |
+| fib(36) | 0.0287 / 0.0298 | 0.0289 / 0.0299 | 0.0301 / 0.0308 | | 3-4% faster |
+| 30 million calls | 0.0884 / 0.0894 | 0.0882 / 0.0895 | 0.0978 / 0.0996 | | 10% faster |
+| primes below 300 000 | 0.0191 / 0.0198 | 0.0191 / 0.0197 | 0.0197 / 0.0203 | | 3% faster |
+| a sum loop | 0.0036 / 0.0038 | 0.0036 / 0.0037 | 0.0040 / 0.0043 | | as fast (both closed it) |
+| integration | 0.052 / 0.091 | 0.051 / 0.086 | 0.053 / 0.103 | | 4% faster |
+| 600x600 product (`long long`) | 0.055 / 0.058 | 0.054 / 0.055 | 0.056 / 0.058 | | 4% faster |
+| sieve of 100 million | 0.507 / 0.522 | 0.508 / 0.520 | 0.505 / 0.514 | | as fast |
+| 300x300 product (`double`) | 0.035 / 0.035 | 0.035 / 0.036 | 0.018 / 0.018 | | clang vectorizes |
+| intexpr.c | 0.158 / 0.162 | 0.156 / 0.160 | 0.070 / 0.072 | | clang vectorizes |
+| index.c | 0.0197 / 0.0201 | 0.0195 / 0.0200 | 0.0115 / 0.0120 | | clang vectorizes |
+
+What made the difference:
+
+- **n-body**: the six short-lived `vx[i]` temporaries share one xmm
+  register, so `dt` and every body's coordinates stay in registers; the
+  arrays are addressed `[j * 8 + x]` with no base registers (master held 18
+  hoisted addresses, most in memory); `x[i]`, `y[i]`, `z[i]` and `m[i]` are
+  read once per `i`, and the three copies of `m[i]` are one.
+- **factor.c**: the shifts go straight into their locals' registers, and
+  the eighth local has r8 instead of memory.
+- **intchain.c**: x's and y's cuts moved out of the loop take an
+  instruction off each step of the chain.
+
+What is left, and why:
+
+- **intchain.c and chain.c** are dependency chains. clang works the next
+  time round's x into y and reassociates across the copies of the unrolled
+  loop (it computes `3x' + 5` from the product before `+ i`). Substituting
+  x into y by hand in the source made Strike only 4% faster (0.361 s), so
+  what is left is clang's reassociation across iterations, and for
+  intchain its 32-bit registers, which need no cut at all.
+- **intexpr.c, index.c and the double matrix product** are vectorized by
+  clang (`pmulld`, `mulpd`). intexpr.c is also slower than clang's scalar
+  code (0.127 s): clang works in 32-bit registers. Removing the cut of `s`
+  on its add-only chain made the loop slower (0.155 s to 0.177 s, measured,
+  and not by its alignment), so the judge keeps it.
+- Two encodings were tried and measured slower, so they are not used: a
+  multiplication by 3, 5 or 9 as one `lea` (intexpr.c 0.155 s to
+  0.176 s), and addresses with no displacement byte (intexpr.c 0.174 s
+  against 0.155 s).
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds
@@ -781,7 +971,7 @@ are planned:
 1. Command-line arguments, which are strings now there are strings.
 2. More of floats: reading floats from input, and more of each language's
    math library.
-3. Structs and classes.
+3. ~~Structs and classes.~~ Done: see above.
 4. ~~Several files and modules, and C's preprocessor.~~ Done: see
    above.
 
