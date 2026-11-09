@@ -28,13 +28,27 @@ comprehensions = true
 negative_index = true
 index_error = [1, "IndexError: list index out of range\n"]
 list_print = ["[", ", ", "]"]
+# a string is code points; Strike holds them to ASCII (a literal past it is
+# refused, a line read that holds one stops the program)
+strings = "ascii"
 
 [builtins]
 len = "len"
+str = "str"
+ord = "ord"
+chr = "chr"
+input = "input"
 
 [methods]
 append = "list_append"
 pop = "list_pop"
+upper = "str_upper"
+lower = "str_lower"
+strip = "str_strip"
+split = "str_split"
+join = "str_join"
+startswith = "str_startswith"
+find = "str_find"
 
 [bool_constants]
 True = 1
@@ -43,6 +57,7 @@ False = 0
 [binary]
 "or" = [1, "or_value"]
 "and" = [2, "and_value"]
+"in" = [4, "in"]
 "==" = [4, "eq"]
 "!=" = [4, "ne"]
 "<" = [4, "lt"]

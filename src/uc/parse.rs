@@ -641,7 +641,7 @@ impl<'a> P<'a> {
                     let Some(i) = lo else { return self.miss("an index") };
                     e = Expr::Index(Box::new(e), i, line);
                 }
-            } else if !self.l.methods.is_empty() && self.text() == Some(".") {
+            } else if (!self.l.methods.is_empty() || !self.l.qualified.is_empty()) && self.text() == Some(".") {
                 self.i += 1;
                 let name = match self.peek().clone() {
                     T::Ident(s) => {
@@ -734,7 +734,7 @@ impl<'a> P<'a> {
             }
             T::Str(s) => {
                 self.i += 1;
-                (Expr::Str(s), false)
+                (self.postfix(Expr::Str(s))?, false)
             }
             T::Punct(p) if p == "(" => {
                 self.i += 1;

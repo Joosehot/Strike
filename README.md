@@ -112,8 +112,8 @@ file, not a new compiler. There are three today: C, Go and Python.
 
 Integers and truth values, functions and recursion, if/else, while, for,
 Python's `range`, break and continue, printing (print, Println, puts,
-and printf with `%d`, `%s` and `%v`), global variables, and whole numbers
-read from standard input.
+and printf with `%d`, `%s`, `%c`, `%q` and `%v`), global variables, strings,
+and whole numbers and lines read from standard input.
 
 - **Globals.** C's and Go's variables outside functions get their first
   values before main runs. Python's module names are read by functions, and
@@ -126,6 +126,33 @@ read from standard input.
   line at all, or a number past 64 bits stops the program, with Python's
   reason. Input is read 4096 bytes at a time. A program that reads its input
   is never worked out while compiling.
+- **Strings** ([src/uc/strs.rs](src/uc/strs.rs), written in Strike IR as
+  the rest of the library is). A Python or Go string is the address of its
+  length and its bytes, never changed once made; a literal lives in the
+  read-only data (`Op::Data`), and a copy of a string is a copy of its
+  address.
+  - **Python:** literals, `+`, `*`, `len`, `s[i]` and negative indexes,
+    slices, the comparisons, `in`, `for c in s`, `str()`, `int()` of a
+    string (blanks around it, a sign, underscores between digits, else
+    ValueError), `ord`, `chr`, `input()` (with a prompt too), and
+    `upper`, `lower`, `strip`, `split()`, `join`, `startswith`, `find`. A
+    string in a list prints as Python's repr, quotes chosen as Python
+    chooses them. Strike holds Python's strings to ASCII, so a code point is
+    a byte: a literal past ASCII is refused, and `chr()` past it or a line
+    read that holds one stops the program with the reason.
+  - **Go:** bytes. `s[i]` is a `byte` (uint8, which wraps at 256),
+    `range` decodes UTF-8 as Go does (U+FFFD and one byte where it is not
+    UTF-8), `string(r)` encodes it, and slicing out of range panics with
+    exit code 2. Printf's `%s`, `%v`, `%c` and `%q` print as Go prints;
+    `%q` of a string past ASCII stops the program (which characters Go
+    keeps as they are is Unicode's table). `strconv.Itoa` is there,
+    `strconv.Atoi` (two results) is not.
+  - **C:** `char s[] = "abc"` and `char s[10] = "ab"` (the zero byte where
+    there is room), a pointer variable given a literal or an array to point
+    at, `s[i]`, `while (s[i])`, printf's `%s` and `%c`, `puts`, `strlen` and
+    `strcmp` (-1, 0 or 1, as Windows' C library gives it). strlen's
+    `size_t` is unsigned: it is compared unsigned, as C converts the other
+    side, and dividing or shifting it is refused.
 
 Integers are exactly what each language says they are:
 
@@ -142,8 +169,10 @@ Integers are exactly what each language says they are:
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
-- strings as values, arrays, floats, structs, pointers, `unsigned` and
-  `uint`;
+- floats, structs, pointer arithmetic, `&` and `*`, and the unsigned
+  types other than Go's `byte`;
+- a Python string past ASCII, a string changed in place, `split` with a
+  separator, Go's `[]byte`;
 - a chained comparison in Python;
 - a function whose value is used but which can end without one;
 - a Python variable that changes between a number and a truth value.
@@ -174,6 +203,11 @@ the line and the reason, and never guessed. Refused today:
   loop for 300 random polynomials, with overflow.
 - Globals and input are checked against clang, Go and Python with the
   same input, in every mode, and Python's input errors one by one.
+- Strings are checked the same way (tests/uc/strings.*, and lines read by
+  Python), with each error a string can stop on (IndexError, ValueError,
+  TypeError, EOFError, Go's panics) and each refusal. The random C
+  programs make strings in char arrays too, and compare them with strlen
+  and strcmp.
 - 41 tests in all, in about 25 s.
 
 The tests have found real bugs, all fixed:
@@ -182,7 +216,9 @@ The tests have found real bugs, all fixed:
 - a panic in release builds, from jumps left in code that folding made
   unreachable;
 - a crash on frames larger than a page;
-- Python's 25! and C's `int` overflow coming out wrong with no warning.
+- Python's 25! and C's `int` overflow coming out wrong with no warning;
+- Go's `x := int32(y)` (and `c := s[0]`) taking int's width, not the
+  value's, so x did not wrap at 32 bits.
 
 ### Code generation
 
@@ -298,8 +334,7 @@ take 0.2 s.
 To compile ordinary programs, these are still missing, in the order they
 are planned:
 
-1. Arrays and strings, with a heap and an allocator under them (then
-   command-line arguments, which are strings).
+1. Command-line arguments, which are strings now there are strings.
 2. Floats.
 3. Structs and classes.
 4. Several files and modules, and C's preprocessor. Today a `#` line is

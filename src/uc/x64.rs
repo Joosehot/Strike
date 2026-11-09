@@ -273,6 +273,12 @@ pub fn compile(f: &Func) -> Code {
             Op::Fail(code, m) => {
                 fail_here(&mut a, *code, m);
             }
+            Op::Data(d) => {
+                a.e(&[0x48, 0x8D, 0x05]); // lea rax, [rip + data]
+                a.reloc(Target::Data(d.clone()));
+                a.e(&[0x50]);
+                depth += 1;
+            }
             Op::Un(u) => {
                 a.e(&[0x58]);
                 match u {
@@ -326,8 +332,8 @@ pub fn compile(f: &Func) -> Code {
                     BinOp::Ge => set(&mut a, 0x9D),
                     BinOp::Ult => set(&mut a, 0x92),
                     BinOp::Ule => set(&mut a, 0x96),
-                    BinOp::AndBool | BinOp::OrBool | BinOp::AndValue | BinOp::OrValue => {
-                        unreachable!("logic operators are lowered to jumps")
+                    BinOp::AndBool | BinOp::OrBool | BinOp::AndValue | BinOp::OrValue | BinOp::In => {
+                        unreachable!("logic operators are lowered to jumps, `in` to a call")
                     }
                 }
                 a.e(&[0x50]);
