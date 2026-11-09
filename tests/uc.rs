@@ -102,6 +102,16 @@ fn runs_in_every_mode_as_the_real_one(file: &str) {
 /// Programs heavy in what the release simplifier rewrites (polynomials,
 /// shared factors, constant multiples, index arithmetic, C int and char
 /// cuts) print in every mode what clang and Go print.
+/// Work across statements (an unrolled counter's known low bits, value
+/// numbering, shared expressions) and the cuts a range analysis leaves
+/// out: in every mode what clang and Go print.
+#[test]
+fn work_across_statements_is_what_clang_and_go_make_of_it() {
+    for file in ["values.c", "values.go"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
 #[test]
 fn simplified_expressions_are_what_clang_and_go_make_of_them() {
     for file in ["algebra.c", "algebra.go"] {
@@ -611,6 +621,22 @@ impl Gen {
             );
             texts.push(format!("t{k}"));
         }
+        // work across statements: an unrolled counter's copies (known low
+        // bits), locals made again of what they hold, shared expressions,
+        // C int values whose ranges make their cuts needless
+        let mut across = Vec::new();
+        for k in 0..3 {
+            let names: Vec<String> = ["i", "a", "b", "c", "n"].iter().map(|s| s.to_string()).collect();
+            let (from, to) = (self.below(3), self.below(41));
+            let (x, sh, m) = (self.below(5000), self.below(6), self.below(300) as i64 - 150);
+            let shared = self.ring(&names, 2);
+            let e1 = self.ring(&names, 2);
+            let e2 = self.ring(&names, 2);
+            out += &format!(
+                "long long w{k}(long long n) {{\n    long long s = 0;\n    int t = 0;\n    for (int i = {from}; i < {to}; i++) {{\n        long long a = i ^ {x};\n        long long b = (i + 1) >> {sh};\n        int c = (i & 1023) * {m} + (i >> 2);\n        b = (i + 1) >> {sh};\n        s = s + {shared} * {e1} + a * b;\n        t = t + c * 3 + (i << 2);\n        s = s - {shared} + ({e2} & 255);\n    }}\n    return s + t;\n}}\n"
+            );
+            across.push(format!("w{k}"));
+        }
         // ring expressions for the release simplifier: shared factors,
         // polynomials, constant multiples, C long (cut to 32 bits) and long
         // long, index arithmetic in loops, atoms inside
@@ -640,6 +666,9 @@ impl Gen {
         }
         for f in &rings {
             out += &format!("    printf(\"%lld\\n\", {f}({}, {}, {}));\n", self.constant(), self.constant(), self.constant());
+        }
+        for f in &across {
+            out += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
         }
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");

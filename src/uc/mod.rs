@@ -27,10 +27,12 @@ mod modules;
 mod opt;
 mod parse;
 mod pe;
+mod ranges;
 mod rotate;
 mod scev;
 mod simplify;
 mod strs;
+mod values;
 mod x64;
 mod x64opt;
 
@@ -333,9 +335,12 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             simplified += simplify::run(f, rules.loop_weight);
             hoisted += opt::hoist(f);
             simplified += opt::counters(f);
+            simplified += ranges::run(f);
             closed += scev::run(f);
             fold::run(f);
             rotate::run(f);
+            simplified += values::run(f);
+            fold::run(f);
         }
     }
     let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
