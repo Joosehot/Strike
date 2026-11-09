@@ -364,6 +364,79 @@ fn a_second_compile_strikes_every_function_and_writes_the_same_exe() {
 struct Gen(u64);
 
 impl Gen {
+    /// A float expression of the given names, the whole numbers i and n,
+    /// constants (NaN and the infinities come of them), and calls of the
+    /// two float helpers in the middle of it.
+    fn fexpr_names(&mut self, names: &[String], depth: u32) -> String {
+        if depth == 0 || self.below(4) == 0 {
+            return match self.below(10) {
+                0..=5 => names[self.below(names.len() as u64) as usize].clone(),
+                6 => ["i", "n"][self.below(2) as usize].to_string(),
+                _ => ["0.5", "-2.25", "1e300", "1e-300", "0.0", "-0.0", "3", "0.1", "-7.0", "1e-310"][self.below(10) as usize].to_string(),
+            };
+        }
+        let d = depth - 1;
+        match self.below(12) {
+            0..=5 => format!("({} {} {})", self.fexpr_names(names, d), ["+", "-", "*", "/"][self.below(4) as usize], self.fexpr_names(names, d)),
+            6 => format!("-({})", self.fexpr_names(names, d)),
+            7 => format!("sqrt(fabs({}))", self.fexpr_names(names, d)),
+            8 => format!("(double)(long long)({})", self.fexpr_names(names, d)),
+            9 => format!("h0({}, {}, i)", self.fexpr_names(names, d), self.fexpr_names(names, d)),
+            10 => format!("h1({}, {}, {}, {}, {}, n)", self.fexpr_names(names, d.min(1)), self.fexpr_names(names, 0), self.fexpr_names(names, 0), self.fexpr_names(names, 0), self.fexpr_names(names, 0)),
+            _ => format!("({} {} {})", self.fexpr_names(names, d), ["<", "<=", "==", "!=", ">", ">="][self.below(6) as usize], self.fexpr_names(names, d)),
+        }
+    }
+
+    /// A C program of float functions with many locals (more than the xmm
+    /// registers they may live in), parameters past the fourth (on the
+    /// stack), calls and printf between float operations, locals updated
+    /// from themselves and from each other, and every result's bits printed.
+    fn float_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n#include <math.h>\n");
+        out += "double h0(double a, double b, long long i) {\n    return a * b - i;\n}\n";
+        out += "double h1(double a, double b, double c, double d, double e, long long n) {\n    return (a - b) * c + d / (e + n);\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..3 {
+            let np = 1 + self.below(6) as usize;
+            let params: Vec<String> = (0..np).map(|p| format!("p{p}")).collect();
+            let nl = 4 + self.below(12) as usize;
+            // an i the initializers may use; the loop's own shadows it
+            let mut body = String::from("    long long i = n * 3;\n");
+            let mut names = params.clone();
+            for v in 0..nl {
+                body += &format!("    double v{v} = {};\n", self.fexpr_names(&names, 2));
+                names.push(format!("v{v}"));
+            }
+            let locals: Vec<String> = (0..nl).map(|v| format!("v{v}")).collect();
+            let mut inner = String::new();
+            for _ in 0..2 + self.below(5) {
+                let a = &locals[self.below(nl as u64) as usize];
+                inner += &match self.below(6) {
+                    0 => format!("        {a} = {a} {} {};\n", ["+", "-", "*", "/"][self.below(4) as usize], self.fexpr_names(&names, 2)),
+                    1 => format!("        {a} {}= {};\n", ["+", "-", "*", "/"][self.below(4) as usize], self.fexpr_names(&names, 2)),
+                    2 => format!("        if ({}) {a} = -{a}; else {a} = {};\n", self.fexpr_names(&names, 1), self.fexpr_names(&names, 2)),
+                    3 => format!("        printf(\"%.17g\\n\", (double)({}));\n", self.fexpr_names(&names, 1)),
+                    4 => format!("        {a} = {};\n", self.fexpr_names(&names, 3)),
+                    _ => format!("        {a} = {} * {a};\n", self.fexpr_names(&names, 1)),
+                };
+            }
+            body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", self.below(6));
+            let ret: Vec<String> = (0..3).map(|_| locals[self.below(nl as u64) as usize].clone()).collect();
+            body += &format!("    return {} + {} * {};\n", ret[0], ret[1], ret[2]);
+            let decl: Vec<String> = params.iter().map(|p| format!("double {p}")).collect();
+            out += &format!("double f{k}({}, long long n) {{\n{body}}}\n", decl.join(", "));
+            funcs.push((format!("f{k}"), np));
+        }
+        out += "int main() {\n";
+        for (f, np) in &funcs {
+            for _ in 0..2 {
+                let args: Vec<String> = (0..*np).map(|_| ["1.5", "-0.0", "1e308", "3", "0.1", "-2.5e-300", "7", "-1"][self.below(8) as usize].to_string()).collect();
+                out += &format!("    printf(\"%.17g %e\\n\", {f}({}, {}), {f}({}, 2));\n", args.join(", "), self.below(5), args.join(", "));
+            }
+        }
+        out + "    return 0;\n}\n"
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -733,6 +806,31 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
         assert_eq!(outs[0], outs[2], "p{n}.c: the release and the plain code differ");
         assert_eq!(outs[0], outs[3], "p{n}.c: division by multiplying and the plain code differ");
         assert_eq!(outs[0], outs[4], "p{n}.c: the release optimizations and the plain code differ");
+    }
+}
+
+/// Random C programs of float functions with many locals, where HotMotor
+/// puts floats in xmm registers (some, as there are only ten of them), and
+/// calls and printf go between their operations: every mode prints the
+/// same bits as the plain code, NaN's sign included.
+#[test]
+fn float_locals_in_registers_print_what_the_plain_code_prints() {
+    let r = root("float-locals");
+    let mut g = Gen(0x2545_F491_4F6C_DD1D);
+    for n in 0..40 {
+        let src = r.join(format!("f{n}.c"));
+        std::fs::write(&src, g.float_program()).unwrap();
+        let mut outs = Vec::new();
+        for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join(format!("f{n}.exe"));
+            let o = compile_with(&r, &src, &exe, &mode, None);
+            assert!(o.status.success(), "f{n}.c: {}", text(&o));
+            let run = Command::new(&exe).output().unwrap();
+            outs.push((run.status.code(), run.stdout));
+        }
+        for (i, o) in outs.iter().enumerate().skip(1) {
+            assert_eq!(&outs[0], o, "f{n}.c: mode {i} and the plain code differ");
+        }
     }
 }
 
