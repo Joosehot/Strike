@@ -112,8 +112,9 @@ file, not a new compiler. There are three today: C, Go and Python.
 
 Integers and truth values, functions and recursion, if/else, while, for,
 Python's `range`, break and continue, printing (print, Println, puts,
-and printf with `%d`, `%s`, `%c`, `%q` and `%v`), global variables, strings,
-and whole numbers and lines read from standard input.
+and printf with `%d`, `%s`, `%c`, `%q` and `%v`), global variables, arrays,
+lists and slices, strings, and whole numbers and lines read from standard
+input.
 
 - **Globals.** C's and Go's variables outside functions get their first
   values before main runs. Python's module names are read by functions, and
@@ -126,6 +127,30 @@ and whole numbers and lines read from standard input.
   line at all, or a number past 64 bits stops the program, with Python's
   reason. Input is read 4096 bytes at a time. A program that reads its input
   is never worked out while compiling.
+- **Arrays, lists and slices** ([src/uc/lib.rs](src/uc/lib.rs): what they
+  need beyond single operations is written in Strike IR, and branded,
+  inlined and optimized as the program's own functions are). The IR has
+  memory: loads and stores of 1, 2, 4 or 8 bytes, a function's own memory,
+  globals' addresses, and a stop with the language's exit code. New memory
+  comes from Strike's own allocator over VirtualAlloc; nothing is given
+  back yet. An element takes its own width: a C `char` 1 byte, an `int` 4,
+  a Go `int32` 4.
+  - **C:** arrays local (in the function's own memory) and global, 2D,
+    `{...}` initializers (the rest zero), array parameters (`int a[]`,
+    `int *a`, `int g[][10]`). An index is not checked, as C does not
+    check it.
+  - **Go:** slices (`make`, `[]T{...}`, `append` with Go 1.27's growth and
+    the allocator's size classes, so `cap` is Go's for a slice on the heap,
+    slicing, `len`, `cap`) and arrays as values (copied when assigned,
+    given or returned). `range` with an index, a value or both. An index
+    out of range panics with exit code 2. (Go 1.25 and later keep a small
+    slice that never leaves its function on the stack, where its first
+    capacity is 4; Strike does not follow Go's escape analysis.)
+  - **Python:** lists (`[...]`, `[x] * n`, comprehensions with `if`,
+    `append`, `pop`, `+`, `+=`, slices, negative indexes, `for x in`,
+    `len`, a list as a condition), printed as Python prints them. An index
+    out of range is IndexError, with exit code 1. The kind of an empty
+    list's elements is learned from what is appended, in any function.
 - **Strings** ([src/uc/strs.rs](src/uc/strs.rs), written in Strike IR as
   the rest of the library is). A Python or Go string is the address of its
   length and its bytes, never changed once made; a literal lives in the
@@ -203,12 +228,15 @@ the line and the reason, and never guessed. Refused today:
   loop for 300 random polynomials, with overflow.
 - Globals and input are checked against clang, Go and Python with the
   same input, in every mode, and Python's input errors one by one.
+- Arrays, lists and slices are checked the same way (tests/uc/arrays.*),
+  with each index error and its exit code, in every mode; the random C
+  programs have local and global arrays and arrays given to functions.
 - Strings are checked the same way (tests/uc/strings.*, and lines read by
   Python), with each error a string can stop on (IndexError, ValueError,
   TypeError, EOFError, Go's panics) and each refusal. The random C
   programs make strings in char arrays too, and compare them with strlen
   and strcmp.
-- 41 tests in all, in about 25 s.
+- 57 tests in all (with the daemon's), in about 45 s.
 
 The tests have found real bugs, all fixed:
 
@@ -280,7 +308,18 @@ these is also something clang -O2 does:
   gets the counter's last value.
 - **Loop rotation and unrolling** ([src/uc/rotate.rs](src/uc/rotate.rs)).
   The test moves to the bottom, and a short body with no jump goes round
-  twice per jump back.
+  twice (a very short one four times) per jump back. A counted loop whose
+  count four or two divides has its copies with no test between them, and
+  copy m reads the counter plus m, so the copies differ only by their
+  addresses' displacement.
+- **Array loops.** A local every store of which gives one constant is read
+  as it (so `int n = 300` makes a loop's count known). A global array's
+  address and a row's leave the loop. `a[i] += x` is one instruction on
+  the memory, an element only tested is one `cmp` with zero, and an
+  element's address is `[base + index * size + d]`. A C `int` counter's
+  cut back to 32 bits is left out where the loop has just found it below a
+  bound that fits: clang leaves it out because signed overflow cannot
+  happen, Strike shows that it cannot.
 - **Inlining callees of up to 200 operations.**
 - **A program that reads nothing is worked out while compiling**
   ([src/uc/eval.rs](src/uc/eval.rs)). Strike's IR runner tries first,
@@ -319,6 +358,20 @@ computes the same numbers.
 | invariant loops | 0.0275 s | 0.0260 s | 0.028 s | 6% slower |
 | a sum loop | 0.0047 s | 0.0053 s | 0.042 s | as fast (both closed it) |
 
+Arrays, fastest and median of interleaved runs (the machine busy with other
+builds, so a few percent either way is noise):
+
+| | Strike | clang -O2 | Strike against clang -O2 |
+|---|---|---|---|
+| 600x600 matrix product (`long long`) | 0.053 s | 0.056 s | 6% faster |
+| 300x300 matrix product | 0.0122 s | 0.0128 s | 5% faster |
+| sieve of 100 million (`char`) | 0.648 / 0.678 s | 0.617 / 0.690 s | as fast |
+
+clang vectorizes the matrix product with SSE2, but x86 has no 64-bit
+vector multiplication, so its three `pmuludq` per two elements lose to
+Strike's four copies of one `imul` and one `add` on the memory. The sieve
+is bound by memory, and its loops are now the same as clang's.
+
 On these five, Strike's code is as fast as clang -O2's, and some are
 faster. The calls benchmark is a C `long` loop. It cuts each result to 32
 bits, because C's `long` is 32 bits on Windows. clang does not cut,
@@ -335,7 +388,7 @@ To compile ordinary programs, these are still missing, in the order they
 are planned:
 
 1. Command-line arguments, which are strings now there are strings.
-2. Floats.
+2. Floats (being built).
 3. Structs and classes.
 4. Several files and modules, and C's preprocessor. Today a `#` line is
    skipped. It must become a preprocessor, or be refused.
