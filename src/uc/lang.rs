@@ -50,10 +50,34 @@ struct Raw {
     literals: Option<String>,
     #[serde(default)]
     int_widths: BTreeMap<String, u8>,
+    /// the float types and their widths (64: a double, 32: a float32)
+    #[serde(default)]
+    float_widths: BTreeMap<String, u8>,
+    /// the letters after a float literal that make it a float32 (C's 1.5f)
+    #[serde(default)]
+    float_suffixes: Vec<String>,
+    /// how print (Println) prints a float: "repr" (Python's) or "shortest"
+    /// (Go's %v)
+    #[serde(default)]
+    float_print: Option<String>,
+    /// whose words a format prints for NaN and the infinities: "ucrt"
+    /// (C's printf on Windows) or "go"
+    #[serde(default)]
+    printf_floats: Option<String>,
+    /// (type) value is a conversion (C's casts)
+    #[serde(default)]
+    casts: bool,
+    /// module.name(...) calls: "module.name" -> what it is
+    #[serde(default)]
+    qualified: BTreeMap<String, String>,
     /// what an index out of range does: the exit code and the message
     /// (none: nothing is checked, as C does nothing)
     #[serde(default)]
     index_error: Option<(u8, String)>,
+    /// what a division by zero does: the exit code and the message (none:
+    /// a float's infinity or NaN, and a whole number's as the machine does)
+    #[serde(default)]
+    zero_division: Option<(u8, String)>,
     /// a[-1] is the last element (Python)
     #[serde(default)]
     negative_index: bool,
@@ -166,6 +190,16 @@ pub enum Style {
     SpacedLine,
 }
 
+/// How print (Println) prints a float.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatPrint {
+    /// Python's repr: the shortest digits, the point from 1e-4 to 1e16
+    Repr,
+    /// Go's %v: the shortest digits as %g, an exponent below 1e-4 and
+    /// from 1e6 on
+    Shortest,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cap {
     Name,
@@ -225,6 +259,13 @@ pub struct Lang {
     pub checked: bool,
     /// bits of each integer type (none: every number is 64 bits)
     pub int_widths: HashMap<String, u8>,
+    pub float_widths: HashMap<String, u8>,
+    pub float_suffixes: Vec<String>,
+    pub float_print: Option<FloatPrint>,
+    /// a format prints NaN and the infinities as Go does (else as the UCRT)
+    pub printf_go: Option<bool>,
+    pub casts: bool,
+    pub qualified: HashMap<String, String>,
     /// the narrowest width arithmetic is done at (C: int)
     pub promote: u8,
     /// a literal takes the width of what it meets (Go) instead of its own
@@ -233,6 +274,7 @@ pub struct Lang {
     pub read_line: Option<(String, String)>,
     pub bool_print: Option<(String, String)>,
     pub index_error: Option<(u8, String)>,
+    pub zero_division: Option<(u8, String)>,
     pub negative_index: bool,
     pub list_literals: bool,
     pub comprehensions: bool,
@@ -424,6 +466,9 @@ impl Lang {
         if !r.methods.is_empty() {
             puncts.push(".".into());
         }
+        if !r.qualified.is_empty() {
+            puncts.push(".".into());
+        }
         if r.composite_literals || r.list_literals {
             puncts.push(":".into()); // a[i:j]
         }
@@ -471,6 +516,22 @@ impl Lang {
                 c => return Err(err(format!("unknown chained_comparisons {c}"))),
             },
             int_widths: r.int_widths.clone().into_iter().collect(),
+            float_widths: r.float_widths.clone().into_iter().collect(),
+            float_suffixes: r.float_suffixes.clone(),
+            float_print: match r.float_print.as_deref() {
+                None => None,
+                Some("repr") => Some(FloatPrint::Repr),
+                Some("shortest") => Some(FloatPrint::Shortest),
+                Some(x) => return Err(err(format!("unknown float_print {x}"))),
+            },
+            printf_go: match r.printf_floats.as_deref() {
+                None => None,
+                Some("ucrt") => Some(false),
+                Some("go") => Some(true),
+                Some(x) => return Err(err(format!("unknown printf_floats {x}"))),
+            },
+            casts: r.casts,
+            qualified: r.qualified.clone().into_iter().collect(),
             read_line: r.read_line.clone().map(|[a, b]| (a, b)),
             promote: r.promote.unwrap_or(0),
             untyped_literals: match r.literals.as_deref() {
@@ -494,6 +555,7 @@ impl Lang {
             type_words: r.type_words.into_iter().collect(),
             bool_print,
             index_error: r.index_error,
+            zero_division: r.zero_division,
             negative_index: r.negative_index,
             list_literals: r.list_literals,
             comprehensions: r.comprehensions,

@@ -4,10 +4,24 @@
 
 use super::lang::{End, Lang};
 
+/// A float literal: the nearest double, the nearest float32 (as a double:
+/// a literal made a float32 is rounded once, from its own digits), whether
+/// it was written as a float32 (C's 1.5f), and whether the double is the
+/// literal exactly (Go's constants are exact numbers, so this decides what
+/// may be worked out with them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatLit {
+    pub bits: u64,
+    pub bits32: u64,
+    pub f32: bool,
+    pub exact: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum T {
     Ident(String),
     Num(i64),
+    Float(FloatLit),
     Str(Vec<u8>),
     Punct(String),
     /// the end of a statement made by a newline
@@ -27,10 +41,39 @@ fn ends_value(t: &T, l: &Lang) -> bool {
     match t {
         // a type's name ends a line as any name does (Go's `var x int`)
         T::Ident(s) => !l.keywords.contains(s) || l.end_after.contains(s) || l.type_words.contains(s),
-        T::Num(_) | T::Str(_) => true,
+        T::Num(_) | T::Float(_) | T::Str(_) => true,
         T::Punct(p) => l.end_after.contains(p),
         _ => false,
     }
+}
+
+/// Is the decimal literal (digits, a point, an exponent) the double x
+/// exactly? Both are made digits without leading or trailing zeros and an
+/// exponent, and compared.
+fn exactly(text: &str, x: f64) -> bool {
+    if !x.is_finite() {
+        return false;
+    }
+    let (mant, exp) = match text.find(['e', 'E']) {
+        Some(k) => (&text[..k], text[k + 1..].parse::<i64>().unwrap_or(i64::MAX / 2)),
+        None => (text, 0),
+    };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    let norm = |digits: String, mut e: i64| -> (String, i64) {
+        let d = digits.trim_start_matches('0');
+        let t = d.trim_end_matches('0');
+        e += (d.len() - t.len()) as i64;
+        (t.to_string(), e)
+    };
+    let (a, ea) = norm(format!("{int}{frac}"), exp - frac.len() as i64);
+    if a.is_empty() {
+        return x == 0.0;
+    }
+    // Rust writes a double's digits exactly when it is asked for enough
+    let s = format!("{:.1100e}", x);
+    let (m, e) = s.split_once('e').unwrap();
+    let (b, eb) = norm(m.replace('.', ""), e.parse::<i64>().unwrap() - 1100);
+    a == b && ea == eb
 }
 
 fn escape(c: u8) -> Option<u8> {
@@ -178,6 +221,52 @@ pub fn lex(src: &str, l: &Lang) -> Result<Vec<Tok>, (u32, String)> {
             out.push(Tok { t, line: start });
             continue;
         }
+        // a float: digits with a point or an exponent (1.5, .5, 2., 1e9)
+        let float_start = c.is_ascii_digit() || (c == b'.' && s.get(i + 1).is_some_and(|d| d.is_ascii_digit()));
+        if float_start && !rest.starts_with("0x") && !rest.starts_with("0X") {
+            let mut j = i;
+            let digits = |j: &mut usize| {
+                while *j < s.len() && (s[*j].is_ascii_digit() || s[*j] == b'_') {
+                    *j += 1;
+                }
+            };
+            digits(&mut j);
+            let mut is_float = false;
+            if j < s.len() && s[j] == b'.' && !(j + 1 < s.len() && s[j + 1] == b'.') {
+                is_float = true;
+                j += 1;
+                digits(&mut j);
+            }
+            if j < s.len() && (s[j] == b'e' || s[j] == b'E') {
+                let mut k = j + 1;
+                if k < s.len() && (s[k] == b'+' || s[k] == b'-') {
+                    k += 1;
+                }
+                if k < s.len() && s[k].is_ascii_digit() {
+                    is_float = true;
+                    j = k;
+                    digits(&mut j);
+                }
+            }
+            if is_float {
+                let text: String = src[i..j].chars().filter(|c| *c != '_').collect();
+                let mut f32 = false;
+                let mut end = j;
+                if let Some(sfx) = l.float_suffixes.iter().find(|x| src[j..].starts_with(x.as_str())) {
+                    f32 = true;
+                    end += sfx.len();
+                }
+                if end < s.len() && (s[end].is_ascii_alphanumeric() || s[end] == b'_') {
+                    return Err((line, format!("{} is not a float literal Strike knows", &src[i..end + 1])));
+                }
+                let x: f64 = text.parse().map_err(|_| (line, format!("{text} is not a float literal Strike knows")))?;
+                let y: f32 = text.parse().map_err(|_| (line, format!("{text} is not a float literal Strike knows")))?;
+                let lit = FloatLit { bits: x.to_bits(), bits32: (y as f64).to_bits(), f32, exact: exactly(&text, x) };
+                out.push(Tok { t: T::Float(lit), line });
+                i = end;
+                continue;
+            }
+        }
         if c.is_ascii_digit() {
             let mut j = i;
             let (radix, from) = if rest.starts_with("0x") || rest.starts_with("0X") { (16, i + 2) } else { (10, i) };
@@ -236,4 +325,16 @@ pub fn lex(src: &str, l: &Lang) -> Result<Vec<Tok>, (u32, String)> {
     }
     out.push(Tok { t: T::Eof, line });
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_literal_is_exact_only_where_its_double_is_it() {
+        for (text, exact) in [("0.5", true), ("2.25e1", true), ("1e22", true), ("1e23", false), ("0.1", false), ("123.000", true), ("0.0", true), ("1e400", false), (".375", true)] {
+            assert_eq!(exactly(text, text.parse().unwrap()), exact, "{text}");
+        }
+    }
 }

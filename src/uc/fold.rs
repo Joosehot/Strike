@@ -7,6 +7,11 @@ use super::ir::{BinOp, Func, Op, UnOp};
 
 fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
     use BinOp::*;
+    // floats bit for bit as the machine works them out (IEEE, and the NaN
+    // it gives)
+    if let Some(r) = op.float_eval(a, b) {
+        return Some(r);
+    }
     // a checked operation is folded only where it fits; else the program
     // must stop there when it runs
     if let Some(r) = op.checked_eval(a, b) {
@@ -64,6 +69,7 @@ pub fn run(f: &mut Func) -> usize {
                     UnOp::Not => Some((*a == 0) as i64),
                     UnOp::Bnot => Some(!*a),
                     UnOp::NegOv => a.checked_neg(),
+                    u => u.float_eval(*a),
                 }
                 .map(|v| (2, vec![Op::Push(v)])),
                 [.., Op::Push(a), Op::Jz(l)] => Some((2, if *a == 0 { vec![Op::Jmp(*l)] } else { vec![] })),

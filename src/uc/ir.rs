@@ -46,6 +46,24 @@ pub enum BinOp {
     /// `0 <= i` in one test (an index checked against a length)
     Ult,
     Ule,
+    /// Python's `/`: true division, which the lowering makes a float's (it
+    /// never reaches the IR)
+    DivTrue,
+    /// IEEE double arithmetic on the bit patterns (a float is carried as
+    /// its 64 bits), rounded to nearest as the machine rounds
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    /// the remainder of a division cut toward zero, exact (C's fmod)
+    FRem,
+    /// comparisons of floats: false for a NaN, but FNe true
+    FEq,
+    FNe,
+    FLt,
+    FLe,
+    FGt,
+    FGe,
 }
 
 impl BinOp {
@@ -76,6 +94,7 @@ impl BinOp {
             "or_value" => OrValue,
             "ult" => Ult,
             "ule" => Ule,
+            "div_true" => DivTrue,
             _ => return None,
         })
     }
@@ -83,6 +102,70 @@ impl BinOp {
     pub fn is_comparison(self) -> bool {
         use BinOp::*;
         matches!(self, Eq | Ne | Lt | Le | Gt | Ge | Ult | Ule)
+    }
+
+    /// An operation on floats (its numbers are bit patterns of doubles).
+    pub fn is_float(self) -> bool {
+        use BinOp::*;
+        matches!(self, FAdd | FSub | FMul | FDiv | FRem | FEq | FNe | FLt | FLe | FGt | FGe)
+    }
+
+    pub fn is_float_comparison(self) -> bool {
+        use BinOp::*;
+        matches!(self, FEq | FNe | FLt | FLe | FGt | FGe)
+    }
+
+    /// The float operation for an integer one (C's `+` on doubles).
+    pub fn float(self) -> Option<BinOp> {
+        use BinOp::*;
+        Some(match self {
+            Add => FAdd,
+            Sub => FSub,
+            Mul => FMul,
+            DivTrunc | DivTrue => FDiv,
+            Eq => FEq,
+            Ne => FNe,
+            Lt => FLt,
+            Le => FLe,
+            Gt => FGt,
+            Ge => FGe,
+            _ => return None,
+        })
+    }
+
+    /// The float operation worked out as the machine works it out (SSE2,
+    /// and the x87 for FRem), bit for bit: also which NaN comes out. None
+    /// for an operation that is not a float's.
+    pub fn float_eval(self, a: i64, b: i64) -> Option<i64> {
+        use BinOp::*;
+        let (x, y) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+        let r = match self {
+            FAdd => x + y,
+            FSub => x - y,
+            FMul => x * y,
+            FDiv => x / y,
+            FRem => x % y,
+            FEq => return Some((x == y) as i64),
+            FNe => return Some((x != y) as i64),
+            FLt => return Some((x < y) as i64),
+            FLe => return Some((x <= y) as i64),
+            FGt => return Some((x > y) as i64),
+            FGe => return Some((x >= y) as i64),
+            _ => return None,
+        };
+        if !r.is_nan() {
+            return Some(r.to_bits() as i64);
+        }
+        // a NaN that comes in goes out quieted: the first one for SSE2,
+        // the one with the larger fraction for the x87; an invalid
+        // operation makes the machine's own NaN
+        let pick = match (x.is_nan(), y.is_nan()) {
+            (true, true) if self == FRem && (b as u64 & FRACTION) > (a as u64 & FRACTION) => b,
+            (true, _) => a,
+            (false, true) => b,
+            (false, false) => return Some(DEFAULT_NAN),
+        };
+        Some(pick | QUIET)
     }
 
     /// The operation that stops where the number would not fit, for a
@@ -124,6 +207,22 @@ pub enum UnOp {
     Bnot,
     /// Neg that stops on the lowest number (its negation does not fit)
     NegOv,
+    /// a float's sign turned, and taken away (exact: only the sign bit)
+    FNeg,
+    FAbs,
+    /// the square root, rounded as every operation is (exact for IEEE)
+    FSqrt,
+    /// a whole number made the nearest double, or the nearest float32
+    /// (held as a double: one rounding, not two)
+    FromInt,
+    FromInt32,
+    /// a double rounded to the nearest float32 (and held as a double again)
+    ToF32,
+    /// a float cut toward zero to a whole number, as the machine's cvttsd2si
+    /// does: one that does not fit (or NaN) is the lowest number of 64 bits,
+    /// or of 32 bits for ToInt32
+    ToInt,
+    ToInt32,
 }
 
 impl UnOp {
@@ -136,7 +235,42 @@ impl UnOp {
             _ => return None,
         })
     }
+
+    pub fn is_float(self) -> bool {
+        use UnOp::*;
+        matches!(self, FNeg | FAbs | FSqrt | FromInt | FromInt32 | ToF32 | ToInt | ToInt32)
+    }
+
+    /// The float operation as the machine works it out, bit for bit; None
+    /// for one that is not a float's.
+    pub fn float_eval(self, a: i64) -> Option<i64> {
+        use UnOp::*;
+        let x = f64::from_bits(a as u64);
+        Some(match self {
+            FNeg => a ^ i64::MIN,
+            FAbs => a & i64::MAX,
+            FSqrt if x.is_nan() => a | QUIET,
+            FSqrt if x < 0.0 => DEFAULT_NAN,
+            FSqrt => x.sqrt().to_bits() as i64,
+            FromInt => (a as f64).to_bits() as i64,
+            FromInt32 => ((a as f32) as f64).to_bits() as i64,
+            // a NaN keeps its sign and the top of its fraction, quieted
+            ToF32 if x.is_nan() => (a & (i64::MIN | 0x7FF0_0000_0000_0000 | (0x000F_FFFF_E000_0000))) | QUIET,
+            ToF32 => ((x as f32) as f64).to_bits() as i64,
+            ToInt if x.is_nan() || !(-9223372036854775808.0..9223372036854775808.0).contains(&x) => i64::MIN,
+            ToInt => x as i64,
+            ToInt32 if x.is_nan() || !(-2147483648.0..2147483648.0).contains(&x) => i32::MIN as i64,
+            ToInt32 => x as i64,
+            _ => return None,
+        })
+    }
 }
+
+/// The fraction bits of a double, its quiet bit, and the NaN the machine
+/// makes for an invalid operation (negative, only the quiet bit set).
+const FRACTION: u64 = (1 << 52) - 1;
+const QUIET: i64 = 1 << 51;
+pub const DEFAULT_NAN: i64 = 0xFFF8_0000_0000_0000_u64 as i64;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -190,6 +324,12 @@ pub enum Op {
     /// the message on standard error, and the program stops with the exit
     /// code (an index out of range: Python's IndexError, Go's panic)
     Fail(u8, Vec<u8>),
+    /// pops a length, then an address, and prints that many bytes from
+    /// there (a float's digits, made by the library)
+    PrintMem,
+    /// pops a length, then an address: those bytes on standard error, and
+    /// the program stops with the exit code (a message the library made)
+    FailMem(u8),
 }
 
 /// The runtime's allocator, called as a function: it pops a size in bytes
@@ -248,7 +388,7 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-3";
+pub const CODEGEN: &str = "strike-x64-4";
 
 /// How the IR's stack changes at an operation (None: nothing comes after
 /// it on the same way, a return or a stop).
@@ -257,10 +397,10 @@ pub fn stack_effect(op: &Op) -> Option<i32> {
         Op::Push(_) | Op::Load(_) | Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => 1,
         Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::StoreG(_) => -1,
         Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) | Op::LoadM(_) => 0,
-        Op::StoreM(_) => -2,
+        Op::StoreM(_) | Op::PrintMem => -2,
         Op::ReadToken => 2,
         Op::Call(_, n) => 1 - *n as i32,
-        Op::Ret | Op::Fail(..) => return None,
+        Op::Ret | Op::Fail(..) | Op::FailMem(_) => return None,
     })
 }
 
@@ -315,10 +455,43 @@ impl Func {
                     h.update(m);
                     (25, *code as i64)
                 }
+                Op::PrintMem => (26, 0),
+                Op::FailMem(code) => (27, *code as i64),
             };
             h.update(&[tag]);
             h.update(&a.to_le_bytes());
         }
         h.finalize().to_hex().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(x: f64) -> i64 {
+        x.to_bits() as i64
+    }
+
+    /// What SSE2 gives, bit for bit: the first NaN that comes in, quieted,
+    /// or the machine's own for an invalid operation; cvttsd2si's lowest
+    /// number where a float does not fit.
+    #[test]
+    fn floats_are_worked_out_as_the_machine_works_them_out() {
+        let snan = 0x7FF0_0000_0000_0001_i64;
+        assert_eq!(BinOp::FAdd.float_eval(snan, f(1.0)), Some(snan | QUIET));
+        assert_eq!(BinOp::FMul.float_eval(f(0.0), f(f64::INFINITY)), Some(DEFAULT_NAN));
+        assert_eq!(BinOp::FSub.float_eval(f(f64::INFINITY), f(f64::INFINITY)), Some(DEFAULT_NAN));
+        assert_eq!(UnOp::FSqrt.float_eval(f(-1.0)), Some(DEFAULT_NAN));
+        assert_eq!(UnOp::FSqrt.float_eval(f(-0.0)), Some(f(-0.0)));
+        assert_eq!(UnOp::ToInt.float_eval(f(1e19)), Some(i64::MIN));
+        assert_eq!(UnOp::ToInt.float_eval(f(-2.9)), Some(-2));
+        assert_eq!(UnOp::ToInt32.float_eval(f(3e9)), Some(i32::MIN as i64));
+        assert_eq!(UnOp::ToF32.float_eval(f(0.1)), Some(f(0.1f32 as f64)));
+        assert_eq!(UnOp::FromInt32.float_eval(16777217), Some(f(16777216.0)));
+        assert_eq!(UnOp::FNeg.float_eval(f(0.0)), Some(f(-0.0)));
+        assert_eq!(BinOp::FLt.float_eval(DEFAULT_NAN, f(1.0)), Some(0));
+        assert_eq!(BinOp::FNe.float_eval(DEFAULT_NAN, DEFAULT_NAN), Some(1));
+        assert_eq!(BinOp::FRem.float_eval(f(-7.5), f(2.0)), Some(f(-1.5)));
     }
 }

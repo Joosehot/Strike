@@ -106,6 +106,58 @@ fn arrays_lists_and_slices_are_what_clang_go_and_python_make_of_them() {
     }
 }
 
+#[test]
+fn floats_are_what_clang_go_and_python_make_of_them() {
+    for file in ["floats.c", "floats.go", "floats.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+/// 400 doubles (edge cases, random bit patterns, random decimals) printed
+/// in every format: C's printf ten ways, Go's Println and Printf (and the
+/// float32 of each), Python's repr. tools/float_values.py wrote the
+/// programs, and clang, Go and Python the .out files.
+#[test]
+fn floats_print_as_clang_go_and_python_print_them() {
+    for file in ["floatprint.c", "floatprint.go", "floatprint.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
+/// Python stops where it raises: a division by zero (ZeroDivisionError),
+/// int() of NaN (ValueError) or of an infinity (OverflowError), math.sqrt
+/// of a negative number; and Strike stops where Python would go on with a
+/// number it does not have (int() past 64 bits, a division of whole numbers
+/// past 2^53). Nothing is printed after it.
+#[test]
+fn python_stops_on_floats_where_python_raises() {
+    let r = root("py-floats");
+    for (expr, says) in [
+        ("1 / 0.0", "ZeroDivisionError: division by zero"),
+        ("1.0 // 0", "ZeroDivisionError"),
+        ("5.5 % -0.0", "ZeroDivisionError"),
+        ("7 // 0", "ZeroDivisionError"),
+        ("5 % 0", "ZeroDivisionError"),
+        ("1 / 0", "ZeroDivisionError"),
+        ("int(z * 1e400 - z * 1e400)", "ValueError: cannot convert float NaN to integer"),
+        ("int(-1e400 * z)", "OverflowError: cannot convert float infinity to integer"),
+        ("int(1e30 * z)", "grew past 64 bits"),
+        ("math.sqrt(-2.5 * z)", "ValueError: expected a nonnegative input, got -2.5"),
+        ("1152921504606846976 / 3", "past 2^53"),
+    ] {
+        let p = r.join("stop.py");
+        std::fs::write(&p, format!("import math\nz = 1.0\nprint(1)\nprint({expr})\nprint(2)\n")).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join("a.exe");
+            assert!(compile_with(&r, &p, &exe, &mode, None).status.success(), "{expr}");
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(got.status.code(), Some(1), "{expr} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout), "1\n", "{expr} {mode:?}");
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{expr} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+        }
+    }
+}
+
 /// An index out of range stops the program as the language stops it:
 /// Python's IndexError with exit code 1, Go's panic with exit code 2, and
 /// nothing printed after it.
@@ -300,6 +352,32 @@ impl Gen {
             _ => self.expr(names, funcs, d),
         }
     }
+    /// A float expression of the doubles x, y, s and the whole numbers n,
+    /// i: every float operator, conversions both ways, constants that
+    /// overflow, vanish and are zero of either sign (so NaN and the
+    /// infinities come out too, and their bits are printed).
+    fn fexpr(&mut self, depth: u32) -> String {
+        self.fexpr_of(depth, true)
+    }
+    /// The same, without s and i where `inner` is false (an initializer).
+    fn fexpr_of(&mut self, depth: u32, inner: bool) -> String {
+        if depth == 0 || self.below(4) == 0 {
+            return match self.below(8) {
+                0..=2 => ["x", "y", "s"][self.below(if inner { 3 } else { 2 }) as usize].to_string(),
+                3 => ["n", "i"][self.below(if inner { 2 } else { 1 }) as usize].to_string(),
+                _ => ["0.5", "-2.25", "1e300", "1e-300", "0.0", "-0.0", "3", "0.1", "-7.0", "1e-310"][self.below(10) as usize].to_string(),
+            };
+        }
+        let d = depth - 1;
+        match self.below(10) {
+            0..=4 => format!("({} {} {})", self.fexpr_of(d, inner), ["+", "-", "*", "/"][self.below(4) as usize], self.fexpr_of(d, inner)),
+            5 => format!("-({})", self.fexpr_of(d, inner)),
+            6 => format!("sqrt(fabs({}))", self.fexpr_of(d, inner)),
+            7 => format!("(double)(long long)({})", self.fexpr_of(d, inner)),
+            8 => format!("(float)({})", self.fexpr_of(d, inner)),
+            _ => format!("({} {} {})", self.fexpr_of(d, inner), ["<", "<=", "==", "!=", ">", ">="][self.below(6) as usize], self.fexpr_of(d, inner)),
+        }
+    }
     fn program(&mut self) -> String {
         let mut out = String::from("#include <stdio.h>\n");
         // two globals every function may read and change
@@ -415,7 +493,26 @@ impl Gen {
             );
             arrays.push(format!("a{k}"));
         }
+        // floats: a loop of float expressions into a double, and the bits
+        // of every result printed (NaN's sign too)
+        let mut floats = Vec::new();
+        for k in 0..3 {
+            out += &format!(
+                "double d{k}(double x, double y, long long n) {{\n    double s = {};\n    for (long long i = 0; i < {}; i++) {{\n        if ({}) s = {}; else s += {};\n    }}\n    return s * {};\n}}\n",
+                self.fexpr_of(3, false),
+                self.below(12),
+                self.fexpr(2),
+                self.fexpr(3),
+                self.fexpr(2),
+                self.fexpr_of(2, false)
+            );
+            floats.push(format!("d{k}"));
+        }
         out += "int main() {\n";
+        for f in &floats {
+            let c = |g: &mut Gen| ["1.5", "-0.0", "1e308", "3", "0.1", "-2.5e-300"][g.below(6) as usize];
+            out += &format!("    printf(\"%.17g %e %g\\n\", {f}({}, {}, {}), {f}(2, -1, 5), {f}({}, 0.5, -3));\n", c(self), c(self), self.constant(), c(self));
+        }
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
         }
@@ -567,7 +664,24 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
     let r = root("refused");
     for (name, src, says) in [
         ("chain.py", "x = 1\nprint(0 < x < 2)\n", "chained comparison"),
-        ("float.py", "print(7 / 2)\n", "/"),
+        // floats: what Strike cannot do the language's way
+        ("exact.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(0.1 + 0.2)\n}\n", "constant expressions exactly"),
+        ("thirds.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(1.0 / 3.0 * 3.0)\n}\n", "constant expressions exactly"),
+        ("mix.go", "package main\nimport \"fmt\"\nfunc main() {\n\ti := 1\n\tx := 1.5\n\tfmt.Println(x + i)\n}\n", "Go does not mix whole numbers and floats"),
+        ("widths.go", "package main\nimport \"fmt\"\nfunc main() {\n\tvar f float32 = 1\n\tx := 1.5\n\tfmt.Println(x * f)\n}\n", "a float64 and a float32"),
+        ("truncated.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(int(-2.9))\n}\n", "not a whole number"),
+        ("over32.go", "package main\nimport \"fmt\"\nfunc main() {\n\tvar f float32 = 1e40\n\tfmt.Println(f)\n}\n", "overflows float32"),
+        ("kind.py", "x = 0\nx = x + 0.5\nprint(x)\n", "x holds a number in one place and a float in another"),
+        ("param.py", "def f(a):\n    return a\nprint(f(1), f(1.5))\n", "a float in one place and a whole number in another"),
+        ("floats.py", "print([1, 2.5])\n", "one kind per list"),
+        ("floor.py", "import math\nprint(math.floor(2.5))\n", "math.floor is not in Strike yet"),
+        ("mod.c", "#include <stdio.h>\nint main() { double d = 5.5; printf(\"%f\", d % 2); return 0; }\n", "not one C has for floats"),
+        ("long.c", "int main() { long double d = 1; return 0; }\n", "long double is not in Strike yet"),
+        ("scan.c", "#include <stdio.h>\nint main() { double d; scanf(\"%d\", &d); return 0; }\n", "only a whole number is read"),
+        ("percentd.c", "#include <stdio.h>\nint main() { printf(\"%d\", 1.5); return 0; }\n", "%d is given a float"),
+        ("percentf.c", "#include <stdio.h>\nint main() { printf(\"%f\", 1); return 0; }\n", "%f is given a number, not a float"),
+        ("precision.c", "#include <stdio.h>\nint main() { printf(\"%.200f\", 1.5); return 0; }\n", "a precision above 100"),
+        ("width.c", "#include <stdio.h>\nint main() { printf(\"%8.3f\", 1.5); return 0; }\n", "the format %8 is not in Strike yet"),
         ("undeclared.c", "int main() { return y; }\n", "y is not declared"),
         ("none.py", "def f(x):\n    if x:\n        return 1\nprint(f(0))\n", "can end without returning"),
         ("nolang.txt", "SELECT * FROM t;\n", "no description reads the whole file"),

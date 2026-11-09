@@ -3,13 +3,19 @@
 //! (Python's True, Go's true) the lowering follows which values are truth
 //! values, through variables, parameters and results, until nothing changes.
 //! A list, a slice or an array is the address of its memory (lib.rs says
-//! how each is laid out), and its kind is followed the same way.
+//! how each is laid out), and its kind is followed the same way. A float is
+//! its 64 bits (a float32 is held as the double of the same value), and
+//! each language's conversions between numbers and floats are made where
+//! it makes them: C's usual arithmetic conversions, Go's constants taking
+//! the type they meet (and nothing else), Python's whole numbers made
+//! floats in arithmetic but compared exactly.
 //! Whatever Strike cannot yet do the way the language does is an error,
 //! never a guess.
 
 use super::ir::{BinOp, Func, Op, UnOp};
-use super::lang::{Lang, Style};
-use super::lib::{Elem, Printer, MAX_LEN};
+use super::lang::{FloatPrint, Lang, Style};
+use super::lex::FloatLit;
+use super::lib::{Elem, FloatElem, Printer, MAX_LEN};
 use super::parse::{Expr, FuncDef, Program, Stmt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -17,6 +23,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub enum Ty {
     Int,
     Bool,
+    /// a double, or a float32 where its width is 32
+    Float,
     /// n elements in a row, each of the given width when it is a number (a
     /// C or Go array; a nested array is its rows in a row): the value is
     /// the address of the first
@@ -52,6 +60,10 @@ impl Ty {
         }
     }
     fn scalar(&self) -> bool {
+        matches!(self, Ty::Int | Ty::Bool | Ty::Float | Ty::Unknown)
+    }
+    /// A whole number (or a truth value, which is one)?
+    fn whole(&self) -> bool {
         matches!(self, Ty::Int | Ty::Bool | Ty::Unknown)
     }
     /// Is the zero of this kind not all zero bits? (A Go slice's zero is
@@ -67,6 +79,7 @@ impl Ty {
         match self {
             Ty::Int => "a number".into(),
             Ty::Bool => "a truth value".into(),
+            Ty::Float => "a float".into(),
             Ty::Arr(..) => "an array".into(),
             Ty::Ptr(..) => "a pointer".into(),
             Ty::Slice(..) => "a slice".into(),
@@ -80,6 +93,10 @@ impl Ty {
 /// width (a C char 1, an int 4, a Go int32 4, a bool 1), anything else as
 /// it is kept.
 fn size(e: &Ty, w: u8) -> u64 {
+    // a float32 is held as a double
+    if *e == Ty::Float {
+        return 8;
+    }
     if e.scalar() {
         (w as u64 / 8).max(1)
     } else {
@@ -134,6 +151,10 @@ pub struct Lowered {
 type E = (u32, String);
 
 const TOP: &str = "top.";
+/// the words of the float buffer: the longest a float prints (a %f of
+/// 1e308 with a precision of 100) fits
+const FLOAT_BUF_WORDS: u32 = 64;
+const INEXACT_DIVISION: &str = "strike: a division of whole numbers past 2^53 is not worked out exactly by Strike yet, so the program stops\n";
 /// where a C or Go program's globals get their first values, then main runs
 const INIT: &str = "init.";
 /// the bit that marks a slot number as a global's
@@ -198,7 +219,7 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
                 expr(b, out);
                 a.iter().for_each(|x| expr(x, out));
             }
-            Expr::Un(_, x) => expr(x, out),
+            Expr::Un(_, x) | Expr::Cast(_, x, _) => expr(x, out),
             Expr::Bin(_, a, b) | Expr::Index(a, b, _) => {
                 expr(a, out);
                 expr(b, out);
@@ -208,7 +229,7 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
                 expr(iter, out);
                 cond.iter().for_each(|x| expr(x, out));
             }
-            Expr::Num(..) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) => {}
+            Expr::Num(..) | Expr::Float(_) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) => {}
         }
     }
     fn walk(body: &[Stmt], out: &mut HashSet<String>) {
@@ -308,6 +329,93 @@ fn constant(e: &Expr) -> Option<i64> {
     }
 }
 
+/// A Go constant: a whole number, or a float (exact or not).
+enum K {
+    Int(i64),
+    Float(FloatLit),
+}
+
+/// A Go constant expression worked out as Go works it out: exactly. An
+/// operation is taken only on constants whose doubles are the numbers
+/// exactly; its one rounding is then Go's (1.0 / 3.0), and its result may be
+/// worked on again only where it is exact too. So 0.1 + 0.2, which is 0.3
+/// in Go and not the sum of two doubles, is refused. None where the
+/// expression is not a constant (or is only whole numbers, which the
+/// lowering takes as before).
+fn go_const(e: &Expr) -> Option<Result<K, String>> {
+    Some(Ok(match e {
+        Expr::Num(v, false) => K::Int(*v),
+        Expr::Float(f) => K::Float(*f),
+        Expr::Un(UnOp::Plus, x) => return go_const(x),
+        Expr::Un(UnOp::Neg, x) => match go_const(x)? {
+            Ok(K::Int(v)) => K::Int(v.checked_neg()?),
+            Ok(K::Float(f)) if f64::from_bits(f.bits) == 0.0 => K::Float(f),
+            Ok(K::Float(f)) => K::Float(FloatLit { bits: f.bits ^ (1 << 63), bits32: f.bits32 ^ (1 << 63), ..f }),
+            Err(m) => return Some(Err(m)),
+        },
+        Expr::Bin(op, a, b) => {
+            let (a, b) = match (go_const(a)?, go_const(b)?) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(m), _) | (_, Err(m)) => return Some(Err(m)),
+            };
+            let exact = |k: &K| match k {
+                K::Int(v) => (v.unsigned_abs() <= 1 << 53, *v as f64),
+                K::Float(f) => (f.exact, f64::from_bits(f.bits)),
+            };
+            match (&a, &b) {
+                (K::Int(x), K::Int(y)) => return constant(&Expr::Bin(*op, Box::new(Expr::Num(*x, false)), Box::new(Expr::Num(*y, false)))).map(|v| Ok(K::Int(v))),
+                _ => {
+                    let ((ea, x), (eb, y)) = (exact(&a), exact(&b));
+                    let refused = Err("Go works out constant expressions exactly (0.1 + 0.2 is 0.3 there); this one is not exact as doubles, and Strike does not work it out exactly yet".to_string());
+                    if !ea || !eb {
+                        return Some(refused);
+                    }
+                    // one operation on two exact numbers rounds once, as Go
+                    // rounds the exact result: the double is Go's. Whether
+                    // it is exact itself decides whether it may be worked
+                    // on again.
+                    let tiny = |r: f64| r != 0.0 && r.abs() < f64::MIN_POSITIVE;
+                    let (r, exact) = match op {
+                        BinOp::Add | BinOp::Sub => {
+                            let y = if *op == BinOp::Sub { -y } else { y };
+                            // the sum is exact when nothing is lost (two-sum)
+                            let s = x + y;
+                            let bb = s - x;
+                            (s, (x - (s - bb)) + (y - bb) == 0.0)
+                        }
+                        BinOp::Mul => {
+                            let p = x * y;
+                            (p, !tiny(p) && (p != 0.0 || x == 0.0 || y == 0.0) && x.mul_add(y, -p) == 0.0)
+                        }
+                        BinOp::DivTrunc if y == 0.0 => return Some(Err("division by zero".to_string())),
+                        BinOp::DivTrunc => {
+                            let q = x / y;
+                            (q, !tiny(q) && (q != 0.0 || x == 0.0) && q.mul_add(y, -x) == 0.0)
+                        }
+                        _ => return Some(Err("this operator on Go's float constants is not in Strike yet".to_string())),
+                    };
+                    if !r.is_finite() {
+                        return Some(Err("the constant overflows a float64".to_string()));
+                    }
+                    let r = if r == 0.0 { 0.0 } else { r };
+                    // its float32: rounded from the double, which is the
+                    // exact number's rounding unless the double lies just
+                    // between two float32s (then the exact number decides)
+                    let f = r as f32;
+                    if !exact && (f as f64) != r {
+                        let other = if (f as f64) < r { f.next_up() } else { f.next_down() };
+                        if ((f as f64) + (other as f64)) / 2.0 == r {
+                            return Some(refused);
+                        }
+                    }
+                    K::Float(FloatLit { bits: r.to_bits(), bits32: (f as f64).to_bits(), f32: false, exact })
+                }
+            }
+        }
+        _ => return None,
+    }))
+}
+
 /// The bits of a number type the language writes (64 where it writes
 /// none, or where its numbers have no width of their own).
 fn width_of(l: &Lang, words: &[String]) -> Result<u8, String> {
@@ -349,9 +457,16 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
     }
     let base_end = words.iter().position(|w| w == "[" || w == "*").unwrap_or(words.len());
     let base = &words[..base_end];
-    let w = width_of(l, base)?;
-    let is_bool = base.iter().any(|b| b == "bool" || b == "_Bool");
-    let scalar = if is_bool && bools { Ty::Bool } else { Ty::Int };
+    let plain: Vec<&String> = base.iter().filter(|s| !matches!(s.as_str(), "static" | "const" | "register" | "volatile")).collect();
+    let (scalar, w) = match base.iter().find_map(|b| l.float_widths.get(b).copied()) {
+        Some(_) if plain.len() > 1 => return Err(format!("the type {} is not in Strike yet", plain.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))),
+        Some(fw) => (Ty::Float, fw),
+        None => {
+            let w = width_of(l, base)?;
+            let is_bool = base.iter().any(|b| b == "bool" || b == "_Bool");
+            (if is_bool && bools { Ty::Bool } else { Ty::Int }, w)
+        }
+    };
     let mut rest = &words[base_end..];
     let mut stars = 0;
     while rest.first().map(String::as_str) == Some("*") {
@@ -396,7 +511,7 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
 /// capacity its slices grow to).
 fn go_size(t: &Ty, w: u8) -> (i64, bool) {
     match t {
-        Ty::Int | Ty::Unknown => ((w / 8).max(1) as i64, true),
+        Ty::Int | Ty::Unknown | Ty::Float => ((w / 8).max(1) as i64, true),
         Ty::Bool => (1, true),
         Ty::Arr(e, ew, n) => {
             let (s, ns) = go_size(e, *ew);
@@ -428,6 +543,8 @@ struct Shared<'a> {
     seen: HashMap<(String, String), Ty>,
     /// the global words of Go's empty slice header
     nil_slice: Option<u32>,
+    /// the global words a float's digits are made in before they print
+    float_buf: Option<u32>,
 }
 
 struct Fx<'s, 'a> {
@@ -445,8 +562,12 @@ struct Fx<'s, 'a> {
     /// the bits of each slot's type (64 where not known narrower)
     widths: HashMap<u32, u8>,
     /// the width of the value expr just left: the bits it is known to fit,
-    /// sign-extended (0: a literal that takes the width of what it meets)
+    /// sign-extended (0: a literal that takes the width of what it meets);
+    /// for a float, 64 or 32
     last_w: u8,
+    /// the value expr just left when it is a Go float constant (its
+    /// float32 is rounded from the constant itself)
+    last_k: Option<FloatLit>,
     /// the width of what this function returns, and its kind where the
     /// language declares one that is not a number
     ret_w: u8,
@@ -664,6 +785,9 @@ impl Fx<'_, '_> {
         }
     }
     fn same(&mut self, name: &str, was: &Ty, now: &Ty) -> Result<(), E> {
+        if was.scalar() && now.scalar() && (*was == Ty::Float) != (*now == Ty::Float) && *was != Ty::Unknown && *now != Ty::Unknown {
+            return self.err(format!("{name} holds {} in one place and {} in another; Strike keeps one kind per variable", was.describe(), now.describe()));
+        }
         if was.scalar() && now.scalar() {
             if self.sh.bools && was != now && *was != Ty::Unknown && *now != Ty::Unknown {
                 return self.err(format!("{name} holds a number in one place and a truth value in another; Strike keeps one kind per variable"));
@@ -695,6 +819,399 @@ impl Fx<'_, '_> {
     }
     fn go_fail(&self) -> u8 {
         self.sh.l.index_error.as_ref().map_or(2, |e| e.0)
+    }
+    /// The global words a float's digits are made in before they print.
+    fn float_buf(&mut self) -> u32 {
+        match self.sh.float_buf {
+            Some(g) => g,
+            None => {
+                let g = self.sh.nglobals;
+                self.sh.nglobals += FLOAT_BUF_WORDS;
+                self.sh.float_buf = Some(g);
+                g
+            }
+        }
+    }
+    /// Stops the program as the language does on a division by zero
+    /// (Python's ZeroDivisionError) where the divisor on top is zero (0.0
+    /// and -0.0 for a float); the divisor stays on top. Nothing for a
+    /// language that goes on (C, Go: a float's infinity or NaN).
+    fn zero_division(&mut self, float: bool) {
+        let Some((code, msg)) = self.sh.l.zero_division.clone() else { return };
+        if let Some(Op::Push(c)) = self.code.last() {
+            let zero = if float { f64::from_bits(*c as u64) == 0.0 } else { *c == 0 };
+            if !zero {
+                return;
+            }
+        }
+        let h = self.hidden();
+        self.ops(&[Op::Store(h), Op::Load(h)]);
+        if float {
+            self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]);
+        }
+        self.fail_unless(code, &msg);
+        self.emit(Op::Load(h));
+    }
+
+    /// The value whose code ends at `at`, when it is a constant: its last
+    /// operation is what makes it, so a Push there is the whole value.
+    fn constant_at(&self, at: usize) -> Option<i64> {
+        match at.checked_sub(1).and_then(|i| self.code.get(i)) {
+            Some(Op::Push(c)) => Some(*c),
+            _ => None,
+        }
+    }
+    /// The whole number whose code ends at `at` made a float of width w
+    /// (64, or 32 for a float32): a constant at once, else by the machine.
+    fn to_float_at(&mut self, at: usize, w: u8) {
+        let op = if w == 32 { UnOp::FromInt32 } else { UnOp::FromInt };
+        match self.constant_at(at) {
+            Some(c) => self.code[at - 1] = Op::Push(op.float_eval(c).unwrap()),
+            None => self.code.insert(at, Op::Un(op)),
+        }
+    }
+    /// The float whose code ends at `at` (width fw; k its constant, Go's)
+    /// made a float of width w: a double rounded to a float32 where w is 32.
+    /// A Go constant is rounded from its own value, not from its double.
+    fn float_width_at(&mut self, at: usize, fw: u8, k: Option<FloatLit>, w: u8) {
+        if w != 32 || fw == 32 {
+            return;
+        }
+        match (k, self.constant_at(at)) {
+            // a constant that rounds to zero is zero, never -0 (Go's
+            // constants have no negative zero)
+            (Some(k), Some(_)) if fw == 0 => self.code[at - 1] = Op::Push(if f64::from_bits(k.bits32) == 0.0 { 0 } else { k.bits32 as i64 }),
+            (_, Some(c)) => self.code[at - 1] = Op::Push(UnOp::ToF32.float_eval(c).unwrap()),
+            _ => self.code.insert(at, Op::Un(UnOp::ToF32)),
+        }
+    }
+    /// Go refuses a constant that a float32 cannot hold.
+    fn go_fits32(&self, fw: u8, k: Option<FloatLit>, w: u8) -> Result<(), E> {
+        match k {
+            Some(k) if fw == 0 && w == 32 && f64::from_bits(k.bits32).is_infinite() => self.err(format!("the constant {:?} overflows float32", f64::from_bits(k.bits))),
+            _ => Ok(()),
+        }
+    }
+    /// A Go float constant whose code ends at `at`, where a whole number is
+    /// wanted: the number, if the constant is one exactly (Go: else it
+    /// would be truncated, which is an error).
+    fn float_const_as_int(&mut self, at: usize, k: FloatLit) -> Result<(), E> {
+        let x = f64::from_bits(k.bits);
+        if !k.exact || x.fract() != 0.0 || !(-9.2e18..9.2e18).contains(&x) {
+            return self.err(format!("the constant {x:?} is not a whole number (Go: truncated to integer)"));
+        }
+        self.code[at - 1] = Op::Push(x as i64);
+        Ok(())
+    }
+    /// The float on top cut toward zero to a whole number of w bits, as C's
+    /// conversion and Go's int(x) do it (the machine's cvttsd2si: 32 bits
+    /// for a width of 32 or less, as clang and Go convert to an int).
+    fn float_to_int(&mut self, w: u8) {
+        let op = if w <= 32 { UnOp::ToInt32 } else { UnOp::ToInt };
+        match self.constant_at(self.code.len()) {
+            Some(c) => *self.code.last_mut().unwrap() = Op::Push(op.float_eval(c).unwrap()),
+            None => self.emit(Op::Un(op)),
+        }
+        if w < 32 {
+            self.emit(Op::Sext(w));
+        }
+    }
+    /// The value on top, of kind `from` (width fw), made what is kept where
+    /// it goes (kind `to`, width tw), as a typed language converts by itself
+    /// at an assignment, an argument, a return or an element: a whole number
+    /// cut to its width, C's whole numbers and floats into each other, a Go
+    /// constant taking the type it meets. An error where the language does
+    /// not convert; nothing for a language without types (Python).
+    fn convert(&mut self, to: &Ty, tw: u8, from: &Ty, fw: u8) -> Result<(), E> {
+        if !self.typed() {
+            return Ok(());
+        }
+        let at = self.code.len();
+        let k = self.last_k;
+        let go = self.sh.l.untyped_literals;
+        match (*to == Ty::Float, *from == Ty::Float) {
+            (true, true) => {
+                if go && fw != 0 && tw != fw {
+                    return self.err(format!("a float{fw} is given where a float{tw} is wanted; Go wants a conversion"));
+                }
+                self.go_fits32(fw, k, tw)?;
+                self.float_width_at(at, fw, k, tw);
+            }
+            (true, false) => {
+                if go && fw != 0 {
+                    return self.err("Go does not make a whole number a float by itself; write float64(x)");
+                }
+                self.to_float_at(at, tw);
+            }
+            (false, true) if go => match k {
+                Some(k) if fw == 0 => {
+                    self.float_const_as_int(at, k)?;
+                    self.narrow(tw, 0)?;
+                }
+                _ => return self.err("Go does not make a float a whole number by itself; write int(x)"),
+            },
+            (false, true) => self.float_to_int(tw),
+            (false, false) => self.narrow(tw, fw)?,
+        }
+        Ok(())
+    }
+    /// An explicit conversion of the value on top (kind `from`, width fw)
+    /// to kind `to` (width tw): C's (double)x, Go's float64(i) and int(f),
+    /// Python's float(x) and int(x).
+    fn explicit_convert(&mut self, to: &Ty, tw: u8, from: &Ty, fw: u8) -> Result<(), E> {
+        if !from.scalar() {
+            return self.err(format!("{} is not converted to a number", from.describe()));
+        }
+        let at = self.code.len();
+        let k = self.last_k;
+        match (*to == Ty::Float, *from == Ty::Float) {
+            (true, true) => {
+                self.go_fits32(fw, k, tw)?;
+                self.float_width_at(at, fw, k, tw);
+            }
+            (true, false) => {
+                if *from == Ty::Bool && self.sh.l.untyped_literals {
+                    return self.err("Go does not convert a bool to a float");
+                }
+                self.to_float_at(at, tw);
+            }
+            (false, true) if !self.typed() => self.py_int_of_float(),
+            (false, true) => match k {
+                Some(k) if fw == 0 && self.sh.l.untyped_literals => {
+                    self.float_const_as_int(at, k)?;
+                    self.narrow(tw, 0)?;
+                }
+                _ => self.float_to_int(tw),
+            },
+            (false, false) => self.narrow(tw, fw)?,
+        }
+        Ok(())
+    }
+    /// Python's int() of the float on top: cut toward zero, but NaN, an
+    /// infinity and a number past 64 bits stop the program (ValueError,
+    /// OverflowError, and Strike's own stop where Python would go on with a
+    /// larger number).
+    fn py_int_of_float(&mut self) {
+        let h = self.hidden();
+        self.emit(Op::Store(h));
+        self.ops(&[Op::Load(h), Op::Load(h), Op::Bin(BinOp::FEq)]);
+        self.fail_unless(1, "ValueError: cannot convert float NaN to integer\n");
+        self.ops(&[Op::Load(h), Op::Un(UnOp::FAbs), Op::Push(f64::INFINITY.to_bits() as i64), Op::Bin(BinOp::FNe)]);
+        self.fail_unless(1, "OverflowError: cannot convert float infinity to integer\n");
+        let (lo, hi) = ((-9223372036854775808.0f64).to_bits() as i64, 9223372036854775808.0f64.to_bits() as i64);
+        self.ops(&[Op::Load(h), Op::Push(lo), Op::Bin(BinOp::FGe), Op::Load(h), Op::Push(hi), Op::Bin(BinOp::FLt), Op::Bin(BinOp::Band)]);
+        let ok = self.label();
+        self.ops(&[Op::Jnz(ok), Op::Fail(1, super::x64::OVERFLOW.to_vec()), Op::Label(ok)]);
+        self.ops(&[Op::Load(h), Op::Un(UnOp::ToInt)]);
+    }
+    /// Prints the float on top: by print's own rule (fmt None: Python's
+    /// repr, Go's %v), or in a format ('e', 'f', 'g', 'E', 'G' and its
+    /// precision; -1 is Go's shortest). The library makes the digits in
+    /// the program's float buffer, and they print from there.
+    fn print_float(&mut self, f32: bool, fmt: Option<(u8, i64)>) -> Result<(), E> {
+        let v = self.hidden();
+        self.emit(Op::Store(v));
+        let buf = self.float_buf();
+        let (c, p, go) = match (fmt, self.sh.l.float_print) {
+            (None, Some(FloatPrint::Repr)) => {
+                self.ops(&[Op::AddrG(buf), Op::Load(v), Op::AddrG(buf)]);
+                self.lib("lib.py_repr", 2);
+                self.emit(Op::PrintMem);
+                return Ok(());
+            }
+            (None, Some(FloatPrint::Shortest)) => (b'g', -1, true),
+            (None, None) => return self.err(format!("{} prints a float only by a format (printf's %f, %e, %g)", self.sh.l.name)),
+            (Some((c, p)), _) => (c, p, self.sh.l.printf_go == Some(true)),
+        };
+        self.ops(&[Op::AddrG(buf), Op::Load(v), Op::Push(f32 as i64), Op::Push(c as i64), Op::Push(p), Op::Push(go as i64), Op::AddrG(buf)]);
+        self.lib("lib.fmt_float", 6);
+        self.emit(Op::PrintMem);
+        Ok(())
+    }
+
+    /// A binary operator whose left value (kind ta, width wa, k its Go
+    /// constant) is on the stack, its code ending at a_end: the right one
+    /// is lowered, both are made one kind as the language makes them, and
+    /// the operation is done.
+    fn binary(&mut self, op: BinOp, ta: Ty, wa: u8, ka: Option<FloatLit>, a_end: usize, b: &Expr) -> Result<Ty, E> {
+        let tb = self.expr(b, true)?;
+        let (wb, kb) = (self.last_w, self.last_k);
+        if !ta.scalar() || !tb.scalar() {
+            return self.list_op(op, &ta, &tb);
+        }
+        if ta == Ty::Float || tb == Ty::Float || op == BinOp::DivTrue {
+            return self.float_binary(op, (&ta, wa, ka, a_end), (&tb, wb, kb));
+        }
+        self.int_binary(op, wa, wb)
+    }
+
+    /// An operator on two whole numbers (on the stack, widths wa and wb).
+    fn int_binary(&mut self, op: BinOp, wa: u8, wb: u8) -> Result<Ty, E> {
+        let op = if self.sh.l.checked { op.checked() } else { op };
+        if matches!(op, BinOp::DivFloor | BinOp::ModFloor) {
+            self.zero_division(false);
+        }
+        self.emit(Op::Bin(op));
+        if op.is_comparison() {
+            self.last_w = 8;
+            return Ok(self.bool_ty());
+        }
+        // the operation at its width: a result that can leave it is cut
+        // back, as the machine of that width would
+        let w = self.arith_width(wa, wb);
+        if w > 0 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::DivTrunc) {
+            self.narrow(w, 64)?;
+        }
+        self.last_w = if w == 0 { 0 } else { w };
+        Ok(Ty::Int)
+    }
+
+    /// A binary operator where a float is met (or Python's /): both sides
+    /// made floats of one width, as the language makes them, then the
+    /// operation. C makes a whole number a float, and a float32 stays one
+    /// only with another or with a whole number; Go mixes nothing but lets a
+    /// constant take the type it meets; Python makes a whole number a float
+    /// but compares the two exactly. The left side's code ends at a_end, the
+    /// right side's at the end.
+    fn float_binary(&mut self, op: BinOp, (ta, wa, ka, a_end): (&Ty, u8, Option<FloatLit>, usize), (tb, wb, kb): (&Ty, u8, Option<FloatLit>)) -> Result<Ty, E> {
+        let go = self.sh.l.untyped_literals;
+        let python = !self.typed();
+        let (fa, fb) = (*ta == Ty::Float, *tb == Ty::Float);
+        if op == BinOp::DivTrue && !fa && !fb {
+            return self.int_true_div();
+        }
+        let fop = match op {
+            BinOp::DivFloor | BinOp::ModFloor if python => op,
+            o => match o.float() {
+                Some(f) => f,
+                None => return self.err(format!("this operator is not one {} has for floats", self.sh.l.name)),
+            },
+        };
+        if go && (*ta == Ty::Bool || *tb == Ty::Bool) {
+            return self.err("a bool and a float meet here; Go does not mix them");
+        }
+        let w = if go {
+            match (fa, wa, fb, wb) {
+                (true, 0, true, w) | (true, w, true, 0) => if w == 0 { 64 } else { w },
+                (true, x, true, y) if x != y => return self.err(format!("a float{x} and a float{y} meet here; Go wants a conversion")),
+                (true, x, true, _) => x,
+                (true, w, false, 0) | (false, 0, true, w) => if w == 0 { 64 } else { w },
+                // a whole number and a float constant: the constant must be
+                // a whole number, and the operation is a whole number's
+                (true, 0, false, _) => {
+                    let k = ka.expect("a Go float of width 0 is a constant");
+                    self.float_const_as_int(a_end, k)?;
+                    return self.int_binary(op, 0, wb);
+                }
+                (false, _, true, 0) => {
+                    let k = kb.expect("a Go float of width 0 is a constant");
+                    let at = self.code.len();
+                    self.float_const_as_int(at, k)?;
+                    return self.int_binary(op, wa, 0);
+                }
+                _ => return self.err("Go does not mix whole numbers and floats; convert one (float64(i))"),
+            }
+        } else if python {
+            64
+        } else {
+            match (fa.then_some(wa), fb.then_some(wb)) {
+                (Some(32), Some(32)) | (Some(32), None) | (None, Some(32)) => 32,
+                _ => 64,
+            }
+        };
+        // Python compares a float with a whole number exactly; one that a
+        // double holds exactly (a constant within 2^53) is made a float
+        if python && fop.is_float_comparison() && fa != fb {
+            let int_end = if fa { self.code.len() } else { a_end };
+            if !matches!(self.constant_at(int_end), Some(c) if c.unsigned_abs() <= 1 << 53) {
+                return self.py_compare(fop, fa);
+            }
+        }
+        self.go_fits32(wa, ka, w)?;
+        self.go_fits32(wb, kb, w)?;
+        if fa {
+            self.float_width_at(a_end, wa, ka, w);
+        } else {
+            self.to_float_at(a_end, w);
+        }
+        let end = self.code.len();
+        if fb {
+            self.float_width_at(end, wb, kb, w);
+        } else {
+            self.to_float_at(end, w);
+        }
+        match fop {
+            BinOp::DivFloor | BinOp::ModFloor => {
+                self.zero_division(true);
+                self.lib(if fop == BinOp::DivFloor { "lib.py_floordiv" } else { "lib.py_mod" }, 2);
+            }
+            f => {
+                if f == BinOp::FDiv {
+                    self.zero_division(true);
+                }
+                self.emit(Op::Bin(f));
+            }
+        }
+        if fop.is_float_comparison() {
+            self.last_w = 8;
+            return Ok(self.bool_ty());
+        }
+        if w == 32 {
+            self.emit(Op::Un(UnOp::ToF32));
+        }
+        self.last_w = w;
+        Ok(Ty::Float)
+    }
+
+    /// Python's comparison of a float and a whole number (both on the
+    /// stack, the float first when float_left): exact, by lib.py_cmp.
+    fn py_compare(&mut self, op: BinOp, float_left: bool) -> Result<Ty, E> {
+        use BinOp::*;
+        let op = if float_left {
+            op
+        } else {
+            let (f, i) = (self.hidden(), self.hidden());
+            self.ops(&[Op::Store(f), Op::Store(i), Op::Load(f), Op::Load(i)]);
+            match op {
+                FLt => FGt,
+                FGt => FLt,
+                FLe => FGe,
+                FGe => FLe,
+                o => o,
+            }
+        };
+        self.lib("lib.py_cmp", 2);
+        // py_cmp gives -1, 0, 1, or 2 for NaN
+        let (c, test) = match op {
+            FLt => (-1, Eq),
+            FLe => (0, Le),
+            FGt => (1, Eq),
+            FGe => (2, Ult),
+            FEq => (0, Eq),
+            _ => (0, Ne),
+        };
+        self.ops(&[Op::Push(c), Op::Bin(test)]);
+        self.last_w = 8;
+        Ok(self.bool_ty())
+    }
+
+    /// Python's / of two whole numbers: exactly Python's while both fit 53
+    /// bits (a double holds them exactly, and one division rounds once);
+    /// past that the program stops instead of guessing.
+    fn int_true_div(&mut self) -> Result<Ty, E> {
+        let (b, a) = (self.hidden(), self.hidden());
+        self.ops(&[Op::Store(b), Op::Store(a), Op::Load(b)]);
+        match self.sh.l.zero_division.clone() {
+            Some((code, msg)) => self.fail_unless(code, &msg),
+            None => self.emit(Op::Pop),
+        }
+        for s in [a, b] {
+            self.ops(&[Op::Load(s), Op::Push(1 << 53), Op::Bin(BinOp::Add), Op::Push(1 << 54), Op::Bin(BinOp::Ule)]);
+            self.fail_unless(1, INEXACT_DIVISION);
+        }
+        self.ops(&[Op::Load(a), Op::Un(UnOp::FromInt), Op::Load(b), Op::Un(UnOp::FromInt), Op::Bin(BinOp::FDiv)]);
+        self.last_w = 64;
+        Ok(Ty::Float)
     }
     /// Go's empty slice: the address of three zero words every program has.
     fn nil_slice(&mut self) {
@@ -756,6 +1273,8 @@ impl Fx<'_, '_> {
         let t = self.expr(e, true)?;
         match t {
             Ty::List(_) => self.emit(Op::LoadM(8)),
+            // not zero (0.0 and -0.0 are false, NaN is true)
+            Ty::Float => self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]),
             Ty::Slice(..) | Ty::Arr(..) | Ty::Ptr(..) => return self.err(format!("{} is not a condition", t.describe())),
             _ => {}
         }
@@ -787,9 +1306,10 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
-    /// The value on top stored at the address in slot `a`: a number cut to
-    /// the element's width, an array (held in place) copied in.
-    fn put(&mut self, a: u32, t: &Ty, w: u8, from: u8) -> Result<(), E> {
+    /// The value on top (of kind vt, width `from`) stored at the address in
+    /// slot `a`: a number cut to the element's width, a float made the
+    /// element's kind, an array (held in place) copied in.
+    fn put(&mut self, a: u32, t: &Ty, w: u8, vt: &Ty, from: u8) -> Result<(), E> {
         if let Ty::Arr(..) = t {
             let src = self.hidden();
             self.emit(Op::Store(src));
@@ -801,8 +1321,12 @@ impl Fx<'_, '_> {
         // a number is cut to the element's width by the store itself; only
         // a constant that does not fit (Go) is checked
         let v = self.hidden();
-        if t.scalar() && from == 0 {
-            self.narrow(w, from)?;
+        if t.whole() && vt.whole() {
+            if from == 0 {
+                self.narrow(w, from)?;
+            }
+        } else if t.scalar() {
+            self.convert(t, w, vt, from)?;
         }
         self.emit(Op::Store(v));
         self.ops(&[Op::Load(a), Op::Load(v), Op::StoreM(size(t, w) as u8)]);
@@ -905,7 +1429,7 @@ impl Fx<'_, '_> {
                     Some(e) => {
                         let t = self.expr(e, true)?;
                         if let Some(want) = self.ret_ty.clone() {
-                            if unify(&want, &t).is_none() {
+                            if unify(&want, &t).is_none() && !(want.scalar() && t.scalar()) {
                                 return self.err(format!("this function returns {}, not {}", want.describe(), t.describe()));
                             }
                         }
@@ -921,7 +1445,10 @@ impl Fx<'_, '_> {
                             self.copy_new(&t)?;
                         }
                         let (to, from) = (self.ret_w, self.last_w);
-                        if t.scalar() {
+                        let want = self.ret_ty.clone().unwrap_or(Ty::Int);
+                        if t.scalar() && (want == Ty::Float || t == Ty::Float) {
+                            self.convert(&want, to, &t, from)?;
+                        } else if t.scalar() {
                             self.narrow(to, from)?;
                         }
                         self.rets.push((t, *line));
@@ -960,8 +1487,8 @@ impl Fx<'_, '_> {
                 if ty == Ty::Bool && self.sh.bools {
                     return self.err(format!("{name} holds a truth value; a number is read into it"));
                 }
-                if !ty.scalar() {
-                    return self.err(format!("{name} is {}; a number is read into a number", ty.describe()));
+                if !ty.whole() {
+                    return self.err(format!("{name} is {}; only a whole number is read in this stage of Strike", ty.describe()));
                 }
                 // the number and whether there was one; with none the
                 // variable keeps its value, as scanf and Scan leave it
@@ -1006,13 +1533,18 @@ impl Fx<'_, '_> {
         if !was.scalar() {
             return self.err(format!("{name} is {}; Strike does not do arithmetic into it", was.describe()));
         }
-        self.load(slot);
-        self.int_expr(value)?;
-        let op = if self.sh.l.checked { op.checked() } else { op };
-        self.emit(Op::Bin(op));
-        // done at the promoted width, then put back in the variable's
+        // done as `name op value` is, then put back as the variable's kind:
+        // converted (C, Go), or the same kind (Python)
         let w = self.width(slot);
-        self.narrow(w, 64)?;
+        self.load(slot);
+        let at = self.code.len();
+        let t = self.binary(op, was.clone(), w, None, at, value)?;
+        let from = self.last_w;
+        if self.typed() {
+            self.convert(&was, w, &t, from)?;
+        } else {
+            self.same(name, &was, &t)?;
+        }
         self.store(slot);
         Ok(())
     }
@@ -1033,7 +1565,7 @@ impl Fx<'_, '_> {
             let slot = *slot;
             self.load_var(slot, &t);
             self.emit(Op::Store(dst));
-            return self.put(dst, &t, 64, 64);
+            return self.put(dst, &t, 64, &got, 64);
         }
         let ty = self.value(value)?;
         let from = self.last_w;
@@ -1044,6 +1576,13 @@ impl Fx<'_, '_> {
                 }
                 if self.typed() && was.scalar() && !ty.scalar() {
                     return self.err(format!("{name} is a number; it is given {}", ty.describe()));
+                }
+                // a typed variable keeps its kind: the value is converted to it
+                if self.typed() && was.scalar() && (was == Ty::Float || ty == Ty::Float) {
+                    let w = self.width(slot);
+                    self.convert(&was, w, &ty, from)?;
+                    self.store(slot);
+                    return Ok(());
                 }
                 self.same(name, &was, &ty)?;
                 slot
@@ -1110,14 +1649,14 @@ impl Fx<'_, '_> {
     /// An expression that must be a number.
     fn int_expr(&mut self, e: &Expr) -> Result<(), E> {
         let t = self.expr(e, true)?;
-        if !t.scalar() {
-            return self.err(format!("a number is wanted here, not {}", t.describe()));
+        if !t.whole() {
+            return self.err(format!("a whole number is wanted here, not {}", t.describe()));
         }
         Ok(())
     }
 
     fn var(&mut self, name: &str, words: &[String], dims: &[Option<Expr>], value: Option<&Expr>) -> Result<(), E> {
-        let (mut dt, dw) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+        let (mut dt, mut dw) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
         if matches!(dt, Ty::Ptr(..)) {
             return self.err("pointer variables are not in Strike yet (but arrays are)");
         }
@@ -1158,9 +1697,16 @@ impl Fx<'_, '_> {
                 if !words.is_empty() && (!dt.scalar() || !t.scalar()) && unify(&dt, &t).is_none() {
                     return self.err(format!("{name} is {}; it is given {}", dt.describe(), t.describe()));
                 }
-                // Go's `x := 5` is an int: the literal's own width
-                if t.scalar() {
+                // Go's `x := 5` is an int: the literal's own width; a declared
+                // kind converts the value to it
+                if t.scalar() && !words.is_empty() && dt.scalar() && (dt == Ty::Float || t == Ty::Float) {
+                    self.convert(&dt, dw, &t, from)?;
+                } else if t.scalar() {
                     self.narrow(dw, from)?;
+                }
+                // a float declared by its value has the value's width
+                if words.is_empty() && t == Ty::Float {
+                    dw = if from == 0 { 64 } else { from };
                 }
                 if words.is_empty() || (dt.scalar() && (dt == Ty::Bool || t == Ty::Bool)) {
                     t
@@ -1251,7 +1797,7 @@ impl Fx<'_, '_> {
                 if got != *t {
                     return self.err(format!("the array is given {}", got.describe()));
                 }
-                return self.put(a, t, 64, 64);
+                return self.put(a, t, 64, &got, 64);
             }
         };
         if elems.len() as u64 > *n {
@@ -1274,16 +1820,17 @@ impl Fx<'_, '_> {
             (Ty::Slice(ie, iw), Expr::Brace(inner, _)) => {
                 let (ie, iw) = ((**ie).clone(), *iw);
                 self.composite_slice(&ie, iw, inner)?;
-                self.put(at, e, 64, 64)
+                self.put(at, e, 64, e, 64)
             }
             (_, Expr::Brace(..)) => self.err("a nested initializer for an element that is not an array"),
             _ => {
                 let t = self.value(x)?;
                 let from = self.last_w;
-                if unify(e, &t).is_none() && !(e.scalar() && t.scalar() && !self.sh.bools) {
+                let numbers = e.scalar() && t.scalar() && (*e == Ty::Float || t == Ty::Float || !self.sh.bools);
+                if unify(e, &t).is_none() && !numbers {
                     return self.err(format!("an element is {}, given {}", e.describe(), t.describe()));
                 }
-                self.put(at, e, w, from)
+                self.put(at, e, w, &t, from)
             }
         }
     }
@@ -1420,7 +1967,7 @@ impl Fx<'_, '_> {
                     }
                 };
                 self.elem_kind(&target, &e, &t)?;
-                self.put(a, &e, w, from)
+                self.put(a, &e, w, &t, from)
             }
             Some(op) => {
                 if !e.scalar() || e == Ty::Bool {
@@ -1428,10 +1975,18 @@ impl Fx<'_, '_> {
                 }
                 let n = size(&e, w) as u8;
                 self.ops(&[Op::Load(a), Op::Load(a), Op::LoadM(n)]);
-                self.int_expr(value)?;
-                let op = if self.sh.l.checked { op.checked() } else { op };
-                self.emit(Op::Bin(op));
-                // the store keeps the element's own width
+                let at = self.code.len();
+                let t = self.binary(op, e.clone(), w, None, at, value)?;
+                let from = self.last_w;
+                // the store keeps a whole number's own width; a float is
+                // made the element's kind
+                if !(e.whole() && t.whole()) {
+                    if self.typed() {
+                        self.convert(&e, w, &t, from)?;
+                    } else if e != t {
+                        return self.err(format!("an element is {}, given {}; Strike keeps one kind per list", e.describe(), t.describe()));
+                    }
+                }
                 self.emit(Op::StoreM(n));
                 Ok(())
             }
@@ -1492,7 +2047,13 @@ impl Fx<'_, '_> {
             None => None,
         };
         let vv = match value {
-            Some(name) => Some(self.loop_var(name, e.clone())?),
+            Some(name) => {
+                let s = self.loop_var(name, e.clone())?;
+                if e == Ty::Float {
+                    self.set_width(s, ew);
+                }
+                Some(s)
+            }
             None => None,
         };
         let (top, cont, done) = (self.label(), self.label(), self.label());
@@ -1569,6 +2130,10 @@ impl Fx<'_, '_> {
                 self.emit(Op::Pop);
             }
             (_, Ty::Ptr(..)) => return self.err("a pointer is not printed"),
+            (_, Ty::Float) => {
+                let f32 = self.last_w == 32;
+                self.print_float(f32, None)?;
+            }
             _ => self.emit(Op::PrintInt),
         }
         Ok(())
@@ -1583,6 +2148,7 @@ impl Fx<'_, '_> {
         let (e, ew) = t.elem().unwrap();
         let elem = match &e {
             Ty::Bool => Elem::Bool,
+            Ty::Float => Elem::Float(FloatElem { f32: ew == 32, repr: self.sh.l.float_print == Some(FloatPrint::Repr), buf: self.float_buf() }),
             Ty::List(_) | Ty::Slice(..) => Elem::Nested(self.printer(&e), false),
             Ty::Arr(..) => Elem::Nested(self.printer(&e), true),
             _ => Elem::Int,
@@ -1641,6 +2207,17 @@ impl Fx<'_, '_> {
                         i += 1;
                         continue;
                     }
+                    // a precision: .digits (none after the point is 0, as in C)
+                    let mut prec: Option<i64> = None;
+                    if f.get(i) == Some(&b'.') {
+                        i += 1;
+                        let mut p = 0i64;
+                        while let Some(d) = f.get(i).filter(|d| d.is_ascii_digit()) {
+                            p = (p * 10 + (d - b'0') as i64).min(1 << 20);
+                            i += 1;
+                        }
+                        prec = Some(p);
+                    }
                     while f.get(i) == Some(&b'l') {
                         i += 1;
                     }
@@ -1652,6 +2229,9 @@ impl Fx<'_, '_> {
                     let Some(a) = rest.next() else {
                         return self.err("the format wants more values than it is given");
                     };
+                    if prec.is_some() && !matches!(spec, b'f' | b'e' | b'E' | b'g' | b'G') {
+                        return self.err(format!("a precision for %{} is not in Strike yet", spec as char));
+                    }
                     match spec {
                         b'd' | b'i' => {
                             if matches!(a, Expr::Str(_)) {
@@ -1661,12 +2241,29 @@ impl Fx<'_, '_> {
                             if t == Ty::Bool && self.sh.bools {
                                 return self.err("%d is given a truth value");
                             }
-                            if !t.scalar() {
+                            if !t.whole() {
                                 return self.err(format!("%d is given {}", t.describe()));
                             }
                             self.emit(Op::PrintInt);
                         }
                         b'v' => self.print_value(a)?,
+                        b'f' | b'e' | b'E' | b'g' | b'G' if self.sh.l.printf_go.is_some() => {
+                            if matches!(a, Expr::Str(_)) {
+                                return self.err(format!("%{} is given a string", spec as char));
+                            }
+                            let t = self.expr(a, true)?;
+                            if t != Ty::Float {
+                                return self.err(format!("%{} is given {}, not a float", spec as char, t.describe()));
+                            }
+                            let f32 = self.last_w == 32;
+                            // Go's %g without a precision is its shortest
+                            let go = self.sh.l.printf_go == Some(true);
+                            let p = prec.unwrap_or(if go && matches!(spec, b'g' | b'G') { -1 } else { 6 });
+                            if p > 100 {
+                                return self.err("a precision above 100 is not in Strike yet");
+                            }
+                            self.print_float(f32, Some((spec, p)))?;
+                        }
                         b's' => match a {
                             Expr::Str(s) => self.emit(Op::PrintStr(s.clone())),
                             _ => return self.err("%s is given something that is not a string"),
@@ -1755,8 +2352,10 @@ impl Fx<'_, '_> {
                     if unify(&e, &vt).is_none() && !(e.scalar() && vt.scalar()) {
                         return self.err(format!("the slice holds {}, given {}", e.describe(), vt.describe()));
                     }
-                    if e.scalar() {
+                    if e.whole() && vt.whole() {
                         self.narrow(w, from)?;
+                    } else if e.scalar() {
+                        self.convert(&e, w, &vt, from)?;
                     }
                     let x = self.hidden();
                     self.emit(Op::Store(x));
@@ -1773,22 +2372,153 @@ impl Fx<'_, '_> {
                     let at = self.hidden();
                     self.ops(&[Op::Load(nh), Op::LoadM(8), Op::Load(old), Op::Push(k as i64), Op::Bin(BinOp::Add), Op::Push(size(&e, w) as i64), Op::Bin(BinOp::Mul), Op::Bin(BinOp::Add), Op::Store(at)]);
                     self.emit(Op::Load(*x));
-                    self.put(at, &e, 64, 64)?;
+                    self.put(at, &e, 64, &e, 64)?;
                 }
                 self.emit(Op::Load(nh));
                 self.last_w = 64;
                 Ok(t)
+            }
+            // the square root and the size of a float: exact, one rounding
+            // (sqrtsd) and none (the sign bit)
+            "sqrt" | "fabs" => {
+                let [x] = args else { return self.err(format!("{name} takes one value")) };
+                let t = self.expr(x, true)?;
+                let w = self.last_w;
+                if !t.scalar() {
+                    return self.err(format!("{name} takes a float, not {}", t.describe()));
+                }
+                if self.sh.l.untyped_literals && t == Ty::Float && w == 32 {
+                    return self.err(format!("{name} takes a float64, not a float32; Go wants a conversion"));
+                }
+                if t != Ty::Float {
+                    if self.typed() {
+                        self.convert(&Ty::Float, 64, &t, w)?;
+                    } else {
+                        let at = self.code.len();
+                        self.to_float_at(at, 64);
+                    }
+                }
+                self.emit(Op::Un(if what == "sqrt" { UnOp::FSqrt } else { UnOp::FAbs }));
+                self.last_w = 64;
+                Ok(Ty::Float)
+            }
+            // Python's math.sqrt: a negative number stops the program with
+            // its ValueError (its message says the number)
+            "py_sqrt" => {
+                let [x] = args else { return self.err(format!("{name} takes one value")) };
+                let t = self.expr(x, true)?;
+                if !t.scalar() {
+                    return self.err(format!("{name} takes a number, not {}", t.describe()));
+                }
+                if t != Ty::Float {
+                    let at = self.code.len();
+                    self.to_float_at(at, 64);
+                }
+                let (v, ok) = (self.hidden(), self.label());
+                let buf = self.float_buf();
+                self.ops(&[Op::Store(v), Op::Load(v), Op::Push(0), Op::Bin(BinOp::FLt), Op::Jz(ok)]);
+                self.ops(&[Op::AddrG(buf), Op::Load(v), Op::AddrG(buf)]);
+                self.lib("lib.py_sqrt_error", 2);
+                self.ops(&[Op::FailMem(1), Op::Label(ok), Op::Load(v), Op::Un(UnOp::FSqrt)]);
+                self.last_w = 64;
+                Ok(Ty::Float)
+            }
+            // Python's abs: a whole number's (checked: the lowest has no
+            // positive), a float's
+            "abs" => {
+                let [x] = args else { return self.err(format!("{name} takes one value")) };
+                let t = self.expr(x, true)?;
+                match t {
+                    Ty::Float => {
+                        self.emit(Op::Un(UnOp::FAbs));
+                        Ok(Ty::Float)
+                    }
+                    t if t.whole() => {
+                        let (h, done) = (self.hidden(), self.label());
+                        let neg = if self.sh.l.checked { UnOp::NegOv } else { UnOp::Neg };
+                        self.ops(&[Op::Store(h), Op::Load(h), Op::Push(0), Op::Bin(BinOp::Lt), Op::Jz(done), Op::Load(h), Op::Un(neg), Op::Store(h), Op::Label(done), Op::Load(h)]);
+                        self.last_w = 64;
+                        Ok(Ty::Int)
+                    }
+                    t => self.err(format!("{name} takes a number, not {}", t.describe())),
+                }
+            }
+            // C's fmod: given to the float library only (lib.rs), not to C
+            // programs, whose fmod is the UCRT's
+            "fmod" => {
+                let [x, y] = args else { return self.err(format!("{name} takes two values")) };
+                for e in [x, y] {
+                    if self.expr(e, true)? != Ty::Float {
+                        return self.err(format!("{name} takes floats"));
+                    }
+                }
+                self.emit(Op::Bin(BinOp::FRem));
+                self.last_w = 64;
+                Ok(Ty::Float)
             }
             other => self.err(format!("{name} ({other}) is not in Strike yet")),
         }
     }
 
     /// Lowers an expression, leaving its value on the stack; `used` is false
-    /// only for an expression statement.
+    /// only for an expression statement. In Go a constant expression with a
+    /// float in it is worked out here, where it is exact (Go's constants
+    /// are exact numbers), and refused where it is not.
     fn expr(&mut self, e: &Expr, used: bool) -> Result<Ty, E> {
+        self.last_k = None;
+        if self.sh.l.untyped_literals && matches!(e, Expr::Un(..) | Expr::Bin(..)) {
+            match go_const(e) {
+                Some(Err(m)) => return self.err(m),
+                Some(Ok(K::Float(f))) => {
+                    self.emit(Op::Push(f.bits as i64));
+                    self.last_w = 0;
+                    self.last_k = Some(f);
+                    return Ok(Ty::Float);
+                }
+                _ => {}
+            }
+        }
+        let t = self.expr_case(e, used)?;
+        if !matches!(e, Expr::Float(_)) {
+            self.last_k = None;
+        }
+        Ok(t)
+    }
+
+    fn expr_case(&mut self, e: &Expr, used: bool) -> Result<Ty, E> {
         // every case leaves the width of its value in last_w; a truth
         // value fits 8 bits
         Ok(match e {
+            Expr::Float(f) => {
+                if self.sh.l.untyped_literals && f64::from_bits(f.bits).is_infinite() {
+                    return self.err("the constant overflows float64");
+                }
+                self.emit(Op::Push(if f.f32 { f.bits32 } else { f.bits } as i64));
+                self.last_w = if self.sh.l.untyped_literals {
+                    0
+                } else if f.f32 {
+                    32
+                } else {
+                    64
+                };
+                self.last_k = Some(*f);
+                Ty::Float
+            }
+            Expr::Cast(words, x, line) => {
+                self.line = *line;
+                if words.iter().any(|w| w == "bool" || w == "_Bool") {
+                    return self.err("a cast to bool is not in Strike yet");
+                }
+                let (to, tw) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
+                if !to.scalar() {
+                    return self.err("a cast to this type is not in Strike yet");
+                }
+                let t = self.expr(x, true)?;
+                let fw = self.last_w;
+                self.explicit_convert(&to, tw, &t, fw)?;
+                self.last_w = tw;
+                to
+            }
             Expr::Num(v, b) => {
                 self.emit(Op::Push(*v));
                 self.last_w = if *b || !self.typed() {
@@ -1907,12 +2637,12 @@ impl Fx<'_, '_> {
                 }
                 // a conversion: Go's int32(x), Python's int(x) of a number
                 if !self.sh.sigs.contains_key(name) && self.sh.l.type_words.contains(name) && args.len() == 1 {
-                    if let Ok((Ty::Int, w)) = type_of(self.sh.l, std::slice::from_ref(name), self.sh.bools) {
-                        self.int_expr(&args[0])?;
+                    if let Ok((to @ (Ty::Int | Ty::Float), w)) = type_of(self.sh.l, std::slice::from_ref(name), self.sh.bools) {
+                        let t = self.expr(&args[0], true)?;
                         let from = self.last_w;
-                        self.narrow(w, from)?;
+                        self.explicit_convert(&to, w, &t, from)?;
                         self.last_w = w;
-                        return Ok(Ty::Int);
+                        return Ok(to);
                     }
                 }
                 let Some(sig) = self.sh.sigs.get(name).cloned() else {
@@ -1941,7 +2671,12 @@ impl Fx<'_, '_> {
                     } else {
                         // an argument is converted to its parameter's type
                         let from = self.last_w;
-                        self.narrow(pw.get(i).copied().unwrap_or(64), from)?;
+                        let w = pw.get(i).copied().unwrap_or(64);
+                        if want == Ty::Float || t == Ty::Float {
+                            self.convert(&want, w, &t, from)?;
+                        } else {
+                            self.narrow(w, from)?;
+                        }
                     }
                     tys.push(t);
                 }
@@ -1964,6 +2699,14 @@ impl Fx<'_, '_> {
                     return Ok(self.bool_ty());
                 }
                 let t = self.expr(x, true)?;
+                if t == Ty::Float {
+                    match op {
+                        UnOp::Plus => {}
+                        UnOp::Neg | UnOp::NegOv => self.emit(Op::Un(UnOp::FNeg)),
+                        _ => return self.err("this operator is not one a float has"),
+                    }
+                    return Ok(Ty::Float);
+                }
                 if !t.scalar() {
                     return self.err(format!("arithmetic on {} is not in Strike yet", t.describe()));
                 }
@@ -2009,39 +2752,23 @@ impl Fx<'_, '_> {
                         return self.err("and/or of lists is not in Strike yet");
                     }
                     self.emit(Op::Dup);
+                    if ta == Ty::Float {
+                        self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]);
+                    }
                     self.emit(if *op == BinOp::AndValue { Op::Jz(end) } else { Op::Jnz(end) });
                     self.emit(Op::Pop);
                     let tb = self.expr(b, true)?;
                     self.emit(Op::Label(end));
-                    if ta != tb && self.sh.bools {
-                        return self.err("and/or between a number and a truth value is not in Strike yet");
+                    if ta != tb && (self.sh.bools || ta == Ty::Float || tb == Ty::Float) {
+                        return self.err(format!("and/or between {} and {} is not in Strike yet", ta.describe(), tb.describe()));
                     }
                     self.last_w = 64;
                     ta
                 }
                 _ => {
                     let ta = self.expr(a, true)?;
-                    let wa = self.last_w;
-                    let tb = self.expr(b, true)?;
-                    let wb = self.last_w;
-                    if !ta.scalar() || !tb.scalar() {
-                        return self.list_op(*op, &ta, &tb);
-                    }
-                    let op = if self.sh.l.checked { op.checked() } else { *op };
-                    self.emit(Op::Bin(op));
-                    if op.is_comparison() {
-                        self.last_w = 8;
-                        self.bool_ty()
-                    } else {
-                        // the operation at its width: a result that can leave
-                        // it is cut back, as the machine of that width would
-                        let w = self.arith_width(wa, wb);
-                        if w > 0 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::DivTrunc) {
-                            self.narrow(w, 64)?;
-                        }
-                        self.last_w = if w == 0 { 0 } else { w };
-                        Ty::Int
-                    }
+                    let (wa, ka, at) = (self.last_w, self.last_k, self.code.len());
+                    self.binary(*op, ta, wa, ka, at, b)?
                 }
             },
         })
@@ -2125,6 +2852,16 @@ impl Fx<'_, '_> {
 
     /// x.name(args): Python's list methods.
     fn method(&mut self, base: &Expr, name: &str, args: &[Expr]) -> Result<Ty, E> {
+        // a module's function (Go's math.Sqrt, Python's math.sqrt)
+        if let Expr::Var(m, _) = base {
+            if self.lookup(m).is_none() {
+                let full = format!("{m}.{name}");
+                return match self.sh.l.qualified.get(&full).cloned() {
+                    Some(what) => self.builtin(&what, &full, args),
+                    None => self.err(format!("{full} is not in Strike yet")),
+                };
+            }
+        }
         let Some(what) = self.sh.l.methods.get(name).cloned() else {
             return self.err(format!(".{name}() is not in Strike yet"));
         };
@@ -2217,6 +2954,12 @@ fn combine(what: &str, tys: &[Ty], bools: bool) -> Result<Ty, String> {
         return Ok(u);
     }
     let has = |t: &Ty| tys.contains(t);
+    if has(&Ty::Float) {
+        if has(&Ty::Int) || has(&Ty::Bool) {
+            return Err(format!("{what} is a float in one place and a whole number in another"));
+        }
+        return Ok(Ty::Float);
+    }
     Ok(match (has(&Ty::Int), has(&Ty::Bool)) {
         (_, false) => Ty::Int,
         (false, true) => Ty::Bool,
@@ -2264,14 +3007,14 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
         for t in &f.param_types {
             let (k, w) = type_of(l, t, bools).map_err(|m| (f.line, m))?;
             ps.push(w);
-            kinds.push((typed && !k.scalar()).then_some(k));
+            kinds.push((typed && (!k.scalar() || k == Ty::Float)).then_some(k));
         }
         let (rk, rw) = type_of(l, &f.ret, bools).map_err(|m| (f.line, m))?;
         if matches!(rk, Ty::Ptr(..)) {
             return Err((f.line, "a function that returns a pointer is not in Strike yet".into()));
         }
         fw.insert(f.name.clone(), (ps, rw));
-        declared.insert(f.name.clone(), (kinds, (typed && !rk.scalar()).then_some(rk)));
+        declared.insert(f.name.clone(), (kinds, (typed && (!rk.scalar() || rk == Ty::Float)).then_some(rk)));
     }
     let mut sigs: HashMap<String, Sig> = p
         .funcs
@@ -2301,6 +3044,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             known: &known,
             seen: HashMap::new(),
             nil_slice: None,
+            float_buf: None,
         };
         let mut funcs = Vec::new();
         let mut errors: Vec<E> = Vec::new();
@@ -2331,6 +3075,7 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                 line,
                 widths: HashMap::new(),
                 last_w: 64,
+                last_k: None,
                 ret_w: if top { 64 } else { ret_w },
                 ret_ty,
                 globals_here: top,
@@ -2422,7 +3167,9 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
             if declared[name].1.is_some() {
                 continue;
             }
-            let tys: Vec<Ty> = rs.iter().map(|r| r.0.clone()).collect();
+            // a typed language's result is a whole number where no float is
+            // declared: a float returned is converted to it
+            let tys: Vec<Ty> = rs.iter().map(|r| if typed && r.0 == Ty::Float { Ty::Int } else { r.0.clone() }).collect();
             let line = rs.first().map(|r| r.1).unwrap_or(1);
             next.get_mut(name).unwrap().ret = combine(&format!("what {name} returns"), &tys, bools).map_err(|m| (line, m))?;
         }
@@ -2433,7 +3180,8 @@ pub fn lower(p: &Program, l: &Lang) -> Result<Lowered, E> {
                     continue;
                 }
                 let what = format!("parameter {} of {callee}", table[callee.as_str()].params[i]);
-                next.get_mut(callee).unwrap().params[i] = combine(&what, tys, bools).map_err(|m| (line, m))?;
+                let tys: Vec<Ty> = tys.iter().map(|t| if typed && *t == Ty::Float { Ty::Int } else { t.clone() }).collect();
+                next.get_mut(callee).unwrap().params[i] = combine(&what, &tys, bools).map_err(|m| (line, m))?;
             }
         }
         // a parameter whose kind the function itself learns (a list it

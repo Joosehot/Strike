@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-5 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-9 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -118,7 +118,15 @@ enum V {
     /// base + index << k + d, both locals in registers: an element's
     /// address, used where it is as [base + index * size + d]
     Index(u32, u32, u8, i32),
+    /// a float in xmm2 to xmm5 (a result, or an element loaded for a
+    /// float operation): the next float operation takes it there, anything
+    /// else has it moved out
+    X(u8),
 }
+
+/// The xmm registers floats wait in (volatile on Windows, so a call takes
+/// them out first); xmm0 and xmm1 are the scratch of single operations.
+const XMMS: std::ops::RangeInclusive<u8> = 2..=5;
 
 /// Where memory is: a register plus a displacement, or base + index << k
 /// + displacement (no base: None).
@@ -500,6 +508,7 @@ impl G {
             },
             V::Rax => self.mov_rr(r, RAX),
             V::Stack => self.pop_r(r),
+            V::X(k) => self.a.e(&[0x66, 0x48 | (r >> 3) & 1, 0x0F, 0x7E, 0xC0 | k << 3 | (r & 7)]), // movq r, xmm
             V::Flags(cc) => self.setcc_into(r, cc),
             V::Lea(s, c) => {
                 let y = self.slot_reg(s);
@@ -544,7 +553,7 @@ impl G {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
             }
-            V::Lea(..) | V::Scaled(..) | V::Index(..) => {
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::X(_) => {
                 self.to_reg(x, R11);
                 self.push_r(R11);
             }
@@ -571,6 +580,18 @@ impl G {
     }
     fn need_rax(&mut self) {
         if let Some(i) = self.v.iter().rposition(|x| *x == V::Rax) {
+            self.flush_to(i);
+        }
+    }
+    /// A free xmm register for a float to wait in, other than those in
+    /// `avoid`: when all are taken, the deepest float waiting is pushed.
+    fn alloc_xmm(&mut self, avoid: &[u8]) -> u8 {
+        loop {
+            let used = |k: u8, v: &[V]| v.contains(&V::X(k)) || avoid.contains(&k);
+            if let Some(k) = XMMS.clone().find(|&k| !used(k, &self.v)) {
+                return k;
+            }
+            let i = self.v.iter().position(|x| matches!(x, V::X(_))).expect("an xmm register is taken by a value");
             self.flush_to(i);
         }
     }
@@ -634,6 +655,10 @@ impl G {
     }
 
     fn bin(&mut self, b: BinOp, done: &mut dyn FnMut(&mut Asm) -> u32) {
+        if b.is_float() {
+            self.float_bin(b);
+            return;
+        }
         // a local in a register plus or minus a constant waits as a Lea
         let n = self.v.len();
         if matches!(b, BinOp::Add | BinOp::Sub) && n >= 2 {
@@ -823,6 +848,117 @@ impl G {
         self.v.push(V::Rax);
     }
 
+    /// A float operation in xmm registers: each side taken from where it
+    /// is (a float waiting in its xmm register, a local in memory straight
+    /// from there) and the result left in the left side's register. A
+    /// comparison leaves its flags. FRem (the x87's) and a side on the
+    /// machine's stack take rax and rcx, as the plain generator does.
+    fn float_bin(&mut self, b: BinOp) {
+        let right = self.pop();
+        let left = self.pop();
+        self.need_rax();
+        if b == BinOp::FRem || left == V::Stack || right == V::Stack {
+            self.to_reg(right, RCX);
+            self.to_reg(left, RAX);
+            match super::x64::float_compare(&mut self.a, b) {
+                Some(cc) => self.v.push(V::Flags(cc)),
+                None => self.v.push(V::Rax),
+            }
+            return;
+        }
+        let op = match b {
+            BinOp::FAdd => 0x58,
+            BinOp::FMul => 0x59,
+            BinOp::FSub => 0x5C,
+            BinOp::FDiv => 0x5E,
+            _ => 0,
+        };
+        // the left side's register, which the result takes
+        let a = match left {
+            V::X(k) => k,
+            x => {
+                let avoid = if let V::X(k) = right { vec![k] } else { vec![] };
+                let k = self.alloc_xmm(&avoid);
+                self.to_xmm(x, k);
+                k
+            }
+        };
+        // arithmetic takes a local in memory as it is
+        if let (V::Slot(s), true) = (right, op != 0) {
+            if let Loc::Mem(d) = self.loc[s as usize] {
+                let disp = self.at(d);
+                self.a.e(&[0xF2, 0x0F, op, 0x84 | a << 3, 0x24]); // op xmm, [rsp + d]
+                self.a.d32(disp);
+                self.v.push(V::X(a));
+                return;
+            }
+        }
+        let c = match right {
+            V::X(k) => k,
+            x => {
+                self.to_xmm(x, 1);
+                1
+            }
+        };
+        let rr = 0xC0 | a << 3 | c;
+        match b {
+            BinOp::FLt | BinOp::FLe => {
+                self.a.e(&[0x66, 0x0F, 0x2E, 0xC0 | c << 3 | a]); // ucomisd right, left: a < b is b above a
+                self.v.push(V::Flags(if b == BinOp::FLt { 0x97 } else { 0x93 }));
+            }
+            BinOp::FGt | BinOp::FGe => {
+                self.a.e(&[0x66, 0x0F, 0x2E, rr]); // ucomisd left, right
+                self.v.push(V::Flags(if b == BinOp::FGt { 0x97 } else { 0x93 }));
+            }
+            BinOp::FEq | BinOp::FNe => {
+                // cmpsd's mask, made 0 or 1 in rax
+                self.a.e(&[0xF2, 0x0F, 0xC2, rr, if b == BinOp::FEq { 0 } else { 4 }]);
+                self.a.e(&[0x66, 0x48, 0x0F, 0x7E, 0xC0 | a << 3, 0x83, 0xE0, 0x01]); // movq rax, xmm; and eax, 1
+                self.v.push(V::Rax);
+            }
+            _ => {
+                self.a.e(&[0xF2, 0x0F, op, rr]);
+                self.v.push(V::X(a));
+            }
+        }
+    }
+
+    /// An element a float operation is to use, loaded from memory straight
+    /// into an xmm register (rax stays free for the next one's address).
+    fn load_float(&mut self) {
+        let x = self.pop();
+        let k = self.alloc_xmm(&[]);
+        let at = self.address(x);
+        self.a.e(&[0xF2]);
+        self.mem(false, false, &[0x0F, 0x10], k, at); // movsd xmm, [address]
+        self.v.push(V::X(k));
+    }
+
+    /// A value (not on the machine's stack, not waiting in an xmm register)
+    /// into xmm register `xmm`.
+    fn to_xmm(&mut self, x: V, xmm: u8) {
+        match x {
+            V::Slot(s) if !self.in_reg(s) => {
+                let Loc::Mem(d) = self.loc[s as usize] else { unreachable!() };
+                let disp = self.at(d);
+                self.a.e(&[0xF2, 0x0F, 0x10, 0x84 | xmm << 3, 0x24]); // movsd xmm, [rsp + d]
+                self.a.d32(disp);
+            }
+            V::Imm(0) => self.a.e(&[0x0F, 0x57, 0xC0 | xmm << 3 | xmm]), // xorps xmm, xmm
+            x => {
+                let r = match x {
+                    V::Slot(s) => self.slot_reg(s),
+                    V::Rax => RAX,
+                    x => {
+                        self.to_reg(x, R11);
+                        R11
+                    }
+                };
+                self.a.e(&[0x66, 0x48 | (r >> 3) & 1, 0x0F, 0x6E, 0xC0 | xmm << 3 | (r & 7)]); // movq xmm, r
+            }
+        }
+    }
+
     fn store(&mut self, s: u32) {
         let x = self.pop();
         if let Some(i) = self.reads(s) {
@@ -875,7 +1011,7 @@ impl G {
             return;
         }
         let args: Vec<V> = self.v.split_off(at);
-        if let Some(i) = self.v.iter().rposition(|x| *x == V::Rax) {
+        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::X(_))) {
             self.flush_to(i);
         }
         // a comparison's flags become a number before anything changes them
@@ -1042,6 +1178,13 @@ impl G {
     fn store_mem(&mut self, w: u8) {
         let x = self.pop();
         let a = self.pop();
+        // a float waiting in an xmm register: stored from there
+        if let (V::X(k), 8) = (x, w) {
+            let at = self.address(a);
+            self.a.e(&[0xF2]);
+            self.mem(false, false, &[0x0F, 0x11], k, at); // movsd [address], xmm
+            return;
+        }
         let imm = match x {
             V::Imm(c) => i32::try_from(c).ok(),
             _ => None,
@@ -1125,6 +1268,17 @@ impl G {
     fn un(&mut self, u: UnOp) {
         let x = self.pop();
         match (u, x) {
+            // a square root where the float waits
+            (UnOp::FSqrt, V::X(k)) => {
+                self.a.e(&[0xF2, 0x0F, 0x51, 0xC0 | k << 3 | k]); // sqrtsd xmm, xmm
+                self.v.push(V::X(k));
+            }
+            (u, x) if u.is_float() => {
+                self.need_rax();
+                self.to_reg(x, RAX);
+                super::x64::float_un(&mut self.a, u);
+                self.v.push(V::Rax);
+            }
             (UnOp::Plus, x) => self.v.push(x),
             (UnOp::Not, V::Flags(cc)) => self.v.push(V::Flags(cc ^ 1)),
             (UnOp::Not, x) => {
@@ -1335,6 +1489,44 @@ fn fast_path(f: &Func) -> Option<Fast> {
     Some(Fast { test, rest_on_zero, value, test_at: i, rest })
 }
 
+/// For every operation, whether its value goes to a float operation (so it
+/// is better loaded into an xmm register than into rax). Followed on the
+/// IR's stack between labels and jumps; across them, nothing is known.
+fn float_operands(code: &[Op]) -> Vec<bool> {
+    let mut out = vec![false; code.len()];
+    let mut st: Vec<Option<usize>> = Vec::new();
+    for (i, op) in code.iter().enumerate() {
+        let (ins, outs) = match op {
+            Op::Push(_) | Op::Load(_) | Op::LoadG(_) | Op::Frame(_) | Op::AddrG(_) | Op::ReadLine => (0, 1),
+            Op::Store(_) | Op::StoreG(_) | Op::Pop | Op::PrintInt | Op::Jz(_) | Op::Jnz(_) => (1, 0),
+            Op::Bin(_) => (2, 1),
+            Op::Un(_) | Op::Sext(_) | Op::LoadM(_) => (1, 1),
+            Op::StoreM(_) | Op::PrintMem => (2, 0),
+            Op::Call(_, n) => (*n as usize, 1),
+            Op::ReadToken => (0, 2),
+            Op::PrintStr(_) => (0, 0),
+            Op::Dup | Op::Label(_) | Op::Jmp(_) | Op::Ret | Op::Fail(..) | Op::FailMem(_) => {
+                st.clear();
+                if matches!(op, Op::Dup) {
+                    st.push(None);
+                    st.push(None);
+                }
+                continue;
+            }
+        };
+        let float = matches!(op, Op::Bin(b) if b.is_float()) || matches!(op, Op::Un(u) if u.is_float());
+        for _ in 0..ins {
+            if let Some(Some(p)) = st.pop() {
+                out[p] = float;
+            }
+        }
+        for _ in 0..outs {
+            st.push(Some(i));
+        }
+    }
+    out
+}
+
 pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if std::env::var_os("STRIKE_DUMP_IR").is_some() {
         eprintln!("{} ({} params, {} slots):", f.name, f.params, f.slots);
@@ -1351,7 +1543,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         .iter()
         .map(|o| match o {
             Op::Call(_, n) => 32 + 8 * n.saturating_sub(4) as i32,
-            Op::PrintInt | Op::PrintStr(_) => 32,
+            Op::PrintInt | Op::PrintStr(_) | Op::PrintMem => 32,
             _ => 0,
         })
         .max()
@@ -1491,6 +1683,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         g.a.jmp(labels_of[fp.rest as usize]);
         live = false;
     }
+    let for_float = float_operands(&f.code);
     let mut new_label = |a: &mut Asm| a.label();
     let mut skip = 0;
     for (at, op) in f.code.iter().enumerate() {
@@ -1565,6 +1758,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 g.call_runtime("rt.read_line");
                 g.v.push(V::Rax);
             }
+            Op::LoadM(8) if for_float[at] => g.load_float(),
             Op::LoadM(w) => g.load_mem(*w),
             Op::StoreM(w) => g.store_mem(*w),
             Op::Frame(n) => {
@@ -1582,6 +1776,15 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             }
             Op::Fail(code, m) => {
                 super::x64::fail_here(&mut g.a, *code, m);
+                live = false;
+            }
+            Op::FailMem(code) => {
+                let len = g.pop();
+                let at = g.pop();
+                g.need_rax();
+                g.to_reg(len, 2); // rdx
+                g.to_reg(at, RCX);
+                super::x64::fail_mem(&mut g.a, *code);
                 live = false;
             }
             Op::Dup => match g.v.last().copied() {
@@ -1604,6 +1807,15 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 g.to_reg(x, RCX);
                 g.flush();
                 g.call_runtime("rt.print_int");
+            }
+            Op::PrintMem => {
+                let len = g.pop();
+                let at = g.pop();
+                g.need_rax();
+                g.to_reg(len, 2); // rdx
+                g.to_reg(at, RCX);
+                g.flush();
+                g.call_runtime("rt.print_str");
             }
             Op::PrintStr(s) => {
                 g.flush();

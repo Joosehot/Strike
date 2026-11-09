@@ -245,9 +245,14 @@ pub fn compile(f: &Func) -> Code {
             Op::Fail(code, m) => {
                 fail_here(&mut a, *code, m);
             }
+            Op::FailMem(code) => {
+                a.e(&[0x5A, 0x59]); // pop rdx (the length); pop rcx (the message)
+                fail_mem(&mut a, *code);
+            }
             Op::Un(u) => {
                 a.e(&[0x58]);
                 match u {
+                    u if u.is_float() => float_un(&mut a, *u),
                     UnOp::Neg => a.e(&[0x48, 0xF7, 0xD8]),
                     UnOp::Bnot => a.e(&[0x48, 0xF7, 0xD0]),
                     UnOp::Not => a.e(&[0x48, 0x85, 0xC0, 0x0F, 0x94, 0xC0, 0x0F, 0xB6, 0xC0]),
@@ -256,6 +261,7 @@ pub fn compile(f: &Func) -> Code {
                         let t = *trap_at.get_or_insert_with(|| a.label());
                         checked(&mut a, None, t);
                     }
+                    _ => unreachable!("every float operation is above"),
                 }
                 a.e(&[0x50]);
             }
@@ -263,6 +269,10 @@ pub fn compile(f: &Func) -> Code {
                 a.e(&[0x59, 0x58]); // pop rcx (right); pop rax (left)
                 let set = |a: &mut Asm, cc: u8| a.e(&[0x48, 0x39, 0xC8, 0x0F, cc, 0xC0, 0x0F, 0xB6, 0xC0]);
                 match b {
+                    b if b.is_float() => match float_compare(&mut a, *b) {
+                        Some(cc) => a.e(&[0x0F, cc, 0xC0, 0x0F, 0xB6, 0xC0]), // setcc al; movzx eax, al
+                        None => {}
+                    },
                     BinOp::AddOv | BinOp::SubOv | BinOp::MulOv | BinOp::ShlOv => {
                         let t = *trap_at.get_or_insert_with(|| a.label());
                         checked(&mut a, Some(*b), t);
@@ -298,9 +308,10 @@ pub fn compile(f: &Func) -> Code {
                     BinOp::Ge => set(&mut a, 0x9D),
                     BinOp::Ult => set(&mut a, 0x92),
                     BinOp::Ule => set(&mut a, 0x96),
-                    BinOp::AndBool | BinOp::OrBool | BinOp::AndValue | BinOp::OrValue => {
-                        unreachable!("logic operators are lowered to jumps")
+                    BinOp::AndBool | BinOp::OrBool | BinOp::AndValue | BinOp::OrValue | BinOp::DivTrue => {
+                        unreachable!("logic operators are lowered to jumps, and / to a float's")
                     }
+                    _ => unreachable!("every float operation is above"),
                 }
                 a.e(&[0x50]);
                 depth -= 1;
@@ -310,6 +321,11 @@ pub fn compile(f: &Func) -> Code {
             }
             Op::PrintInt => {
                 call(&mut a, "rt.print_int", 1, &mut depth, false);
+            }
+            Op::PrintMem => {
+                a.e(&[0x5A, 0x59]); // pop rdx (the length); pop rcx (the address)
+                depth -= 2;
+                call(&mut a, "rt.print_str", 0, &mut depth, false);
             }
             Op::PrintStr(s) => {
                 a.e(&[0x48, 0x8D, 0x0D]); // lea rcx, [rip + data]
@@ -455,6 +471,80 @@ pub fn runtime(entry: &str) -> Vec<(String, Code)> {
     ]
 }
 
+const MOVQ_XMM0_RAX: [u8; 5] = [0x66, 0x48, 0x0F, 0x6E, 0xC0];
+const MOVQ_XMM1_RCX: [u8; 5] = [0x66, 0x48, 0x0F, 0x6E, 0xC9];
+const MOVQ_RAX_XMM0: [u8; 5] = [0x66, 0x48, 0x0F, 0x7E, 0xC0];
+
+/// rax = rax op rcx for a float operation (both bit patterns of doubles);
+/// a comparison leaves its flags instead, and gives the setcc opcode that
+/// reads them (Eq and Ne, which need two flags, give 0 or 1 in rax and
+/// None). Only rax, rcx, xmm0 and xmm1 are touched (and, for FRem, the x87
+/// and 16 bytes below rsp).
+pub(super) fn float_compare(a: &mut Asm, b: BinOp) -> Option<u8> {
+    if b == BinOp::FRem {
+        // the x87's partial remainder until it is complete: exact
+        a.e(&[0x48, 0x83, 0xEC, 0x10, 0x48, 0x89, 0x04, 0x24, 0x48, 0x89, 0x4C, 0x24, 0x08]); // sub rsp, 16; mov [rsp], rax; mov [rsp+8], rcx
+        a.e(&[0xDD, 0x44, 0x24, 0x08, 0xDD, 0x04, 0x24]); // fld qword [rsp+8]; fld qword [rsp]
+        a.e(&[0xD9, 0xF8, 0xDF, 0xE0, 0xF6, 0xC4, 0x04, 0x75, 0xF7]); // again: fprem; fnstsw ax; test ah, 4; jnz again
+        a.e(&[0xDD, 0xD9, 0xDD, 0x1C, 0x24, 0x48, 0x8B, 0x04, 0x24, 0x48, 0x83, 0xC4, 0x10]); // fstp st1; fstp qword [rsp]; mov rax, [rsp]; add rsp, 16
+        return None;
+    }
+    a.e(&MOVQ_XMM0_RAX);
+    a.e(&MOVQ_XMM1_RCX);
+    let op = match b {
+        BinOp::FAdd => 0x58,
+        BinOp::FMul => 0x59,
+        BinOp::FSub => 0x5C,
+        BinOp::FDiv => 0x5E,
+        // a < b is b above a: an unordered pair is never above
+        BinOp::FLt | BinOp::FLe => {
+            a.e(&[0x66, 0x0F, 0x2E, 0xC8]); // ucomisd xmm1, xmm0
+            return Some(if b == BinOp::FLt { 0x97 } else { 0x93 });
+        }
+        BinOp::FGt | BinOp::FGe => {
+            a.e(&[0x66, 0x0F, 0x2E, 0xC1]); // ucomisd xmm0, xmm1
+            return Some(if b == BinOp::FGt { 0x97 } else { 0x93 });
+        }
+        BinOp::FEq | BinOp::FNe => {
+            a.e(&[0xF2, 0x0F, 0xC2, 0xC1, if b == BinOp::FEq { 0 } else { 4 }]); // cmpsd xmm0, xmm1, eq or neq
+            a.e(&MOVQ_RAX_XMM0);
+            a.e(&[0x83, 0xE0, 0x01]); // and eax, 1
+            return None;
+        }
+        _ => unreachable!("{b:?} is not a float's"),
+    };
+    a.e(&[0xF2, 0x0F, op, 0xC1]); // addsd (mulsd, subsd, divsd) xmm0, xmm1
+    a.e(&MOVQ_RAX_XMM0);
+    None
+}
+
+/// rax = op rax for a float operation; only rax and xmm0 are touched (so a
+/// fast path may use it while the parameters are still in their registers).
+pub(super) fn float_un(a: &mut Asm, u: UnOp) {
+    match u {
+        UnOp::FNeg => a.e(&[0x48, 0x0F, 0xBA, 0xF8, 0x3F]), // btc rax, 63
+        UnOp::FAbs => a.e(&[0x48, 0x0F, 0xBA, 0xF0, 0x3F]), // btr rax, 63
+        UnOp::FromInt => a.e(&[0x0F, 0x57, 0xC0, 0xF2, 0x48, 0x0F, 0x2A, 0xC0]), // xorps xmm0, xmm0; cvtsi2sd xmm0, rax
+        UnOp::FromInt32 => a.e(&[0x0F, 0x57, 0xC0, 0xF3, 0x48, 0x0F, 0x2A, 0xC0, 0xF3, 0x0F, 0x5A, 0xC0]), // cvtsi2ss; cvtss2sd
+        UnOp::FSqrt => a.e(&[0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF2, 0x0F, 0x51, 0xC0]), // movq xmm0, rax; sqrtsd xmm0, xmm0
+        UnOp::ToF32 => a.e(&[0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF2, 0x0F, 0x5A, 0xC0, 0xF3, 0x0F, 0x5A, 0xC0]), // cvtsd2ss; cvtss2sd
+        UnOp::ToInt => {
+            a.e(&MOVQ_XMM0_RAX);
+            a.e(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]); // cvttsd2si rax, xmm0
+            return;
+        }
+        UnOp::ToInt32 => {
+            a.e(&MOVQ_XMM0_RAX);
+            a.e(&[0xF2, 0x0F, 0x2C, 0xC0, 0x48, 0x63, 0xC0]); // cvttsd2si eax, xmm0; movsxd rax, eax
+            return;
+        }
+        _ => unreachable!("{u:?} is not a float's"),
+    }
+    if !matches!(u, UnOp::FNeg | UnOp::FAbs) {
+        a.e(&MOVQ_RAX_XMM0);
+    }
+}
+
 /// movsx r, r (the low n bits of r, sign-extended).
 pub(super) fn sext_reg(a: &mut Asm, r: u8, n: u8) {
     let rex = 0x48 | ((r >> 3) & 1) << 2 | ((r >> 3) & 1);
@@ -572,6 +662,15 @@ pub(super) fn fail_here(a: &mut Asm, code: u8, msg: &[u8]) {
     a.reloc(Target::Data(msg.to_vec()));
     a.e(&[0x48, 0xC7, 0xC2]); // mov rdx, len
     a.d32(msg.len() as i32);
+    a.e(&[0x41, 0xB8, code, 0, 0, 0]); // mov r8d, code
+    a.call("rt.fail");
+    a.e(&[0xCC]);
+}
+
+/// Op::FailMem with the message in rcx and its length in rdx: aligned,
+/// then rt.fail, which does not come back.
+pub(super) fn fail_mem(a: &mut Asm, code: u8) {
+    a.e(&[0x48, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20]); // and rsp, -16; sub rsp, 32
     a.e(&[0x41, 0xB8, code, 0, 0, 0]); // mov r8d, code
     a.call("rt.fail");
     a.e(&[0xCC]);

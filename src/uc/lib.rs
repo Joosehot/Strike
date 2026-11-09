@@ -10,9 +10,47 @@
 //! the length, the capacity), so a copy of a slice is a copy of its address,
 //! as Go copies the three words. A C or Go array is the address of its
 //! elements.
+//!
+//! What floats need beyond single operations (printing them, and Python's
+//! // and % of them) is written in C instead, in floats.c, and compiled by
+//! Strike's own C description into the same IR.
 
 use super::ir::{BinOp, Func, Op, ALLOC};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+
+/// The float library, in the C that Strike compiles.
+const FLOATS_C: &str = include_str!("floats.c");
+
+/// The float library lowered once by the C description: its functions by
+/// their library names (floats.c's `py_repr` is lib.py_repr).
+fn float_library() -> &'static HashMap<String, Func> {
+    static LIB: OnceLock<HashMap<String, Func>> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let mut c = super::languages().expect("the built-in descriptions read").into_iter().find(|l| l.name == "C").expect("C is a built-in description");
+        // the library's own fmod, exact (the x87's partial remainder); a C
+        // program's fmod would be the UCRT's, which is not this one
+        c.builtins.insert("fmod".into(), "fmod".into());
+        let toks = super::lex::lex(FLOATS_C, &c).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.0, e.1));
+        let prog = super::parse::parse(&toks, &c).unwrap_or_else(|f| panic!("floats.c:{}: {}", f.line, f.message));
+        let low = super::lower::lower(&prog, &c).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.0, e.1));
+        assert_eq!(low.globals, 0, "the float library keeps nothing between calls");
+        let rename = |s: &str| s.strip_prefix("u.").map(|n| format!("lib.{n}")).unwrap_or(s.to_string());
+        low.funcs
+            .into_iter()
+            .filter(|f| f.name != "u.main")
+            .map(|mut f| {
+                f.name = rename(&f.name);
+                for op in &mut f.code {
+                    if let Op::Call(s, _) = op {
+                        *s = rename(s);
+                    }
+                }
+                (f.name.clone(), f)
+            })
+            .collect()
+    })
+}
 
 /// Go's allocator's size classes (internal/runtime/gc/sizeclasses.go, Go
 /// 1.27): a slice that grows gets the capacity its new memory's class
@@ -81,7 +119,7 @@ pub fn make(printers: &BTreeMap<String, Printer>, basics: &std::collections::Has
         }
         let f = match printers.get(&name) {
             Some(p) => print(&name, p),
-            None => basic(&name).unwrap_or_else(|| panic!("no library function {name}")),
+            None => basic(&name).or_else(|| float_library().get(&name).cloned()).unwrap_or_else(|| panic!("no library function {name}")),
         };
         for op in &f.code {
             if let Op::Call(c, _) = op {
@@ -340,14 +378,24 @@ pub struct Printer {
 pub enum Elem {
     Int,
     Bool,
+    Float(FloatElem),
     /// a list or slice: the element's own printer; true where the element
     /// is held in place (an array), not by its address
     Nested(String, bool),
 }
 
+/// How a float element prints: Python's repr, or Go's %v (a float32's own
+/// shortest digits); the digits are made in the float buffer (global buf).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatElem {
+    pub f32: bool,
+    pub repr: bool,
+    pub buf: u32,
+}
+
 fn print(name: &str, p: &Printer) -> Func {
     use BinOp::*;
-    // slots: 0 the container, 1 i, 2 n, 3 data
+    // slots: 0 the container, 1 i, 2 n, 3 data, 4 a float element
     let mut b = B::new();
     let (top, end, first) = (b.label(), b.label(), b.label());
     match (p.array, p.list) {
@@ -377,6 +425,15 @@ fn print(name: &str, p: &Printer) -> Func {
             b.o(&[call(f, 1), Op::Pop]);
         }
         Elem::Int => b.o(&[Op::LoadM(p.width), Op::PrintInt]),
+        Elem::Float(f) => {
+            b.o(&[Op::LoadM(8), Op::Store(4), Op::AddrG(f.buf), Op::Load(4)]);
+            if f.repr {
+                b.o(&[Op::AddrG(f.buf), call("lib.py_repr", 2)]);
+            } else {
+                b.o(&[Op::Push(f.f32 as i64), Op::Push(b'g' as i64), Op::Push(-1), Op::Push(1), Op::AddrG(f.buf), call("lib.fmt_float", 6)]);
+            }
+            b.o(&[Op::PrintMem]);
+        }
         Elem::Bool => {
             let (yes, no) = p.words.clone().unwrap_or((b"1".to_vec(), b"0".to_vec()));
             let (other, done) = (b.label(), b.label());
@@ -384,7 +441,7 @@ fn print(name: &str, p: &Printer) -> Func {
         }
     }
     b.o(&[Op::Load(1), Op::Push(1), Op::Bin(Add), Op::Store(1), Op::Jmp(top), Op::Label(end), Op::PrintStr(p.close.clone()), Op::Push(0), Op::Ret]);
-    b.done(name, 1, 4)
+    b.done(name, 1, 5)
 }
 
 #[cfg(test)]

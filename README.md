@@ -110,10 +110,11 @@ file, not a new compiler. There are three today: C, Go and Python.
 
 ### What it compiles today
 
-Integers and truth values, functions and recursion, if/else, while, for,
-Python's `range`, break and continue, printing (print, Println, puts,
-and printf with `%d`, `%s` and `%v`), global variables, and whole numbers
-read from standard input.
+Integers, floats and truth values, functions and recursion, if/else,
+while, for, Python's `range`, break and continue, printing (print,
+Println, puts, and printf with `%d`, `%s`, `%v`, `%f`, `%e` and `%g`),
+arrays, lists and slices, global variables, and whole numbers read from
+standard input.
 
 - **Globals.** C's and Go's variables outside functions get their first
   values before main runs. Python's module names are read by functions, and
@@ -139,14 +140,86 @@ Integers are exactly what each language says they are:
   number would leave 64 bits, the program stops with exit code 1 and a
   message on standard error. It never goes on with a wrong number.
 
+### Floats
+
+A float is carried in the IR as its 64 bits, so the IR is still a stack
+of 64-bit values. The float operations are their own operations (`FAdd`,
+`FSub`, `FMul`, `FDiv`, `FRem`, the comparisons, `FNeg`, `FAbs`, `FSqrt`,
+and the conversions `FromInt`, `FromInt32`, `ToF32`, `ToInt`, `ToInt32`).
+The generators do them with SSE2: `addsd`, `ucomisd`, `cvtsi2sd`,
+`cvttsd2si`, `sqrtsd`. `FRem` (Python's `%` needs C's `fmod`) uses the
+x87's `fprem`, which is exact. The optimizing generator keeps a float in
+xmm2 to xmm5 until something else needs it, and loads an array element a
+float operation will use straight into one.
+
+Folding and the IR runner work a float out bit for bit as the machine
+does, including which NaN comes out: the first NaN that comes in, quieted,
+or the machine's own NaN (negative, `-nan(ind)` to the UCRT) for an
+invalid operation. Floats are never reassociated, and no pass treats
+`x + 0.0` as `x`. A float expression may still move out of a loop, which
+changes nothing.
+
+Each language's floats are its own:
+
+- **C:** `double` is 64 bits and `float` is 32 (`1.5f`). A float32 is held
+  as the double of the same value, and every operation on float32s is
+  rounded back to float32. This is exact, because a double has enough bits
+  that the double rounding cannot change the result. Whole numbers are
+  made floats by the usual arithmetic conversions, and `(double)x` and
+  `(int)d` are casts. `sqrt` and `fabs` are there.
+- **Go:** `float64` and `float32` are never mixed with each other or with
+  ints without a conversion. A constant takes the type it meets, and Go's
+  constants are exact numbers. An operation on two constants is taken only
+  where Strike can be exact: the operands are exact as doubles, so the one
+  rounding is Go's (`1.0/3.0`). A further operation is taken only on a
+  result that is exact too. So `0.1 + 0.2`, which Go makes 0.3, is
+  refused. `math.Sqrt` and `math.Abs` are there.
+- **Python:** `/` is true division. `//` and `%` of floats are CPython's
+  own algorithm. A whole number meeting a float becomes one, but a
+  comparison between them is exact, as Python's is
+  (`9007199254740993 > 9007199254740992.0` is True). A division by zero
+  stops with ZeroDivisionError. `int()` of NaN or of an infinity stops
+  with Python's ValueError or OverflowError, and of a float past 64 bits
+  with Strike's own stop. `math.sqrt` of a negative number gives Python's
+  ValueError and its message. A division of two whole numbers past 2^53,
+  which a double cannot hold exactly, stops instead of guessing.
+
+Printing is exact, with no tables and no approximation. It is written in
+C, in [src/uc/floats.c](src/uc/floats.c), in the C that Strike compiles,
+and Strike's own C description lowers it into IR like the program's own
+code. A double is m * 2^e, which is a whole number of decimal digits times
+a power of ten. Those digits are worked out with big numbers in limbs of
+10^9.
+
+- **Shortest** (Python's repr, Go's %v, and a float32's own for Go): the
+  fewest digits that lie between the halfway points to the two neighbours,
+  the points themselves allowed when m is even. Of those, the nearest
+  digits are taken, half to even.
+- **%f, %e, %g** with any precision up to 100: the exact digits rounded
+  half to even, as the UCRT's printf and Go's strconv do. NaN and the
+  infinities print as each one writes them: `-nan(ind)`, `nan(snan)` and
+  `INF` for the UCRT, `NaN` and `+Inf` for Go.
+
+floats.c is real C too. clang compiled it first, and it was checked
+against printf, Go and Python on 10,095 doubles (all the powers of 2 and
+10, random bit patterns, random decimals, subnormals, halfway cases):
+504,750 printf results, 353,325 Go Printf results, every repr, and every
+%v of float64 and float32 were all the same.
+
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
-- strings as values, arrays, floats, structs, pointers, `unsigned` and
-  `uint`;
+- strings as values, structs, pointers, `unsigned` and `uint`;
 - a chained comparison in Python;
 - a function whose value is used but which can end without one;
-- a Python variable that changes between a number and a truth value.
+- a Python variable or parameter that changes between a number and a truth
+  value, or between a whole number and a float (`x = 0` then
+  `x += 0.5`), and a list that holds both;
+- a Go constant expression that Strike cannot work out exactly
+  (`0.1 + 0.2`), and a constant that overflows its float type;
+- C's `long double`, `%` on a float, a printf width or flag (`%8.3f`), a
+  precision above 100, and reading a float with scanf;
+- Python's `math` functions other than `sqrt`, and `round`.
 
 ### How it is checked
 
@@ -174,7 +247,15 @@ the line and the reason, and never guessed. Refused today:
   loop for 300 random polynomials, with overflow.
 - Globals and input are checked against clang, Go and Python with the
   same input, in every mode, and Python's input errors one by one.
-- 41 tests in all, in about 25 s.
+- Floats have a suite in each language (tests/uc/floats.*), in every mode.
+  400 doubles are printed in every format each language has
+  (tests/uc/floatprint.*, written by
+  [tools/float_values.py](tools/float_values.py)): ten printf formats each
+  in C, Println, Printf and float32 in Go, and repr in Python. Python's
+  float stops are checked one by one. The 100 random C programs have float
+  functions too, with every float operator, both conversions, NaN, the
+  infinities and both zeros, and they print every result's bits.
+- 50 tests in all, in about 35 s.
 
 The tests have found real bugs, all fixed:
 
@@ -283,11 +364,21 @@ computes the same numbers.
 | invariant loops | 0.0275 s | 0.0260 s | 0.028 s | 6% slower |
 | a sum loop | 0.0047 s | 0.0053 s | 0.042 s | as fast (both closed it) |
 
-On these five, Strike's code is as fast as clang -O2's, and some are
-faster. The calls benchmark is a C `long` loop. It cuts each result to 32
-bits, because C's `long` is 32 bits on Windows. clang does not cut,
-because signed overflow is undefined in C. Proving that no overflow can
-happen, and so leaving the cut out, would win that back.
+| n-body, 5 bodies, 1 million steps (doubles) | 0.144 s | 0.054 s | not measured | 2.7 times as slow |
+
+On the five integer benchmarks, Strike's code is as fast as clang -O2's,
+and some are faster. The calls benchmark is a C `long` loop. It cuts each
+result to 32 bits, because C's `long` is 32 bits on Windows. clang does
+not cut, because signed overflow is undefined in C. Proving that no
+overflow can happen, and so leaving the cut out, would win that back.
+
+Floats are not there yet. In the n-body benchmark both print the same
+energies. Strike was 4.9 times as slow as clang at first (0.26 s), when
+every float went through a general register. Keeping floats in xmm
+registers and loading elements straight into them brought that to 2.7
+times. The rest is mostly float locals: they live in general registers
+(HotMotor's choice of registers knows no xmm yet), so each use is a
+`movq` there and back, where clang keeps them in xmm registers.
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds
@@ -300,7 +391,9 @@ are planned:
 
 1. Arrays and strings, with a heap and an allocator under them (then
    command-line arguments, which are strings).
-2. Floats.
+2. More of floats: xmm registers for float locals (HotMotor choosing
+   them as it chooses the general ones), reading floats from input, and
+   more of each language's math library.
 3. Structs and classes.
 4. Several files and modules, and C's preprocessor. Today a `#` line is
    skipped. It must become a preprocessor, or be refused.

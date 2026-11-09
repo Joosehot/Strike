@@ -82,6 +82,10 @@ pub struct Done {
 
 fn bin(op: BinOp, a: i64, b: i64) -> Option<i64> {
     use BinOp::*;
+    // floats bit for bit as the machine works them out
+    if let Some(r) = op.float_eval(a, b) {
+        return Some(r);
+    }
     // a checked operation that does not fit: the program stops there,
     // which only the program itself can do
     if let Some(r) = op.checked_eval(a, b) {
@@ -214,6 +218,7 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                     UnOp::Not => (x == 0) as i64,
                     UnOp::Bnot => !x,
                     UnOp::NegOv => x.checked_neg()?,
+                    u => u.float_eval(x)?,
                 });
             }
             Op::Dup => stack.push(*stack.last()?),
@@ -236,7 +241,7 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 m.store(a, *w, v)?;
             }
             // a program that stops so must stop so when it runs
-            Op::Fail(..) => return None,
+            Op::Fail(..) | Op::FailMem(_) => return None,
             Op::Sext(n) => {
                 let x = stack.pop()?;
                 stack.push(super::ir::sext(x, *n));
@@ -261,6 +266,14 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 output.extend_from_slice(v.to_string().as_bytes());
             }
             Op::PrintStr(s) => output.extend_from_slice(s),
+            Op::PrintMem => {
+                let n = usize::try_from(stack.pop()?).ok()?;
+                let a = stack.pop()?;
+                if n > lim.max_output {
+                    return None;
+                }
+                output.extend_from_slice(m.place(a, n)?);
+            }
             Op::Call(sym, 1) if sym == ALLOC => {
                 let n = usize::try_from(stack.pop()?).ok()?.checked_add(15)? & !15;
                 let heap = &mut m.regions[1];

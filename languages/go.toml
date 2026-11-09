@@ -15,7 +15,7 @@ end_after = [")", "]", "}", "++", "--", "return", "break", "continue"]
 scope = "block"
 entry = "main"
 param_name = "first"
-type_words = ["int", "int64", "int32", "int16", "int8", "bool", "uint", "uint64", "uint32", "uint16", "uint8", "byte"]
+type_words = ["int", "int64", "int32", "int16", "int8", "bool", "uint", "uint64", "uint32", "uint16", "uint8", "byte", "float64", "float32"]
 chained_comparisons = "allow"
 bool_print = ["true", "false"]
 # Go's integers wrap at their own width; a literal takes the width of what
@@ -25,6 +25,19 @@ literals = "untyped"
 index_error = [2, "panic: runtime error: index out of range\n"]
 composite_literals = true
 list_print = ["[", " ", "]"]
+# floats: float64 and float32, never mixed with each other or with ints
+# without a conversion; a constant takes the type it meets. Println prints
+# a float as %v does.
+float_print = "shortest"
+printf_floats = "go"
+
+[float_widths]
+float64 = 64
+float32 = 32
+
+[qualified]
+"math.Sqrt" = "sqrt"
+"math.Abs" = "fabs"
 
 [builtins]
 len = "len"
@@ -78,7 +91,7 @@ pattern = "package $name $end"
 [[form]]
 kind = "ignore"
 place = "top"
-pattern = "import [ $str | ( $str ) ] $end"
+pattern = "import [ $str | ( $str [ $str [ $str ] ] ) ] $end"
 
 [[form]]
 kind = "function"

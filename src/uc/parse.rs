@@ -5,12 +5,15 @@
 
 use super::ir::{BinOp, UnOp};
 use super::lang::{Cap, End, Form, Kind, Lang, Pat, Place, Style};
-use super::lex::{Tok, T};
+use super::lex::{FloatLit, Tok, T};
 
 #[derive(Clone, Debug)]
 pub enum Expr {
     /// a number; true when it is a truth value (True, false)
     Num(i64, bool),
+    Float(FloatLit),
+    /// (type) value: C's cast, the type's words
+    Cast(Vec<String>, Box<Expr>, u32),
     Str(Vec<u8>),
     Var(String, u32),
     Call(String, Vec<Expr>, u32),
@@ -167,6 +170,7 @@ impl<'a> P<'a> {
             let got = match self.peek() {
                 T::Ident(s) => format!("`{s}`"),
                 T::Num(n) => format!("{n}"),
+                T::Float(f) => format!("{}", f64::from_bits(f.bits)),
                 T::Str(_) => "a string".into(),
                 T::Punct(p) => format!("`{p}`"),
                 T::End => "the end of the line".into(),
@@ -641,7 +645,7 @@ impl<'a> P<'a> {
                     let Some(i) = lo else { return self.miss("an index") };
                     e = Expr::Index(Box::new(e), i, line);
                 }
-            } else if !self.l.methods.is_empty() && self.text() == Some(".") {
+            } else if (!self.l.methods.is_empty() || !self.l.qualified.is_empty()) && self.text() == Some(".") {
                 self.i += 1;
                 let name = match self.peek().clone() {
                     T::Ident(s) => {
@@ -721,6 +725,21 @@ impl<'a> P<'a> {
         }
     }
 
+    /// Does a cast begin here: `(`, type words (and `*`), `)`?
+    fn cast_ahead(&self) -> bool {
+        let mut j = self.i + 1;
+        let mut words = 0;
+        while let Some(T::Ident(s) | T::Punct(s)) = self.t.get(j).map(|t| &t.t) {
+            if self.l.type_words.contains(s) || s == "*" {
+                words += 1;
+                j += 1;
+            } else {
+                return words > 0 && s == ")";
+            }
+        }
+        false
+    }
+
     /// An expression whose operators bind at least as tight as `min`. The
     /// flag says it is a comparison not in parentheses (for languages where
     /// a < b < c is not what C makes of it).
@@ -732,9 +751,22 @@ impl<'a> P<'a> {
                 self.i += 1;
                 (Expr::Num(n, false), false)
             }
+            T::Float(f) => {
+                self.i += 1;
+                (Expr::Float(f), false)
+            }
             T::Str(s) => {
                 self.i += 1;
                 (Expr::Str(s), false)
+            }
+            // C's (type) value: type words, and nothing else, up to the `)`
+            T::Punct(p) if p == "(" && l.casts && self.cast_ahead() => {
+                self.i += 1;
+                let ty = self.ty()?;
+                self.expect(")")?;
+                let p = l.unary.values().map(|u| u.0).max().unwrap_or(0);
+                let (e, _) = self.expr(p)?;
+                (Expr::Cast(ty, Box::new(e), line), false)
             }
             T::Punct(p) if p == "(" => {
                 self.i += 1;

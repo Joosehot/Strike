@@ -22,7 +22,7 @@ statement_end = ";"
 scope = "block"
 entry = "main"
 param_name = "last"
-type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "const", "int64_t", "int32_t"]
+type_words = ["int", "long", "short", "char", "void", "unsigned", "signed", "bool", "_Bool", "static", "const", "int64_t", "int32_t", "double", "float"]
 chained_comparisons = "allow"
 bool_print = []
 # integers as clang makes them on Windows (x86-64): long is 32 bits there.
@@ -34,6 +34,21 @@ literals = "typed"
 # {1, 2, 3} gives an array its first values; an index is not checked,
 # as C does not check it
 brace_lists = true
+# floats: a double is 64 bits and a float 32 (1.5f is one); arithmetic with
+# a whole number makes it a float, and (double)x converts. printf's %f, %e
+# and %g print NaN and the infinities as the UCRT does. long double is
+# refused.
+float_suffixes = ["f", "F"]
+casts = true
+printf_floats = "ucrt"
+
+[float_widths]
+double = 64
+float = 32
+
+[builtins]
+sqrt = "sqrt"
+fabs = "fabs"
 
 [int_widths]
 int = 32

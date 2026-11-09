@@ -13,7 +13,7 @@ statement_end = "newline"
 scope = "function"
 entry = "toplevel"
 param_name = "first"
-type_words = ["int", "bool"]
+type_words = ["int", "bool", "float"]
 chained_comparisons = "error"
 # Python's integers have no upper bound; Strike's are 64 bits, so where a
 # number would not fit the program stops with an error, never wrapping
@@ -28,9 +28,21 @@ comprehensions = true
 negative_index = true
 index_error = [1, "IndexError: list index out of range\n"]
 list_print = ["[", ", ", "]"]
+# floats: a double; a whole number meeting one is made one (compared
+# exactly, though), / is true division, and a division by zero stops the
+# program as ZeroDivisionError does. print shows a float by its repr.
+float_print = "repr"
+zero_division = [1, "ZeroDivisionError: division by zero\n"]
+
+[float_widths]
+float = 64
+
+[qualified]
+"math.sqrt" = "py_sqrt"
 
 [builtins]
 len = "len"
+abs = "abs"
 
 [methods]
 append = "list_append"
@@ -57,6 +69,7 @@ False = 0
 "+" = [9, "add"]
 "-" = [9, "sub"]
 "*" = [10, "mul"]
+"/" = [10, "div_true"]
 "//" = [10, "div_floor"]
 "%" = [10, "mod_floor"]
 
@@ -65,6 +78,11 @@ False = 0
 "-" = [11, "neg"]
 "+" = [11, "plus"]
 "~" = [11, "bnot"]
+
+[[form]]
+kind = "ignore"
+place = "top"
+pattern = "import $name $end"
 
 [[form]]
 kind = "function"
@@ -132,6 +150,11 @@ pattern = "$place -= $expr $end"
 kind = "assign"
 op = "mul"
 pattern = "$place *= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "div_true"
+pattern = "$place /= $expr $end"
 
 [[form]]
 kind = "assign"
