@@ -2275,7 +2275,7 @@ impl Fx<'_, '_> {
                 let t = self.value(x)?;
                 let from = self.last_w;
                 let numbers = e.scalar() && t.scalar() && (*e == Ty::Float || t == Ty::Float || !self.sh.bools);
-                if unify(e, &t).is_none() && !numbers {
+                if unify(e, &t).is_none() && !numbers && !decays(&t, e) {
                     return self.err(format!("an element is {}, given {}", e.describe(), t.describe()));
                 }
                 self.put(at, e, w, &t, from)
@@ -2431,7 +2431,7 @@ impl Fx<'_, '_> {
                     (t, self.last_w)
                 }
             };
-            self.elem_kind(&target, &e, &t)?;
+            self.elem_kind(target, &e, &t)?;
             if e.whole() && t.whole() {
                 if from == 0 {
                     self.narrow(w, from)?;
@@ -2467,7 +2467,7 @@ impl Fx<'_, '_> {
                         (t, self.last_w)
                     }
                 };
-                self.elem_kind(&target, &e, &t)?;
+                self.elem_kind(target, &e, &t)?;
                 self.put(a, &e, w, &t, from)
             }
             Some(op) => {
@@ -2502,7 +2502,7 @@ impl Fx<'_, '_> {
     fn elem_kind(&mut self, c: &Expr, e: &Ty, t: &Ty) -> Result<(), E> {
         // a typed language converts a number to its element's type (or
         // refuses it) where it is stored
-        if unify(e, t).is_some() || (e.scalar() && t.scalar() && (!self.sh.bools || self.typed())) {
+        if unify(e, t).is_some() || decays(t, e) || (e.scalar() && t.scalar() && (!self.sh.bools || self.typed())) {
             if let Expr::Var(n, _) = c {
                 if let Some((_, ct @ Ty::List(_))) = self.lookup(n) {
                     let _ = ct;

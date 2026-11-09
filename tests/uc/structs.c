@@ -215,5 +215,14 @@ int main() {
     grid.cells[0][1].b = 'q';
     printf("%d %d %d %d %c %d %d\n", grid.cells[0][0].a, grid.cells[0][1].a, grid.cells[1][0].a, grid.n, grid.cells[0][1].b, grid.cells[1][2].a, other.cells[1][2].a);
     printf("%zu %zu %d\n", sizeof(ps) / sizeof(ps[0]), sizeof p.name, (int)(sizeof(grid.cells) / sizeof(grid.cells[0][0])));
+
+    /* a char pointer field points at an array, which it sees change */
+    char buf[8] = "abc";
+    struct Rec lr = {'l', 1, 2, 3, buf};
+    buf[0] = 'x';
+    printf("%s %c\n", lr.label, lr.label[2]);
+    lr.label = "lit";
+    grecs[1].label = buf;
+    printf("%s %s %zu\n", lr.label, grecs[1].label, strlen(grecs[1].label));
     return 0;
 }

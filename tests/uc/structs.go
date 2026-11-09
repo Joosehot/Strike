@@ -263,4 +263,19 @@ func main() {
 	copied.Cents = 5
 	toFirst.Cents += 1
 	fmt.Println(first, copied, made.Name, made.Y, pair, *toFirst)
+
+	// a range variable whose address is taken is new each time round
+	// (Go 1.22), and an element's address is the element's
+	var rps []*Inner
+	for _, v := range ins {
+		v.A *= 10
+		rps = append(rps, &v)
+	}
+	fmt.Println(ins, *rps[0], *rps[1])
+	var eps []*Inner
+	for i := range arr {
+		eps = append(eps, &arr[i])
+	}
+	eps[0].A = 60
+	fmt.Println(arr, *eps[0])
 }

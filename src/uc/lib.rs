@@ -378,8 +378,12 @@ pub struct Printer {
     /// a struct (Go's {1 2 hi}): each field's offset, how it prints, its
     /// width, and what comes before it (its name and a colon for %+v);
     /// then the container above is not read
-    pub fields: Option<Vec<(u64, Elem, u8, Vec<u8>)>>,
+    pub fields: Option<Vec<FieldPrint>>,
 }
+
+/// A struct's field as its printer prints it: its offset, how, its width,
+/// and the text before it.
+pub type FieldPrint = (u64, Elem, u8, Vec<u8>);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Elem {
