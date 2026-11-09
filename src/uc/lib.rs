@@ -375,7 +375,15 @@ pub struct Printer {
     pub sep: Vec<u8>,
     pub close: Vec<u8>,
     pub words: Option<(Vec<u8>, Vec<u8>)>,
+    /// a struct (Go's {1 2 hi}): each field's offset, how it prints, its
+    /// width, and what comes before it (its name and a colon for %+v);
+    /// then the container above is not read
+    pub fields: Option<Vec<FieldPrint>>,
 }
+
+/// A struct's field as its printer prints it: its offset, how, its width,
+/// and the text before it.
+pub type FieldPrint = (u64, Elem, u8, Vec<u8>);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Elem {
@@ -387,6 +395,8 @@ pub enum Elem {
     Nested(String, bool),
     /// a string: true where it is shown as Python's repr, false as it is
     Str(bool),
+    /// a Python object: the method that makes its text (its __repr__)
+    Repr(String),
 }
 
 /// How a float element prints: Python's repr, or Go's %v (a float32's own
@@ -398,10 +408,53 @@ pub struct FloatElem {
     pub buf: u32,
 }
 
+/// Prints the element whose address is on top, as `e` says.
+fn element(b: &mut B, e: &Elem, width: u8, words: &Option<(Vec<u8>, Vec<u8>)>) {
+    match e {
+        Elem::Nested(f, inline) => {
+            if !inline {
+                b.o(&[Op::LoadM(8)]);
+            }
+            b.o(&[call(f, 1), Op::Pop]);
+        }
+        Elem::Int => b.o(&[Op::LoadM(width), Op::PrintInt]),
+        Elem::Float(f) => {
+            b.o(&[Op::LoadM(8), Op::Store(4), Op::AddrG(f.buf), Op::Load(4)]);
+            if f.repr {
+                b.o(&[Op::AddrG(f.buf), call("lib.float.py_repr", 2)]);
+            } else {
+                b.o(&[Op::Push(f.f32 as i64), Op::Push(b'g' as i64), Op::Push(-1), Op::Push(1), Op::AddrG(f.buf), call("lib.float.fmt_float", 6)]);
+            }
+            b.o(&[Op::PrintMem]);
+        }
+        Elem::Str(repr) => b.o(&[Op::LoadM(8), call(if *repr { "lib.py_repr_print" } else { "lib.str_print" }, 1), Op::Pop]),
+        Elem::Repr(f) => b.o(&[Op::LoadM(8), call(f, 1), call("lib.str_print", 1), Op::Pop]),
+        Elem::Bool => {
+            let (yes, no) = words.clone().unwrap_or((b"1".to_vec(), b"0".to_vec()));
+            let (other, done) = (b.label(), b.label());
+            b.o(&[Op::LoadM(width), Op::Jz(other), Op::PrintStr(yes), Op::Jmp(done), Op::Label(other), Op::PrintStr(no), Op::Label(done)]);
+        }
+    }
+}
+
 fn print(name: &str, p: &Printer) -> Func {
     use BinOp::*;
     // slots: 0 the container, 1 i, 2 n, 3 data, 4 a float element
     let mut b = B::new();
+    if let Some(fields) = &p.fields {
+        b.o(&[Op::PrintStr(p.open.clone())]);
+        for (k, (off, e, width, label)) in fields.iter().enumerate() {
+            let mut text = if k > 0 { p.sep.clone() } else { Vec::new() };
+            text.extend_from_slice(label);
+            if !text.is_empty() {
+                b.o(&[Op::PrintStr(text)]);
+            }
+            b.at(0, *off as i64);
+            element(&mut b, e, *width, &p.words);
+        }
+        b.o(&[Op::PrintStr(p.close.clone()), Op::Push(0), Op::Ret]);
+        return b.done(name, 1, 5);
+    }
     let (top, end, first) = (b.label(), b.label(), b.label());
     match (p.array, p.list) {
         (Some(n), _) => b.o(&[Op::Push(n as i64), Op::Store(2), Op::Load(0), Op::Store(3)]),
@@ -422,30 +475,7 @@ fn print(name: &str, p: &Printer) -> Func {
     b.o(&[Op::Label(top), Op::Load(1), Op::Load(2), Op::Bin(Lt), Op::Jz(end)]);
     b.o(&[Op::Load(1), Op::Jz(first), Op::PrintStr(p.sep.clone()), Op::Label(first)]);
     b.o(&[Op::Load(3), Op::Load(1), Op::Push(p.stride as i64), Op::Bin(Mul), Op::Bin(Add)]);
-    match &p.elem {
-        Elem::Nested(f, inline) => {
-            if !inline {
-                b.o(&[Op::LoadM(8)]);
-            }
-            b.o(&[call(f, 1), Op::Pop]);
-        }
-        Elem::Int => b.o(&[Op::LoadM(p.width), Op::PrintInt]),
-        Elem::Float(f) => {
-            b.o(&[Op::LoadM(8), Op::Store(4), Op::AddrG(f.buf), Op::Load(4)]);
-            if f.repr {
-                b.o(&[Op::AddrG(f.buf), call("lib.float.py_repr", 2)]);
-            } else {
-                b.o(&[Op::Push(f.f32 as i64), Op::Push(b'g' as i64), Op::Push(-1), Op::Push(1), Op::AddrG(f.buf), call("lib.float.fmt_float", 6)]);
-            }
-            b.o(&[Op::PrintMem]);
-        }
-        Elem::Str(repr) => b.o(&[Op::LoadM(8), call(if *repr { "lib.py_repr_print" } else { "lib.str_print" }, 1), Op::Pop]),
-        Elem::Bool => {
-            let (yes, no) = p.words.clone().unwrap_or((b"1".to_vec(), b"0".to_vec()));
-            let (other, done) = (b.label(), b.label());
-            b.o(&[Op::LoadM(p.width), Op::Jz(other), Op::PrintStr(yes), Op::Jmp(done), Op::Label(other), Op::PrintStr(no), Op::Label(done)]);
-        }
-    }
+    element(&mut b, &p.elem, p.width, &p.words);
     b.o(&[Op::Load(1), Op::Push(1), Op::Bin(Add), Op::Store(1), Op::Jmp(top), Op::Label(end), Op::PrintStr(p.close.clone()), Op::Push(0), Op::Ret]);
     b.done(name, 1, 5)
 }

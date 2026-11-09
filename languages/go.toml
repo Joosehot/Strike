@@ -37,6 +37,20 @@ strings = "bytes"
 float64 = 64
 float32 = 32
 
+# structs: values held in place and copied when assigned, given or
+# returned (an array in one is copied too); &P{...} and &v make pointers
+# (what they point at lives on the heap, as Go's escape analysis puts it),
+# and p.X follows a pointer. Methods take the value or a pointer, which Go
+# takes of an addressable value by itself. P{1, 2} gives every field, P{X:
+# 1} the ones named. Println prints {1 2 hi}, &{1 2} and %+v {X:1 Y:2}.
+[records]
+model = "structs"
+type_intro = ["type"]
+address_of = "&"
+deref = "*"
+auto_deref = true
+keyed = ":"
+
 # pkg.name(...) of Go's own packages that Strike provides
 [qualified]
 "strconv.Itoa" = "itoa"
@@ -123,6 +137,17 @@ pattern = "import @spec $end"
 kind = "function"
 place = "top"
 pattern = "func $name ( $params ) [ $type ] $block"
+
+[[form]]
+kind = "method"
+place = "top"
+pattern = "func ( $params ) $name ( $params ) [ $type ] $block"
+
+[[form]]
+kind = "struct"
+place = "top"
+names = ["alias"]
+pattern = "type $name struct { $fields } $end"
 
 [[form]]
 kind = "var"
