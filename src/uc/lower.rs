@@ -3,17 +3,18 @@
 //! (Python's True, Go's true) the lowering follows which values are truth
 //! values, through variables, parameters and results, until nothing changes.
 //! A list, a slice or an array is the address of its memory (lib.rs says
-//! how each is laid out), and its kind is followed the same way. A float is
-//! its 64 bits (a float32 is held as the double of the same value), and
-//! each language's conversions between numbers and floats are made where
-//! it makes them: C's usual arithmetic conversions, Go's constants taking
-//! the type they meet (and nothing else), Python's whole numbers made
-//! floats in arithmetic but compared exactly.
+//! how each is laid out), and its kind is followed the same way; so is a
+//! string (strs.rs). A float is its 64 bits (a float32 is held as the
+//! double of the same value), and each language's conversions between
+//! numbers and floats are made where it makes them: C's usual arithmetic
+//! conversions, Go's constants taking the type they meet (and nothing
+//! else), Python's whole numbers made floats in arithmetic but compared
+//! exactly.
 //! Whatever Strike cannot yet do the way the language does is an error,
 //! never a guess.
 
 use super::ir::{BinOp, Func, Op, UnOp};
-use super::lang::{FloatPrint, Lang, Style};
+use super::lang::{FloatPrint, Lang, Strings, Style};
 use super::lex::FloatLit;
 use super::lib::{Elem, FloatElem, Printer, MAX_LEN};
 use super::parse::{Expr, FuncDef, Program, Stmt};
@@ -37,6 +38,8 @@ pub enum Ty {
     List(Box<Ty>),
     /// the elements of a Python list before any is seen
     Unknown,
+    /// a Python or Go string: the address of its length and its bytes
+    Str,
 }
 
 impl Ty {
@@ -70,7 +73,7 @@ impl Ty {
     /// the address of the empty header.)
     fn zero_is_not_zero(&self) -> bool {
         match self {
-            Ty::Slice(..) => true,
+            Ty::Slice(..) | Ty::Str => true,
             Ty::Arr(e, _, _) => e.zero_is_not_zero(),
             _ => false,
         }
@@ -85,7 +88,21 @@ impl Ty {
             Ty::Slice(..) => "a slice".into(),
             Ty::List(..) => "a list".into(),
             Ty::Unknown => "an element not yet known".into(),
+            Ty::Str => "a string".into(),
         }
+    }
+}
+
+/// The width of Go's byte (uint8): its values are 0 to 255, so a value
+/// going there is cut by masking, not by sign-extending.
+pub const U8: u8 = 0x88;
+
+/// The bits a width takes.
+fn bits(w: u8) -> u8 {
+    if w == U8 {
+        8
+    } else {
+        w
     }
 }
 
@@ -98,7 +115,7 @@ fn size(e: &Ty, w: u8) -> u64 {
         return 8;
     }
     if e.scalar() {
-        (w as u64 / 8).max(1)
+        (bits(w) as u64 / 8).max(1)
     } else {
         e.bytes()
     }
@@ -140,6 +157,7 @@ struct Sig {
     ret: Ty,
 }
 
+#[derive(Clone)]
 pub struct Lowered {
     pub funcs: Vec<Func>,
     pub entry: String,
@@ -166,7 +184,7 @@ fn symbol(name: &str) -> String {
 
 /// Every name a body assigns whole, in its blocks too (an element's
 /// assignment does not make a name the function's own).
-fn assigned_names(body: &[Stmt]) -> HashSet<String> {
+pub(super) fn assigned_names(body: &[Stmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     fn walk(body: &[Stmt], out: &mut HashSet<String>) {
         for s in body {
@@ -276,6 +294,16 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     walk(body, &mut out);
     out
+}
+
+/// Is the expression free of calls (nothing it does can change memory)?
+fn calls_nothing(e: &Expr) -> bool {
+    match e {
+        Expr::Num(..) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) => true,
+        Expr::Un(_, x) => calls_nothing(x),
+        Expr::Bin(_, a, b) | Expr::Index(a, b, _) => calls_nothing(a) && calls_nothing(b),
+        _ => false,
+    }
 }
 
 /// Does the body assign to name or an element of it?
@@ -423,6 +451,9 @@ fn width_of(l: &Lang, words: &[String]) -> Result<u8, String> {
         return Ok(64);
     }
     let w: Vec<&str> = words.iter().map(String::as_str).filter(|s| !matches!(*s, "static" | "const" | "signed" | "register" | "volatile")).collect();
+    if matches!(w.as_slice(), ["byte"] | ["uint8"]) {
+        return Ok(U8);
+    }
     if w.iter().any(|s| *s == "unsigned" || s.starts_with("uint") || *s == "byte") {
         return Err("unsigned numbers are not in Strike yet: they wrap and compare differently, so they are not guessed at".into());
     }
@@ -445,6 +476,9 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
         // Go: the brackets, outermost first, then the element
         let close = words.iter().position(|w| w == "]").ok_or("a [ without its ]")?;
         let (inner, w) = type_of(l, &words[close + 1..], bools)?;
+        if w == U8 {
+            return Err("a slice or an array of bytes is not in Strike yet (but a string is)".into());
+        }
         let w = if inner.scalar() { w } else { 64 };
         return Ok(match close {
             1 => (Ty::Slice(Box::new(inner), w), 64),
@@ -457,6 +491,12 @@ fn type_of(l: &Lang, words: &[String], bools: bool) -> Result<(Ty, u8), String> 
     }
     let base_end = words.iter().position(|w| w == "[" || w == "*").unwrap_or(words.len());
     let base = &words[..base_end];
+    if base.len() == 1 && base[0] == "string" && matches!(l.strings, Strings::Bytes | Strings::Ascii) {
+        if base_end != words.len() {
+            return Err("pointers are not in Strike yet (but arrays are)".into());
+        }
+        return Ok((Ty::Str, 64));
+    }
     let plain: Vec<&String> = base.iter().filter(|s| !matches!(s.as_str(), "static" | "const" | "register" | "volatile")).collect();
     let (scalar, w) = match base.iter().find_map(|b| l.float_widths.get(b).copied()) {
         Some(_) if plain.len() > 1 => return Err(format!("the type {} is not in Strike yet", plain.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))),
@@ -513,6 +553,8 @@ fn go_size(t: &Ty, w: u8) -> (i64, bool) {
     match t {
         Ty::Int | Ty::Unknown | Ty::Float => ((w / 8).max(1) as i64, true),
         Ty::Bool => (1, true),
+        // a Go string is two words (its bytes' address and its length)
+        Ty::Str => (16, false),
         Ty::Arr(e, ew, n) => {
             let (s, ns) = go_size(e, *ew);
             (s * *n as i64, ns)
@@ -739,6 +781,24 @@ impl Fx<'_, '_> {
     /// A value of width `from` going where `to` bits are kept: cut to them
     /// and sign-extended back, as C and Go convert.
     fn narrow(&mut self, to: u8, from: u8) -> Result<(), E> {
+        if to == U8 {
+            // Go's byte: 0 to 255, a constant that is not one an error
+            if !self.typed() || from == U8 {
+                return Ok(());
+            }
+            if from == 0 && self.sh.l.untyped_literals {
+                if let Some(Op::Push(c)) = self.code.last() {
+                    if !(0..=255).contains(c) {
+                        return self.err(format!("{c} does not fit a byte"));
+                    }
+                    return Ok(());
+                }
+            }
+            self.ops(&[Op::Push(255), Op::Bin(BinOp::Band)]);
+            return Ok(());
+        }
+        // a byte fits any signed width above 8
+        let from = if from == U8 { 9 } else { from };
         if !self.typed() || to >= 64 || (from != 0 && from <= to) {
             return Ok(());
         }
@@ -851,6 +911,32 @@ impl Fx<'_, '_> {
         }
         self.fail_unless(code, &msg);
         self.emit(Op::Load(h));
+    }
+
+    /// Is the expression surely a whole number, by its names' kinds (no
+    /// float in it)? Read without lowering it; false where not known.
+    fn whole_value(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Num(..) => true,
+            Expr::Var(n, _) => self.lookup(n).is_some_and(|(_, t)| t.whole()),
+            Expr::Un(_, x) => self.whole_value(x),
+            Expr::Bin(op, a, b) => *op != BinOp::DivTrue && self.whole_value(a) && self.whole_value(b),
+            Expr::Index(b, i, _) => {
+                let mut base = &**b;
+                while let Expr::Index(inner, _, _) = base {
+                    base = inner;
+                }
+                let scalar_elems = |t: &Ty| {
+                    let mut t = t.clone();
+                    while let Some((e, _)) = t.elem() {
+                        t = e;
+                    }
+                    t.whole()
+                };
+                matches!(base, Expr::Var(n, _) if self.lookup(n).is_some_and(|(_, t)| scalar_elems(&t))) && self.whole_value(i)
+            }
+            _ => false,
+        }
     }
 
     /// The value whose code ends at `at`, when it is a constant: its last
@@ -1015,7 +1101,7 @@ impl Fx<'_, '_> {
         let (c, p, go) = match (fmt, self.sh.l.float_print) {
             (None, Some(FloatPrint::Repr)) => {
                 self.ops(&[Op::AddrG(buf), Op::Load(v), Op::AddrG(buf)]);
-                self.lib("lib.py_repr", 2);
+                self.lib("lib.float.py_repr", 2);
                 self.emit(Op::PrintMem);
                 return Ok(());
             }
@@ -1024,7 +1110,7 @@ impl Fx<'_, '_> {
             (Some((c, p)), _) => (c, p, self.sh.l.printf_go == Some(true)),
         };
         self.ops(&[Op::AddrG(buf), Op::Load(v), Op::Push(f32 as i64), Op::Push(c as i64), Op::Push(p), Op::Push(go as i64), Op::AddrG(buf)]);
-        self.lib("lib.fmt_float", 6);
+        self.lib("lib.float.fmt_float", 6);
         self.emit(Op::PrintMem);
         Ok(())
     }
@@ -1032,12 +1118,24 @@ impl Fx<'_, '_> {
     /// A binary operator whose left value (kind ta, width wa, k its Go
     /// constant) is on the stack, its code ending at a_end: the right one
     /// is lowered, both are made one kind as the language makes them, and
-    /// the operation is done.
-    fn binary(&mut self, op: BinOp, ta: Ty, wa: u8, ka: Option<FloatLit>, a_end: usize, b: &Expr) -> Result<Ty, E> {
+    /// the operation is done. `uns`: C's size_t is on a side, so an order
+    /// is compared unsigned.
+    #[allow(clippy::too_many_arguments)]
+    fn binary(&mut self, op: BinOp, ta: Ty, wa: u8, ka: Option<FloatLit>, a_end: usize, b: &Expr, uns: bool) -> Result<Ty, E> {
         let tb = self.expr(b, true)?;
         let (wb, kb) = (self.last_w, self.last_k);
-        if !ta.scalar() || !tb.scalar() {
+        if !ta.scalar() || !tb.scalar() || op == BinOp::In {
             return self.list_op(op, &ta, &tb);
+        }
+        if uns && ta != Ty::Float && tb != Ty::Float && matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            // both sides as 64-bit unsigned numbers, as C converts them
+            if matches!(op, BinOp::Gt | BinOp::Ge) {
+                let (x, y) = (self.hidden(), self.hidden());
+                self.ops(&[Op::Store(y), Op::Store(x), Op::Load(y), Op::Load(x)]);
+            }
+            self.emit(Op::Bin(if matches!(op, BinOp::Lt | BinOp::Gt) { BinOp::Ult } else { BinOp::Ule }));
+            self.last_w = 8;
+            return Ok(self.bool_ty());
         }
         if ta == Ty::Float || tb == Ty::Float || op == BinOp::DivTrue {
             return self.float_binary(op, (&ta, wa, ka, a_end), (&tb, wb, kb));
@@ -1143,7 +1241,7 @@ impl Fx<'_, '_> {
         match fop {
             BinOp::DivFloor | BinOp::ModFloor => {
                 self.zero_division(true);
-                self.lib(if fop == BinOp::DivFloor { "lib.py_floordiv" } else { "lib.py_mod" }, 2);
+                self.lib(if fop == BinOp::DivFloor { "lib.float.py_floordiv" } else { "lib.float.py_mod" }, 2);
             }
             f => {
                 if f == BinOp::FDiv {
@@ -1180,7 +1278,7 @@ impl Fx<'_, '_> {
                 o => o,
             }
         };
-        self.lib("lib.py_cmp", 2);
+        self.lib("lib.float.py_cmp", 2);
         // py_cmp gives -1, 0, 1, or 2 for NaN
         let (c, test) = match op {
             FLt => (-1, Eq),
@@ -1226,21 +1324,24 @@ impl Fx<'_, '_> {
         };
         self.emit(Op::AddrG(g));
     }
-    /// The zero of a kind, pushed (a slice's is the empty header).
+    /// The zero of a kind, pushed (a slice's is the empty header, a
+    /// string's the empty string; an array's the zero of its elements, the
+    /// word each of its words is given).
     fn zero(&mut self, t: &Ty) {
         match t {
             Ty::Slice(..) => self.nil_slice(),
+            Ty::Str => self.emit(super::strs::empty()),
+            Ty::Arr(e, _, _) => {
+                let e = (**e).clone();
+                self.zero(&e)
+            }
             _ => self.emit(Op::Push(0)),
         }
     }
     /// The zeros of `words` words of kind t at the address in slot a.
     fn fill_zero(&mut self, a: u32, t: &Ty, words: u64) {
         let z = self.hidden();
-        if t.zero_is_not_zero() {
-            self.nil_slice();
-        } else {
-            self.emit(Op::Push(0));
-        }
+        self.zero(t);
         self.emit(Op::Store(z));
         self.ops(&[Op::Load(a), Op::Push(words as i64), Op::Load(z)]);
         self.lib("lib.fill", 3);
@@ -1272,10 +1373,12 @@ impl Fx<'_, '_> {
     fn cond(&mut self, e: &Expr) -> Result<(), E> {
         let t = self.expr(e, true)?;
         match t {
+            // a Python list or string is true when it has elements
             Ty::List(_) => self.emit(Op::LoadM(8)),
             // not zero (0.0 and -0.0 are false, NaN is true)
             Ty::Float => self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]),
-            Ty::Slice(..) | Ty::Arr(..) | Ty::Ptr(..) => return self.err(format!("{} is not a condition", t.describe())),
+            Ty::Str if self.sh.l.strings == Strings::Ascii => self.emit(Op::LoadM(8)),
+            Ty::Slice(..) | Ty::Arr(..) | Ty::Ptr(..) | Ty::Str => return self.err(format!("{} is not a condition", t.describe())),
             _ => {}
         }
         Ok(())
@@ -1530,6 +1633,17 @@ impl Fx<'_, '_> {
             self.emit(Op::Pop);
             return Ok(());
         }
+        if was == Ty::Str {
+            // s += t, Python's s *= n: a new string in s
+            self.load(slot);
+            let t = self.expr(value, true)?;
+            let r = self.str_op(op, &Ty::Str, &t)?;
+            if r != Ty::Str {
+                return self.err(format!("{name} is a string; this operator does not make one"));
+            }
+            self.store(slot);
+            return Ok(());
+        }
         if !was.scalar() {
             return self.err(format!("{name} is {}; Strike does not do arithmetic into it", was.describe()));
         }
@@ -1538,7 +1652,7 @@ impl Fx<'_, '_> {
         let w = self.width(slot);
         self.load(slot);
         let at = self.code.len();
-        let t = self.binary(op, was.clone(), w, None, at, value)?;
+        let t = self.binary(op, was.clone(), w, None, at, value, false)?;
         let from = self.last_w;
         if self.typed() {
             self.convert(&was, w, &t, from)?;
@@ -1571,7 +1685,7 @@ impl Fx<'_, '_> {
         let from = self.last_w;
         let slot = match known {
             Some((slot, was)) => {
-                if self.typed() && !was.scalar() && unify(&was, &ty).is_none() {
+                if self.typed() && !was.scalar() && unify(&was, &ty).is_none() && !decays(&ty, &was) {
                     return self.err(format!("{name} is {}; it is given {}", was.describe(), ty.describe()));
                 }
                 if self.typed() && was.scalar() && !ty.scalar() {
@@ -1657,8 +1771,10 @@ impl Fx<'_, '_> {
 
     fn var(&mut self, name: &str, words: &[String], dims: &[Option<Expr>], value: Option<&Expr>) -> Result<(), E> {
         let (mut dt, mut dw) = type_of(self.sh.l, words, self.sh.bools).map_err(|m| (self.line, m))?;
-        if matches!(dt, Ty::Ptr(..)) {
-            return self.err("pointer variables are not in Strike yet (but arrays are)");
+        // a C pointer variable: only one given an array or a string to
+        // point at (no arithmetic on it, no & or *)
+        if matches!(dt, Ty::Ptr(..)) && (value.is_none() || !dims.is_empty()) {
+            return self.err("pointer variables are not in Strike yet, but one given an array or a string to point at is");
         }
         // C: int a[3][4]: the sizes after the name, the first outermost
         if !dims.is_empty() {
@@ -1672,6 +1788,8 @@ impl Fx<'_, '_> {
                     },
                     None if i == 0 => match value {
                         Some(Expr::Brace(elems, _)) => sizes.push(elems.len().max(1) as u64),
+                        // char s[] = "abc": the chars and their zero
+                        Some(Expr::Str(b)) if self.sh.l.strings == Strings::C => sizes.push(b.len() as u64 + 1),
                         _ => return self.err("an array without its size needs an initializer to count"),
                     },
                     None => return self.err("only an array's first size may be left out"),
@@ -1694,15 +1812,19 @@ impl Fx<'_, '_> {
             Some(e) => {
                 let t = self.value(e)?;
                 let from = self.last_w;
-                if !words.is_empty() && (!dt.scalar() || !t.scalar()) && unify(&dt, &t).is_none() {
+                if !words.is_empty() && (!dt.scalar() || !t.scalar()) && unify(&dt, &t).is_none() && !decays(&t, &dt) {
                     return self.err(format!("{name} is {}; it is given {}", dt.describe(), t.describe()));
                 }
-                // Go's `x := 5` is an int: the literal's own width; a declared
-                // kind converts the value to it
+                // Go's `x := 5` is an int: the literal's own width; `c :=
+                // s[0]` is a byte, `x := int32(y)` an int32: the value's. A
+                // declared kind converts the value to it
                 if t.scalar() && !words.is_empty() && dt.scalar() && (dt == Ty::Float || t == Ty::Float) {
                     self.convert(&dt, dw, &t, from)?;
                 } else if t.scalar() {
                     self.narrow(dw, from)?;
+                }
+                if words.is_empty() && self.typed() && t == Ty::Int && from != 0 {
+                    dw = from;
                 }
                 // a float declared by its value has the value's width
                 if words.is_empty() && t == Ty::Float {
@@ -1783,6 +1905,19 @@ impl Fx<'_, '_> {
     /// array's type, or another array) into the array at slot a.
     fn init_array(&mut self, a: u32, t: &Ty, v: &Expr) -> Result<(), E> {
         let Ty::Arr(e, w, n) = t else { unreachable!() };
+        if let Expr::Str(bytes) = v {
+            if self.sh.l.strings != Strings::C || **e != Ty::Int || *w != 8 {
+                return self.err("only a char array is given a string");
+            }
+            // C keeps the zero byte where there is room for it
+            if bytes.len() as u64 > *n {
+                return self.err(format!("a string of {} chars is given to an array of {n}", bytes.len()));
+            }
+            for (i, c) in bytes.iter().enumerate() {
+                self.ops(&[Op::Load(a), Op::Push(i as i64), Op::Bin(BinOp::Add), Op::Push(*c as i8 as i64), Op::StoreM(1)]);
+            }
+            return Ok(());
+        }
         let elems = match v {
             Expr::Brace(elems, _) => elems,
             Expr::Composite(words, elems, _) => {
@@ -1817,6 +1952,7 @@ impl Fx<'_, '_> {
     fn elem_value(&mut self, at: u32, e: &Ty, w: u8, x: &Expr) -> Result<(), E> {
         match (e, x) {
             (Ty::Arr(..), Expr::Brace(..)) => self.init_array(at, e, x),
+            (Ty::Arr(..), Expr::Str(_)) if self.sh.l.strings == Strings::C => self.init_array(at, e, x),
             (Ty::Slice(ie, iw), Expr::Brace(inner, _)) => {
                 let (ie, iw) = ((**ie).clone(), *iw);
                 self.composite_slice(&ie, iw, inner)?;
@@ -1862,6 +1998,14 @@ impl Fx<'_, '_> {
     fn elem_addr(&mut self, base: &Expr, idx: &Expr) -> Result<(Ty, u8), E> {
         let start = self.code.len();
         let bt = self.expr(base, true)?;
+        if bt == Ty::Str {
+            return self.err("a string is not changed in place: Python's and Go's strings never change");
+        }
+        self.elem_addr_of(start, bt, idx)
+    }
+
+    /// elem_addr for the base whose code begins at `start` and is of kind bt.
+    fn elem_addr_of(&mut self, start: usize, bt: Ty, idx: &Expr) -> Result<(Ty, u8), E> {
         let Some((e, w)) = bt.elem() else {
             return self.err(format!("{} has no elements to index", bt.describe()));
         };
@@ -1952,6 +2096,41 @@ impl Fx<'_, '_> {
             None
         };
         let (e, w) = self.elem_addr(&target, last)?;
+        // a number or an address goes straight to where the address on the
+        // stack points
+        if op.is_none() && !matches!(e, Ty::Arr(..)) {
+            let (t, from) = match early {
+                Some((t, v, from)) => {
+                    self.emit(Op::Load(v));
+                    (t, from)
+                }
+                None => {
+                    let t = self.value(value)?;
+                    (t, self.last_w)
+                }
+            };
+            self.elem_kind(&target, &e, &t)?;
+            if e.whole() && t.whole() {
+                if from == 0 {
+                    self.narrow(w, from)?;
+                }
+            } else if e.scalar() {
+                // a float made the element's kind (C, Go)
+                self.convert(&e, w, &t, from)?;
+            }
+            self.emit(Op::StoreM(size(&e, w) as u8));
+            return Ok(());
+        }
+        // a[i] += x worked on the memory itself, where x calls nothing (so
+        // when the element is read does not matter); whole numbers only
+        if let Some(op @ (BinOp::Add | BinOp::Sub | BinOp::Band | BinOp::Bor | BinOp::Bxor)) = op {
+            if e.whole() && e != Ty::Bool && calls_nothing(value) && self.whole_value(value) {
+                self.int_expr(value)?;
+                let op = if self.sh.l.checked { op.checked() } else { op };
+                self.emit(Op::OpM(op, size(&e, w) as u8));
+                return Ok(());
+            }
+        }
         let a = self.hidden();
         self.emit(Op::Store(a));
         match op {
@@ -1974,9 +2153,12 @@ impl Fx<'_, '_> {
                     return self.err(format!("an element that is {} is not worked on with arithmetic", e.describe()));
                 }
                 let n = size(&e, w) as u8;
-                self.ops(&[Op::Load(a), Op::Load(a), Op::LoadM(n)]);
+                // the element first, as it was, then the value: the old
+                // element waits in a slot, not under the value on the stack
+                let old = self.hidden();
+                self.ops(&[Op::Load(a), Op::LoadM(n), Op::Store(old), Op::Load(a), Op::Load(old)]);
                 let at = self.code.len();
-                let t = self.binary(op, e.clone(), w, None, at, value)?;
+                let t = self.binary(op, e.clone(), w, None, at, value, false)?;
                 let from = self.last_w;
                 // the store keeps a whole number's own width; a float is
                 // made the element's kind
@@ -2012,6 +2194,11 @@ impl Fx<'_, '_> {
     fn for_each(&mut self, index: Option<&str>, value: Option<&str>, iter: &Expr, body: &[Stmt]) -> Result<(), E> {
         self.push_scope();
         let t = self.expr(iter, true)?;
+        if t == Ty::Str {
+            self.for_str(index, value, body)?;
+            self.pop_scope();
+            return Ok(());
+        }
         let Some((e, ew)) = t.elem() else {
             return self.err(format!("a loop goes over a list, a slice or an array, not {}", t.describe()));
         };
@@ -2106,6 +2293,11 @@ impl Fx<'_, '_> {
 
     fn print_value(&mut self, e: &Expr) -> Result<(), E> {
         if let Expr::Str(s) = e {
+            // Python writes its strings in the encoding of where they go,
+            // which is not known while compiling
+            if self.sh.l.strings == Strings::Ascii && !s.is_ascii() {
+                return self.err("a string past ASCII is not in Strike yet: Python prints it in the encoding of where its output goes");
+            }
             self.emit(Op::PrintStr(s.clone()));
             return Ok(());
         }
@@ -2127,6 +2319,10 @@ impl Fx<'_, '_> {
                 }
                 let f = self.printer(&t);
                 self.emit(Op::Call(f, 1));
+                self.emit(Op::Pop);
+            }
+            (_, Ty::Str) => {
+                self.lib("lib.str_print", 1);
                 self.emit(Op::Pop);
             }
             (_, Ty::Ptr(..)) => return self.err("a pointer is not printed"),
@@ -2151,6 +2347,8 @@ impl Fx<'_, '_> {
             Ty::Float => Elem::Float(FloatElem { f32: ew == 32, repr: self.sh.l.float_print == Some(FloatPrint::Repr), buf: self.float_buf() }),
             Ty::List(_) | Ty::Slice(..) => Elem::Nested(self.printer(&e), false),
             Ty::Arr(..) => Elem::Nested(self.printer(&e), true),
+            // Python shows a string in a list as its repr, Go as it is
+            Ty::Str => Elem::Str(self.sh.l.strings == Strings::Ascii),
             _ => Elem::Int,
         };
         let (open, sep, close) = self.sh.l.list_print.clone();
@@ -2169,6 +2367,48 @@ impl Fx<'_, '_> {
         name
     }
 
+    /// The text whose value is on top printed: a Python or Go string, or
+    /// C's chars to their zero byte (a char array, or a char pointer).
+    fn print_text(&mut self, t: &Ty, what: &str) -> Result<(), E> {
+        match t {
+            Ty::Str => self.lib("lib.str_print", 1),
+            Ty::Ptr(e, 8) | Ty::Arr(e, 8, _) if **e == Ty::Int && self.sh.l.strings == Strings::C => self.lib("lib.c_print", 1),
+            _ => return self.err(format!("{what} is given {}, not a string", t.describe())),
+        }
+        self.emit(Op::Pop);
+        Ok(())
+    }
+
+    /// Is this C expression an unsigned size (strlen's size_t, or
+    /// arithmetic on one)? It wraps as the signed numbers do, but it
+    /// compares unsigned, and it divides and shifts unsigned.
+    fn unsigned(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call(n, _, _) => !self.sh.sigs.contains_key(n) && self.sh.l.builtins.get(n).map(String::as_str) == Some("c_strlen"),
+            Expr::Bin(op, a, b) if !op.is_comparison() && !matches!(op, BinOp::AndBool | BinOp::OrBool) => self.unsigned(a) || self.unsigned(b),
+            Expr::Un(UnOp::Neg | UnOp::Plus | UnOp::Bnot, x) => self.unsigned(x),
+            _ => false,
+        }
+    }
+
+    /// The C text (a char array or a char pointer) for strlen, strcmp.
+    fn c_text(&mut self, e: &Expr, name: &str) -> Result<(), E> {
+        let t = self.expr(e, true)?;
+        match &t {
+            Ty::Ptr(x, 8) | Ty::Arr(x, 8, _) if **x == Ty::Int => Ok(()),
+            _ => self.err(format!("{name} is given {}, not chars", t.describe())),
+        }
+    }
+
+    /// An expression that must be a string.
+    fn str_expr(&mut self, e: &Expr, what: &str) -> Result<(), E> {
+        let t = self.expr(e, true)?;
+        if t != Ty::Str {
+            return self.err(format!("{what} is given {}, not a string", t.describe()));
+        }
+        Ok(())
+    }
+
     fn print(&mut self, style: Style, args: &[Expr]) -> Result<(), E> {
         match style {
             Style::SpacedLine | Style::None => {
@@ -2185,6 +2425,11 @@ impl Fx<'_, '_> {
                     let mut s = s.clone();
                     s.push(b'\n');
                     self.emit(Op::PrintStr(s));
+                }
+                [a] => {
+                    let t = self.expr(a, true)?;
+                    self.print_text(&t, "this print")?;
+                    self.emit(Op::PrintStr(b"\n".to_vec()));
                 }
                 _ => return self.err("this print takes one string"),
             },
@@ -2218,7 +2463,9 @@ impl Fx<'_, '_> {
                         }
                         prec = Some(p);
                     }
-                    while f.get(i) == Some(&b'l') {
+                    let mut sized = false;
+                    while matches!(f.get(i), Some(&b'l') | Some(&b'z')) {
+                        sized |= f[i] == b'z';
                         i += 1;
                     }
                     let spec = f.get(i).copied().unwrap_or(b'?');
@@ -2266,8 +2513,51 @@ impl Fx<'_, '_> {
                         }
                         b's' => match a {
                             Expr::Str(s) => self.emit(Op::PrintStr(s.clone())),
-                            _ => return self.err("%s is given something that is not a string"),
+                            _ => {
+                                let t = self.expr(a, true)?;
+                                // Go's %s of a slice or array of strings: as %v
+                                let mut inner = &t;
+                                while let Ty::Slice(e, _) | Ty::Arr(e, _, _) = inner {
+                                    inner = &**e;
+                                }
+                                if self.sh.l.strings == Strings::Bytes && t != Ty::Str && *inner == Ty::Str {
+                                    let f = self.printer(&t);
+                                    self.emit(Op::Call(f, 1));
+                                    self.emit(Op::Pop);
+                                } else {
+                                    self.print_text(&t, "%s")?;
+                                }
+                            }
                         },
+                        // a character: C's int made a byte, Go's code point
+                        // as its UTF-8
+                        b'c' if self.sh.l.strings != Strings::None => {
+                            let t = self.expr(a, true)?;
+                            if !t.scalar() || (t == Ty::Bool && self.sh.bools) {
+                                return self.err(format!("%c is given {}", t.describe()));
+                            }
+                            if self.sh.l.strings == Strings::C {
+                                self.lib("lib.print_byte", 1);
+                            } else {
+                                self.lib("lib.rune_str", 1);
+                                self.lib("lib.str_print", 1);
+                            }
+                            self.emit(Op::Pop);
+                        }
+                        b'q' if self.sh.l.strings == Strings::Bytes => {
+                            let t = self.expr(a, true)?;
+                            if t != Ty::Str {
+                                return self.err(format!("%q is given {}; it quotes a string in this stage of Strike", t.describe()));
+                            }
+                            self.lib("lib.go_quote", 1);
+                            self.lib("lib.str_print", 1);
+                            self.emit(Op::Pop);
+                        }
+                        // %zu of strlen: a size, never negative
+                        b'u' if sized && self.unsigned(a) => {
+                            self.int_expr(a)?;
+                            self.emit(Op::PrintInt);
+                        }
                         c => return self.err(format!("the format %{} is not in Strike yet", c as char)),
                     }
                 }
@@ -2289,7 +2579,7 @@ impl Fx<'_, '_> {
                 let [x] = args else { return self.err(format!("{name} takes one value")) };
                 let t = self.expr(x, true)?;
                 match (&t, what) {
-                    (Ty::List(_), "len") => self.emit(Op::LoadM(8)),
+                    (Ty::List(_) | Ty::Str, "len") => self.emit(Op::LoadM(8)),
                     (Ty::Slice(..), _) => self.ops(&[Op::Push(if what == "len" { 8 } else { 16 }), Op::Bin(BinOp::Add), Op::LoadM(8)]),
                     (Ty::Arr(_, _, n), _) => self.ops(&[Op::Pop, Op::Push(*n as i64)]),
                     _ => return self.err(format!("{name} of {} is not in Strike yet", t.describe())),
@@ -2328,7 +2618,7 @@ impl Fx<'_, '_> {
                     let (d, all, z) = (self.hidden(), self.hidden(), self.hidden());
                     self.ops(&[Op::Load(h), Op::LoadM(8), Op::Store(d)]);
                     self.ops(&[Op::Load(cs), Op::Push((size(&e, ew) / 8) as i64), Op::Bin(BinOp::Mul), Op::Store(all)]);
-                    self.nil_slice();
+                    self.zero(&e);
                     self.ops(&[Op::Store(z), Op::Load(d), Op::Load(all), Op::Load(z)]);
                     self.lib("lib.fill", 3);
                     self.emit(Op::Pop);
@@ -2418,7 +2708,7 @@ impl Fx<'_, '_> {
                 let buf = self.float_buf();
                 self.ops(&[Op::Store(v), Op::Load(v), Op::Push(0), Op::Bin(BinOp::FLt), Op::Jz(ok)]);
                 self.ops(&[Op::AddrG(buf), Op::Load(v), Op::AddrG(buf)]);
-                self.lib("lib.py_sqrt_error", 2);
+                self.lib("lib.float.py_sqrt_error", 2);
                 self.ops(&[Op::FailMem(1), Op::Label(ok), Op::Load(v), Op::Un(UnOp::FSqrt)]);
                 self.last_w = 64;
                 Ok(Ty::Float)
@@ -2455,6 +2745,80 @@ impl Fx<'_, '_> {
                 self.emit(Op::Bin(BinOp::FRem));
                 self.last_w = 64;
                 Ok(Ty::Float)
+            }
+            // Python's str(x) of a number, a truth value or a string
+            "str" => {
+                let [x] = args else { return self.err("str takes one value") };
+                let t = self.expr(x, true)?;
+                match t {
+                    Ty::Str => {}
+                    Ty::Bool if self.sh.bools => {
+                        let (yes, no) = self.sh.l.bool_print.clone().unwrap_or_default();
+                        let (other, end) = (self.label(), self.label());
+                        self.emit(Op::Jz(other));
+                        self.emit(super::strs::literal(yes.as_bytes()));
+                        self.emit(Op::Jmp(end));
+                        self.emit(Op::Label(other));
+                        self.emit(super::strs::literal(no.as_bytes()));
+                        self.emit(Op::Label(end));
+                    }
+                    t if t.scalar() => self.lib("lib.int_str", 1),
+                    t => return self.err(format!("str of {} is not in Strike yet", t.describe())),
+                }
+                self.last_w = 64;
+                Ok(Ty::Str)
+            }
+            // Go's strconv.Itoa
+            "itoa" => {
+                let [x] = args else { return self.err(format!("{name} takes one number")) };
+                self.int_expr(x)?;
+                self.lib("lib.int_str", 1);
+                self.last_w = 64;
+                Ok(Ty::Str)
+            }
+            "ord" => {
+                let [x] = args else { return self.err("ord takes one string") };
+                self.str_expr(x, "ord")?;
+                self.lib("lib.ord", 1);
+                self.last_w = 64;
+                Ok(Ty::Int)
+            }
+            "chr" => {
+                let [x] = args else { return self.err("chr takes one number") };
+                self.int_expr(x)?;
+                self.lib("lib.chr", 1);
+                self.last_w = 64;
+                Ok(Ty::Str)
+            }
+            // Python's input(): its prompt printed first, as Python does
+            "input" => {
+                match args {
+                    [] => {}
+                    [p] => {
+                        self.str_expr(p, "input")?;
+                        self.lib("lib.str_print", 1);
+                        self.emit(Op::Pop);
+                    }
+                    _ => return self.err("input takes at most a prompt"),
+                }
+                self.lib("lib.read_str", 0);
+                self.last_w = 64;
+                Ok(Ty::Str)
+            }
+            "c_strlen" => {
+                let [x] = args else { return self.err("strlen takes one string") };
+                self.c_text(x, "strlen")?;
+                self.lib("lib.c_strlen", 1);
+                self.last_w = 64;
+                Ok(Ty::Int)
+            }
+            "c_strcmp" => {
+                let [x, y] = args else { return self.err("strcmp takes two strings") };
+                self.c_text(x, "strcmp")?;
+                self.c_text(y, "strcmp")?;
+                self.lib("lib.c_strcmp", 2);
+                self.last_w = 32;
+                Ok(Ty::Int)
             }
             other => self.err(format!("{name} ({other}) is not in Strike yet")),
         }
@@ -2536,7 +2900,29 @@ impl Fx<'_, '_> {
                     Ty::Int
                 }
             }
-            Expr::Str(_) => return self.err("a string can only be printed in this stage of Strike"),
+            Expr::Str(bytes) => {
+                self.last_w = 64;
+                match self.sh.l.strings {
+                    Strings::C => {
+                        let mut d = bytes.clone();
+                        d.push(0);
+                        self.emit(Op::Data(d));
+                        Ty::Ptr(Box::new(Ty::Int), 8)
+                    }
+                    Strings::Bytes => {
+                        self.emit(super::strs::literal(bytes));
+                        Ty::Str
+                    }
+                    Strings::Ascii => {
+                        if !bytes.is_ascii() {
+                            return self.err("a string past ASCII is not in Strike yet: Strike's Python strings hold ASCII only, so each code point is one byte");
+                        }
+                        self.emit(super::strs::literal(bytes));
+                        Ty::Str
+                    }
+                    Strings::None => return self.err("a string can only be printed in this stage of Strike"),
+                }
+            }
             Expr::Var(name, line) => {
                 self.line = *line;
                 let Some((slot, ty)) = self.lookup(name) else {
@@ -2548,7 +2934,12 @@ impl Fx<'_, '_> {
             }
             Expr::Index(base, idx, line) => {
                 self.line = *line;
-                let (t, w) = self.elem_addr(base, idx)?;
+                let start = self.code.len();
+                let bt = self.expr(base, true)?;
+                if bt == Ty::Str {
+                    return self.str_index(start, idx);
+                }
+                let (t, w) = self.elem_addr_of(start, bt, idx)?;
                 if let Some(l) = load_of(&t, w) {
                     self.emit(l);
                 }
@@ -2630,19 +3021,49 @@ impl Fx<'_, '_> {
                                 return Ok(Ty::Int);
                             }
                         }
-                        if name == inner {
-                            return self.err(format!("{inner}() gives a string, and strings are not in Strike yet; {outer}({inner}()) reads a whole number"));
-                        }
                     }
                 }
                 // a conversion: Go's int32(x), Python's int(x) of a number
                 if !self.sh.sigs.contains_key(name) && self.sh.l.type_words.contains(name) && args.len() == 1 {
-                    if let Ok((to @ (Ty::Int | Ty::Float), w)) = type_of(self.sh.l, std::slice::from_ref(name), self.sh.bools) {
-                        let t = self.expr(&args[0], true)?;
-                        let from = self.last_w;
-                        self.explicit_convert(&to, w, &t, from)?;
-                        self.last_w = w;
-                        return Ok(to);
+                    match type_of(self.sh.l, std::slice::from_ref(name), self.sh.bools) {
+                        Ok((Ty::Int, w)) => {
+                            let t = self.expr(&args[0], true)?;
+                            // Python's int(s): the string read as a whole number
+                            if t == Ty::Str && self.sh.l.strings == Strings::Ascii {
+                                self.lib("lib.str_int", 1);
+                                self.last_w = 64;
+                                return Ok(Ty::Int);
+                            }
+                            if !t.scalar() {
+                                return self.err(format!("a number is wanted here, not {}", t.describe()));
+                            }
+                            let from = self.last_w;
+                            self.explicit_convert(&Ty::Int, w, &t, from)?;
+                            self.last_w = w;
+                            return Ok(Ty::Int);
+                        }
+                        // Go's float64(i), Python's float(x)
+                        Ok((Ty::Float, w)) => {
+                            let t = self.expr(&args[0], true)?;
+                            let from = self.last_w;
+                            self.explicit_convert(&Ty::Float, w, &t, from)?;
+                            self.last_w = w;
+                            return Ok(Ty::Float);
+                        }
+                        // Go's string(r): the code point's UTF-8
+                        Ok((Ty::Str, _)) => {
+                            let t = self.expr(&args[0], true)?;
+                            match t {
+                                Ty::Str => {}
+                                Ty::Bool if self.sh.bools => return self.err("a truth value is not made a string"),
+                                Ty::Float => return self.err("a float is not made a string in Strike yet"),
+                                t if t.scalar() => self.lib("lib.rune_str", 1),
+                                t => return self.err(format!("{} is not made a string in Strike yet", t.describe())),
+                            }
+                            self.last_w = 64;
+                            return Ok(Ty::Str);
+                        }
+                        _ => {}
                     }
                 }
                 let Some(sig) = self.sh.sigs.get(name).cloned() else {
@@ -2719,8 +3140,9 @@ impl Fx<'_, '_> {
                     _ => {
                         let op = if self.sh.l.checked && *op == UnOp::Neg { UnOp::NegOv } else { *op };
                         self.emit(Op::Un(op));
-                        // -INT_MIN is INT_MIN again at 32 bits
-                        if op == UnOp::Neg && w > 0 {
+                        // -INT_MIN is INT_MIN again at 32 bits; a byte's
+                        // negation and complement wrap at 256
+                        if (op == UnOp::Neg || (op == UnOp::Bnot && w == U8)) && w > 0 {
                             self.narrow(w, 64)?;
                         }
                         self.last_w = w;
@@ -2766,17 +3188,216 @@ impl Fx<'_, '_> {
                     ta
                 }
                 _ => {
+                    // C's size_t (strlen): divided and shifted unsigned, which
+                    // Strike does not do yet; compared unsigned below
+                    let uns = self.sh.l.strings == Strings::C && (self.unsigned(a) || self.unsigned(b));
+                    if uns && matches!(op, BinOp::DivTrunc | BinOp::ModTrunc | BinOp::Shr) {
+                        return self.err("strlen's size is unsigned, and unsigned division and shifts are not in Strike yet (store it in an int first)");
+                    }
                     let ta = self.expr(a, true)?;
                     let (wa, ka, at) = (self.last_w, self.last_k, self.code.len());
-                    self.binary(*op, ta, wa, ka, at, b)?
+                    self.binary(*op, ta, wa, ka, at, b, uns)?
                 }
             },
         })
     }
 
+    /// s[i] of the string whose code begins at `start`: Python's string of
+    /// one character (negative from the end), Go's byte.
+    fn str_index(&mut self, start: usize, idx: &Expr) -> Result<Ty, E> {
+        if self.sh.l.strings == Strings::Ascii {
+            self.int_expr(idx)?;
+            self.lib("lib.py_index", 2);
+            self.last_w = 64;
+            return Ok(Ty::Str);
+        }
+        let hs = self.into_slot(start);
+        let at = self.code.len();
+        self.int_expr(idx)?;
+        let i = self.into_slot(at);
+        self.check(i, &[Op::Load(hs), Op::LoadM(8)]);
+        self.ops(&[Op::Load(hs), Op::Push(8), Op::Bin(BinOp::Add), Op::Load(i), Op::Bin(BinOp::Add), Op::LoadM(1), Op::Push(255), Op::Bin(BinOp::Band)]);
+        self.last_w = U8;
+        Ok(Ty::Int)
+    }
+
+    /// s[lo:hi] of the string in slot hs: Python's held to the string,
+    /// Go's checked (a panic where it does not fit).
+    fn str_slice(&mut self, hs: u32, lo: Option<&Expr>, hi: Option<&Expr>) -> Result<Ty, E> {
+        self.last_w = 64;
+        if self.sh.l.strings == Strings::Ascii {
+            self.emit(Op::Load(hs));
+            for x in [lo, hi] {
+                match x {
+                    Some(x) => self.int_expr(x)?,
+                    None => self.emit(Op::Push(i64::MIN)),
+                }
+            }
+            self.lib("lib.str_slice", 3);
+            self.last_w = 64;
+            return Ok(Ty::Str);
+        }
+        let (l, h) = (self.hidden(), self.hidden());
+        match lo {
+            Some(x) => self.int_expr(x)?,
+            None => self.emit(Op::Push(0)),
+        }
+        self.emit(Op::Store(l));
+        match hi {
+            Some(x) => self.int_expr(x)?,
+            None => self.ops(&[Op::Load(hs), Op::LoadM(8)]),
+        }
+        self.emit(Op::Store(h));
+        let code = self.go_fail();
+        self.ops(&[Op::Load(h), Op::Load(hs), Op::LoadM(8), Op::Bin(BinOp::Ule)]);
+        self.fail_unless(code, "panic: runtime error: slice bounds out of range\n");
+        self.ops(&[Op::Load(l), Op::Load(h), Op::Bin(BinOp::Ule)]);
+        self.fail_unless(code, "panic: runtime error: slice bounds out of range\n");
+        self.ops(&[Op::Load(hs), Op::Load(l), Op::Load(h), Op::Load(l), Op::Bin(BinOp::Sub)]);
+        self.lib("lib.str_sub", 3);
+        self.last_w = 64;
+        Ok(Ty::Str)
+    }
+
+    /// A loop over the string on top: Python's characters, Go's code
+    /// points (decoded as Go decodes UTF-8) and the byte each begins at.
+    fn for_str(&mut self, index: Option<&str>, value: Option<&str>, body: &[Stmt]) -> Result<(), E> {
+        let go = self.sh.l.strings == Strings::Bytes;
+        let (hs, i, n, step) = (self.hidden(), self.hidden(), self.hidden(), self.hidden());
+        self.ops(&[Op::Store(hs), Op::Push(0), Op::Store(i), Op::Load(hs), Op::LoadM(8), Op::Store(n)]);
+        let iv = match index {
+            Some(name) => Some(self.loop_var(name, Ty::Int)?),
+            None => None,
+        };
+        let vv = match value {
+            Some(name) => {
+                let s = self.loop_var(name, if go { Ty::Int } else { Ty::Str })?;
+                if go {
+                    self.set_width(s, 32); // a rune
+                }
+                Some(s)
+            }
+            None => None,
+        };
+        let (top, cont, done) = (self.label(), self.label(), self.label());
+        self.ops(&[Op::Label(top), Op::Load(i), Op::Load(n), Op::Bin(BinOp::Lt), Op::Jz(done)]);
+        if go {
+            let d = self.hidden();
+            self.ops(&[Op::Load(hs), Op::Load(i)]);
+            self.lib("lib.go_decode", 2);
+            self.ops(&[Op::Store(d), Op::Load(d), Op::Push(32), Op::Bin(BinOp::Shr), Op::Store(step)]);
+            if let Some(s) = vv {
+                self.ops(&[Op::Load(d), Op::Push(0xFFFF_FFFF), Op::Bin(BinOp::Band)]);
+                self.store(s);
+            }
+        } else {
+            self.ops(&[Op::Push(1), Op::Store(step)]);
+            if let Some(s) = vv {
+                self.ops(&[Op::Load(hs), Op::Push(8), Op::Bin(BinOp::Add), Op::Load(i), Op::Bin(BinOp::Add), Op::LoadM(1), Op::Push(255), Op::Bin(BinOp::Band)]);
+                self.lib("lib.str_char", 1);
+                self.store(s);
+            }
+        }
+        if let Some(s) = iv {
+            self.emit(Op::Load(i));
+            self.store(s);
+        }
+        self.loops.push((cont, done));
+        self.block(body)?;
+        self.loops.pop();
+        self.ops(&[Op::Label(cont), Op::Load(i), Op::Load(step), Op::Bin(BinOp::Add), Op::Store(i), Op::Jmp(top), Op::Label(done)]);
+        Ok(())
+    }
+
+    /// An operator on strings (both values are on the stack): + joins,
+    /// Python's * repeats, the comparisons go byte by byte, `in` finds.
+    fn str_op(&mut self, op: BinOp, ta: &Ty, tb: &Ty) -> Result<Ty, E> {
+        let ascii = self.sh.l.strings == Strings::Ascii;
+        let swap = |fx: &mut Self| {
+            let (x, y) = (fx.hidden(), fx.hidden());
+            fx.ops(&[Op::Store(y), Op::Store(x), Op::Load(y), Op::Load(x)]);
+        };
+        self.last_w = 64;
+        match (op, ta, tb) {
+            (BinOp::Add, Ty::Str, Ty::Str) => {
+                self.lib("lib.str_concat", 2);
+                Ok(Ty::Str)
+            }
+            (BinOp::Mul, Ty::Str, t) if ascii && t.scalar() && (*t != Ty::Bool || !self.sh.bools) => {
+                self.lib("lib.str_repeat", 2);
+                Ok(Ty::Str)
+            }
+            (BinOp::Mul, t, Ty::Str) if ascii && t.scalar() && (*t != Ty::Bool || !self.sh.bools) => {
+                swap(self);
+                self.lib("lib.str_repeat", 2);
+                Ok(Ty::Str)
+            }
+            (op, Ty::Str, Ty::Str) if op.is_comparison() => {
+                match op {
+                    BinOp::Eq => self.lib("lib.str_eq", 2),
+                    BinOp::Ne => {
+                        self.lib("lib.str_eq", 2);
+                        self.emit(Op::Un(UnOp::Not));
+                    }
+                    BinOp::In => {
+                        swap(self);
+                        self.lib("lib.str_find", 2);
+                        self.ops(&[Op::Push(0), Op::Bin(BinOp::Ge)]);
+                    }
+                    op => {
+                        self.lib("lib.str_cmp", 2);
+                        self.ops(&[Op::Push(0), Op::Bin(op)]);
+                    }
+                }
+                self.last_w = 8;
+                Ok(self.bool_ty())
+            }
+            _ => self.err(format!("this operator on {} and {} is not in Strike yet", ta.describe(), tb.describe())),
+        }
+    }
+
+    /// s.name(args) of Python's string on top.
+    fn str_method(&mut self, what: &str, name: &str, args: &[Expr]) -> Result<Ty, E> {
+        self.last_w = 64;
+        let t = match (what, args) {
+            ("str_upper" | "str_lower" | "str_strip", []) => {
+                self.lib(&format!("lib.{what}"), 1);
+                Ty::Str
+            }
+            ("str_split", []) => {
+                self.lib("lib.str_split", 1);
+                Ty::List(Box::new(Ty::Str))
+            }
+            ("str_join", [x]) => {
+                let t = self.expr(x, true)?;
+                if !matches!(&t, Ty::List(e) if matches!(**e, Ty::Str | Ty::Unknown)) {
+                    return self.err(format!(".join() is given {}, not a list of strings", t.describe()));
+                }
+                self.lib("lib.str_join", 2);
+                Ty::Str
+            }
+            ("str_startswith", [x]) => {
+                self.str_expr(x, ".startswith()")?;
+                self.lib("lib.str_startswith", 2);
+                self.last_w = 8;
+                self.bool_ty()
+            }
+            ("str_find", [x]) => {
+                self.str_expr(x, ".find()")?;
+                self.lib("lib.str_find", 2);
+                Ty::Int
+            }
+            _ => return self.err(format!(".{name}() with these values is not in Strike yet")),
+        };
+        Ok(t)
+    }
+
     /// An operator on lists (both values are on the stack): Python's +
     /// and *.
     fn list_op(&mut self, op: BinOp, ta: &Ty, tb: &Ty) -> Result<Ty, E> {
+        if *ta == Ty::Str || *tb == Ty::Str {
+            return self.str_op(op, ta, tb);
+        }
         self.last_w = 64;
         match (op, ta, tb) {
             (BinOp::Add, Ty::List(_), Ty::List(_)) => {
@@ -2804,6 +3425,9 @@ impl Fx<'_, '_> {
         let t = self.expr(base, true)?;
         let hs = self.hidden();
         self.emit(Op::Store(hs));
+        if t == Ty::Str {
+            return self.str_slice(hs, lo, hi);
+        }
         if let Ty::List(_) = &t {
             self.emit(Op::Load(hs));
             for x in [lo, hi] {
@@ -2852,20 +3476,26 @@ impl Fx<'_, '_> {
 
     /// x.name(args): Python's list methods.
     fn method(&mut self, base: &Expr, name: &str, args: &[Expr]) -> Result<Ty, E> {
-        // a module's function (Go's math.Sqrt, Python's math.sqrt)
-        if let Expr::Var(m, _) = base {
-            if self.lookup(m).is_none() {
-                let full = format!("{m}.{name}");
-                return match self.sh.l.qualified.get(&full).cloned() {
-                    Some(what) => self.builtin(&what, &full, args),
-                    None => self.err(format!("{full} is not in Strike yet")),
+        // Go's package.name(...): a package is not a variable
+        if let Expr::Var(pkg, _) = base {
+            if !self.sh.l.qualified.is_empty() && self.lookup(pkg).is_none() {
+                let key = format!("{pkg}.{name}");
+                let Some(what) = self.sh.l.qualified.get(&key).cloned() else {
+                    return self.err(format!("{key} is not in Strike yet"));
                 };
+                return self.builtin(&what, &key, args);
             }
         }
         let Some(what) = self.sh.l.methods.get(name).cloned() else {
             return self.err(format!(".{name}() is not in Strike yet"));
         };
         let t = self.expr(base, true)?;
+        if what.starts_with("str_") {
+            if t != Ty::Str {
+                return self.err(format!(".{name}() is a string's, not {}'s", t.describe()));
+            }
+            return self.str_method(&what, name, args);
+        }
         let Ty::List(e) = &t else { return self.err(format!(".{name}() is a list's, not {}'s", t.describe())) };
         let e = (**e).clone();
         let r = match (what.as_str(), args) {
@@ -2908,10 +3538,21 @@ impl Fx<'_, '_> {
             self.ops(&[Op::Load(counter), Op::Store(var)]);
         } else {
             let t = self.expr(iter, true)?;
-            let Ty::List(e) = &t else { return self.err(format!("a comprehension goes over a list or a range, not {}", t.describe())) };
-            own.insert(name.to_string(), (var, (**e).clone()));
+            let e = match &t {
+                Ty::List(e) => (**e).clone(),
+                Ty::Str => Ty::Str,
+                _ => return self.err(format!("a comprehension goes over a list, a string or a range, not {}", t.describe())),
+            };
+            own.insert(name.to_string(), (var, e));
             self.ops(&[Op::Store(hs), Op::Push(0), Op::Store(i), Op::Label(top), Op::Load(i), Op::Load(hs), Op::LoadM(8), Op::Bin(BinOp::Lt), Op::Jz(done)]);
-            self.ops(&[Op::Load(hs), Op::Push(16), Op::Bin(BinOp::Add), Op::LoadM(8), Op::Load(i), Op::Push(3), Op::Bin(BinOp::Shl), Op::Bin(BinOp::Add), Op::LoadM(8), Op::Store(var)]);
+            if t == Ty::Str {
+                // a string's characters, each a string of one
+                self.ops(&[Op::Load(hs), Op::Push(8), Op::Bin(BinOp::Add), Op::Load(i), Op::Bin(BinOp::Add), Op::LoadM(1), Op::Push(255), Op::Bin(BinOp::Band)]);
+                self.lib("lib.str_char", 1);
+                self.emit(Op::Store(var));
+            } else {
+                self.ops(&[Op::Load(hs), Op::Push(16), Op::Bin(BinOp::Add), Op::LoadM(8), Op::Load(i), Op::Push(3), Op::Bin(BinOp::Shl), Op::Bin(BinOp::Add), Op::LoadM(8), Op::Store(var)]);
+            }
         }
         // the comprehension's name is seen only inside it, even where a
         // module or `global` name is the same

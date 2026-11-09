@@ -5,7 +5,6 @@ name = "Python"
 extensions = ["py"]
 line_comments = ["#"]
 block_comments = []
-skip_lines = []
 string_quotes = ["\"", "'"]
 char_quotes = []
 blocks = "indent"
@@ -33,20 +32,47 @@ list_print = ["[", ", ", "]"]
 # program as ZeroDivisionError does. print shows a float by its repr.
 float_print = "repr"
 zero_division = [1, "ZeroDivisionError: division by zero\n"]
+# a string is code points; Strike holds them to ASCII (a literal past it is
+# refused, a line read that holds one stops the program)
+strings = "ascii"
+
+# one file runs (a directory runs its __main__.py), and `import m` runs
+# m.py next to it, once, where it is first imported. Python finds its own
+# built-in and frozen modules before any file, so a file named like one is
+# never imported: those names (sys.builtin_module_names and the frozen ones,
+# Python 3.14) are refused as a file's name. Of those, Strike has math
+# (its sqrt): `import math` is that one
+[program]
+model = "modules"
+directory = "__main__.py"
+standard = ["math"]
+found_first = ["_abc", "_ast", "_bisect", "_blake2", "_codecs", "_codecs_cn", "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw", "_collections", "_collections_abc", "_contextvars", "_csv", "_datetime", "_frozen_importlib", "_frozen_importlib_external", "_functools", "_heapq", "_hmac", "_imp", "_interpchannels", "_interpqueues", "_interpreters", "_io", "_json", "_locale", "_lsprof", "_md5", "_multibytecodec", "_opcode", "_operator", "_pickle", "_random", "_sha1", "_sha2", "_sha3", "_signal", "_sitebuiltins", "_sre", "_stat", "_statistics", "_string", "_struct", "_suggestions", "_symtable", "_sysconfig", "_thread", "_tokenize", "_tracemalloc", "_types", "_typing", "_warnings", "_weakref", "_winapi", "abc", "array", "atexit", "binascii", "builtins", "cmath", "codecs", "errno", "faulthandler", "gc", "genericpath", "io", "itertools", "marshal", "math", "mmap", "msvcrt", "nt", "ntpath", "os", "posixpath", "runpy", "site", "stat", "sys", "time", "winreg", "xxsubtype", "zipimport", "zlib"]
+
+[builtins]
+len = "len"
+str = "str"
+ord = "ord"
+chr = "chr"
+input = "input"
+abs = "abs"
 
 [float_widths]
 float = 64
 
+# module.name(...) of Python's own modules that Strike provides
 [qualified]
 "math.sqrt" = "py_sqrt"
-
-[builtins]
-len = "len"
-abs = "abs"
 
 [methods]
 append = "list_append"
 pop = "list_pop"
+upper = "str_upper"
+lower = "str_lower"
+strip = "str_strip"
+split = "str_split"
+join = "str_join"
+startswith = "str_startswith"
+find = "str_find"
 
 [bool_constants]
 True = 1
@@ -55,6 +81,7 @@ False = 0
 [binary]
 "or" = [1, "or_value"]
 "and" = [2, "and_value"]
+"in" = [4, "in"]
 "==" = [4, "eq"]
 "!=" = [4, "ne"]
 "<" = [4, "lt"]
@@ -80,14 +107,27 @@ False = 0
 "~" = [11, "bnot"]
 
 [[form]]
-kind = "ignore"
-place = "top"
-pattern = "import $name $end"
-
-[[form]]
 kind = "function"
 place = "top"
 pattern = "def $name ( $params ) [ -> $type ] : $block"
+
+[[form]]
+name = "spec"
+kind = "import"
+place = "sub"
+pattern = "$name [ as $name ]"
+
+[[form]]
+kind = "import"
+pattern = "import @spec [ , @spec ]* $end"
+
+[[form]]
+kind = "import_from"
+pattern = "from $name import * $end"
+
+[[form]]
+kind = "import_from"
+pattern = "from $name import @spec [ , @spec ]* $end"
 
 [[form]]
 kind = "if"

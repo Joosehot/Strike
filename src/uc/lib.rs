@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 const FLOATS_C: &str = include_str!("floats.c");
 
 /// The float library lowered once by the C description: its functions by
-/// their library names (floats.c's `py_repr` is lib.py_repr).
+/// their library names (floats.c's `py_repr` is lib.float.py_repr).
 fn float_library() -> &'static HashMap<String, Func> {
     static LIB: OnceLock<HashMap<String, Func>> = OnceLock::new();
     LIB.get_or_init(|| {
@@ -31,11 +31,14 @@ fn float_library() -> &'static HashMap<String, Func> {
         // the library's own fmod, exact (the x87's partial remainder); a C
         // program's fmod would be the UCRT's, which is not this one
         c.builtins.insert("fmod".into(), "fmod".into());
-        let toks = super::lex::lex(FLOATS_C, &c).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.0, e.1));
+        // through C's preprocessor, as any C file goes (its math.h)
+        let rule = c.preprocessor.as_ref().expect("C has a preprocessor");
+        let text = super::cpp::run(rule, std::path::Path::new("floats.c"), FLOATS_C, &[]).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.line, e.message)).text;
+        let toks = super::lex::lex(&text, &c).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.0, e.1));
         let prog = super::parse::parse(&toks, &c).unwrap_or_else(|f| panic!("floats.c:{}: {}", f.line, f.message));
         let low = super::lower::lower(&prog, &c).unwrap_or_else(|e| panic!("floats.c:{}: {}", e.0, e.1));
         assert_eq!(low.globals, 0, "the float library keeps nothing between calls");
-        let rename = |s: &str| s.strip_prefix("u.").map(|n| format!("lib.{n}")).unwrap_or(s.to_string());
+        let rename = |s: &str| s.strip_prefix("u.").map(|n| format!("lib.float.{n}")).unwrap_or(s.to_string());
         low.funcs
             .into_iter()
             .filter(|f| f.name != "u.main")
@@ -67,24 +70,24 @@ pub const MAX_LEN: i64 = 1 << 40;
 pub const OUT_OF_MEMORY: &[u8] = b"strike: out of memory: a list or slice that large is not made, so the program stops\n";
 
 /// A function being written: its code, its labels and its slots.
-struct B {
-    code: Vec<Op>,
+pub(super) struct B {
+    pub(super) code: Vec<Op>,
     labels: u32,
 }
 
 impl B {
-    fn new() -> B {
+    pub(super) fn new() -> B {
         B { code: Vec::new(), labels: 0 }
     }
-    fn label(&mut self) -> u32 {
+    pub(super) fn label(&mut self) -> u32 {
         self.labels += 1;
         self.labels - 1
     }
-    fn o(&mut self, ops: &[Op]) {
+    pub(super) fn o(&mut self, ops: &[Op]) {
         self.code.extend_from_slice(ops);
     }
     /// The word at slot s plus off bytes.
-    fn field(&mut self, s: u32, off: i64) {
+    pub(super) fn field(&mut self, s: u32, off: i64) {
         self.code.push(Op::Load(s));
         if off != 0 {
             self.o(&[Op::Push(off), Op::Bin(BinOp::Add)]);
@@ -103,7 +106,7 @@ impl B {
         let ok = self.label();
         self.o(&[Op::Load(n), Op::Push(MAX_LEN), Op::Bin(BinOp::Ule), Op::Jnz(ok), Op::Fail(1, OUT_OF_MEMORY.to_vec()), Op::Label(ok)]);
     }
-    fn done(self, name: &str, params: u32, slots: u32) -> Func {
+    pub(super) fn done(self, name: &str, params: u32, slots: u32) -> Func {
         Func::new(name, params, slots, self.code)
     }
 }
@@ -133,7 +136,7 @@ pub fn make(printers: &BTreeMap<String, Printer>, basics: &std::collections::Has
     out.into_values().collect()
 }
 
-fn call(name: &str, n: u32) -> Op {
+pub(super) fn call(name: &str, n: u32) -> Op {
     Op::Call(name.to_string(), n)
 }
 
@@ -353,7 +356,7 @@ fn basic(name: &str) -> Option<Func> {
             b.o(&[Op::Load(nd), Op::Load(nl), Op::Load(nc), call("lib.header", 3), Op::Ret]);
             b.done(name, 5, 10)
         }
-        _ => return None,
+        _ => return super::strs::make(name),
     })
 }
 
@@ -382,6 +385,8 @@ pub enum Elem {
     /// a list or slice: the element's own printer; true where the element
     /// is held in place (an array), not by its address
     Nested(String, bool),
+    /// a string: true where it is shown as Python's repr, false as it is
+    Str(bool),
 }
 
 /// How a float element prints: Python's repr, or Go's %v (a float32's own
@@ -428,12 +433,13 @@ fn print(name: &str, p: &Printer) -> Func {
         Elem::Float(f) => {
             b.o(&[Op::LoadM(8), Op::Store(4), Op::AddrG(f.buf), Op::Load(4)]);
             if f.repr {
-                b.o(&[Op::AddrG(f.buf), call("lib.py_repr", 2)]);
+                b.o(&[Op::AddrG(f.buf), call("lib.float.py_repr", 2)]);
             } else {
-                b.o(&[Op::Push(f.f32 as i64), Op::Push(b'g' as i64), Op::Push(-1), Op::Push(1), Op::AddrG(f.buf), call("lib.fmt_float", 6)]);
+                b.o(&[Op::Push(f.f32 as i64), Op::Push(b'g' as i64), Op::Push(-1), Op::Push(1), Op::AddrG(f.buf), call("lib.float.fmt_float", 6)]);
             }
             b.o(&[Op::PrintMem]);
         }
+        Elem::Str(repr) => b.o(&[Op::LoadM(8), call(if *repr { "lib.py_repr_print" } else { "lib.str_print" }, 1), Op::Pop]),
         Elem::Bool => {
             let (yes, no) = p.words.clone().unwrap_or((b"1".to_vec(), b"0".to_vec()));
             let (other, done) = (b.label(), b.label());

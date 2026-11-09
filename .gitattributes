@@ -1,2 +1,4 @@
 # the outputs of clang, Go and Python, compared byte for byte
 tests/uc/*.out binary
+# and the input they were given, its line ends as they are
+tests/uc/*.in binary

@@ -64,6 +64,9 @@ pub enum BinOp {
     FLe,
     FGt,
     FGe,
+    /// Python's `in` of strings: a library call, never an operation of
+    /// the IR itself
+    In,
 }
 
 impl BinOp {
@@ -95,13 +98,14 @@ impl BinOp {
             "ult" => Ult,
             "ule" => Ule,
             "div_true" => DivTrue,
+            "in" => In,
             _ => return None,
         })
     }
 
     pub fn is_comparison(self) -> bool {
         use BinOp::*;
-        matches!(self, Eq | Ne | Lt | Le | Gt | Ge | Ult | Ule)
+        matches!(self, Eq | Ne | Lt | Le | Gt | Ge | Ult | Ule | In)
     }
 
     /// An operation on floats (its numbers are bit patterns of doubles).
@@ -316,6 +320,10 @@ pub enum Op {
     /// pops a value, then an address, and writes the value's low n bytes
     /// there
     StoreM(u8),
+    /// pops a value, then an address, and works the n bytes there with the
+    /// operation, the element on the left (C's a[i] += x: one instruction
+    /// that reads, works and writes the memory)
+    OpM(BinOp, u8),
     /// pushes the address of byte n of the function's own memory (its C
     /// arrays: they live as long as the call)
     Frame(u32),
@@ -330,12 +338,24 @@ pub enum Op {
     /// pops a length, then an address: those bytes on standard error, and
     /// the program stops with the exit code (a message the library made)
     FailMem(u8),
+    /// pushes the address of these bytes, kept in the read-only data (a
+    /// string literal: never written)
+    Data(Vec<u8>),
 }
 
 /// The runtime's allocator, called as a function: it pops a size in bytes
 /// and pushes the address of that many new zero bytes (8-aligned). The
 /// memory is never given back in this stage.
 pub const ALLOC: &str = "rt.alloc";
+
+/// The runtime's writer, called as a function: it pops a length, then an
+/// address, writes those bytes to standard output and pushes nothing worth
+/// keeping (a string's bytes printed where they are).
+pub const PRINT: &str = "rt.print_str";
+
+/// The runtime's reader, called as a function: it pushes the next byte of
+/// standard input, or -1 at its end (Python's input(), a byte at a time).
+pub const GETC: &str = "rt.getc";
 
 #[derive(Clone, Debug)]
 pub struct Func {
@@ -388,16 +408,16 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-4";
+pub const CODEGEN: &str = "strike-x64-5";
 
 /// How the IR's stack changes at an operation (None: nothing comes after
 /// it on the same way, a return or a stop).
 pub fn stack_effect(op: &Op) -> Option<i32> {
     Some(match op {
-        Op::Push(_) | Op::Load(_) | Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => 1,
+        Op::Push(_) | Op::Load(_) | Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) | Op::Data(_) => 1,
         Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::StoreG(_) => -1,
         Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) | Op::LoadM(_) => 0,
-        Op::StoreM(_) | Op::PrintMem => -2,
+        Op::StoreM(_) | Op::OpM(..) | Op::PrintMem => -2,
         Op::ReadToken => 2,
         Op::Call(_, n) => 1 - *n as i32,
         Op::Ret | Op::Fail(..) | Op::FailMem(_) => return None,
@@ -448,6 +468,7 @@ impl Func {
                 Op::LoadM(w) => (21, *w as i64),
                 Op::StoreM(w) => (22, *w as i64),
                 Op::Frame(n) => (23, *n as i64),
+                Op::OpM(b, w) => (26, (*b as i64) << 8 | *w as i64),
                 Op::AddrG(g) => (24, *g as i64),
                 Op::Fail(code, m) => {
                     h.update(&[25]);
@@ -455,8 +476,14 @@ impl Func {
                     h.update(m);
                     (25, *code as i64)
                 }
-                Op::PrintMem => (26, 0),
-                Op::FailMem(code) => (27, *code as i64),
+                Op::Data(d) => {
+                    h.update(&[29]);
+                    h.update(&(d.len() as u32).to_le_bytes());
+                    h.update(d);
+                    (29, 0)
+                }
+                Op::PrintMem => (27, 0),
+                Op::FailMem(code) => (28, *code as i64),
             };
             h.update(&[tag]);
             h.update(&a.to_le_bytes());

@@ -74,10 +74,33 @@ pub struct FuncDef {
     pub line: u32,
 }
 
+/// One module or package an import names, and the name it is given here.
+#[derive(Clone, Debug)]
+pub struct Spec {
+    pub path: String,
+    pub alias: Option<String>,
+    pub line: u32,
+}
+
+/// import m, import "mod/pkg", from m import a: where it stands among the
+/// top-level statements (`at`: how many come before it).
+#[derive(Clone, Debug)]
+pub struct Import {
+    /// Python's from m: the module the names are taken from (the specs are
+    /// the names; none: `from m import *`)
+    pub from: Option<String>,
+    pub specs: Vec<Spec>,
+    pub line: u32,
+    pub at: usize,
+}
+
 #[derive(Default, Debug)]
 pub struct Program {
     pub funcs: Vec<FuncDef>,
     pub top: Vec<Stmt>,
+    pub imports: Vec<Import>,
+    /// Go's package clause
+    pub package: Option<(String, u32)>,
 }
 
 /// Why a file could not be read: where the reading got furthest, and what
@@ -104,10 +127,11 @@ struct Caps {
     types: Vec<Vec<String>>,
     places: Vec<(String, Vec<Expr>)>,
     dims: Vec<Vec<Option<Expr>>>,
+    imports: Vec<Import>,
 }
 
 impl Caps {
-    fn mark(&self) -> [usize; 10] {
+    fn mark(&self) -> [usize; 11] {
         [
             self.exprs.len(),
             self.bodies.len(),
@@ -119,9 +143,11 @@ impl Caps {
             self.types.len(),
             self.places.len(),
             self.dims.len(),
+            self.imports.len(),
         ]
     }
-    fn reset(&mut self, m: [usize; 10]) {
+    fn reset(&mut self, m: [usize; 11]) {
+        self.imports.truncate(m[10]);
         self.places.truncate(m[8]);
         self.dims.truncate(m[9]);
         self.exprs.truncate(m[0]);
@@ -138,6 +164,8 @@ impl Caps {
 enum Parsed {
     Stmt(Stmt),
     Func(FuncDef),
+    Import(Import),
+    Package(String, u32),
     Ignore,
 }
 
@@ -273,6 +301,7 @@ impl<'a> P<'a> {
                     T::Eof => return Ok(out),
                     _ => match self.statement(Ctx::Stmt)? {
                         Parsed::Stmt(s) => out.push(s),
+                        Parsed::Import(i) => return self.fatal(i.line, "an import inside a function or a block is not in Strike yet".into()),
                         _ => return self.miss("a statement"),
                     },
                 }
@@ -466,7 +495,13 @@ impl<'a> P<'a> {
                     _ => return self.miss("a simple statement"),
                 },
                 Pat::Cap(Cap::Place) => {
-                    let n = self.name()?;
+                    let mut n = self.name()?;
+                    // pkg.X = v, m.x = v: a name of another module
+                    if self.l.dotted() && self.text() == Some(".") {
+                        self.i += 1;
+                        let m = self.name()?;
+                        n = format!("{n}.{m}");
+                    }
                     let mut index = Vec::new();
                     while self.eat("[") {
                         index.push(self.expr(0)?.0);
@@ -501,6 +536,7 @@ impl<'a> P<'a> {
                     self.seq(&f.pat, &mut sub, Ctx::Stmt)?;
                     match self.build(f, sub, line) {
                         Parsed::Stmt(s) => caps.bodies.push(vec![s]),
+                        Parsed::Import(i) => caps.imports.push(i),
                         _ => return self.miss("a statement"),
                     }
                 }
@@ -517,6 +553,24 @@ impl<'a> P<'a> {
                         caps.reset(m);
                     }
                 }
+                Pat::Many(alts) => loop {
+                    let (at, m) = (self.i, caps.mark());
+                    let mut matched = false;
+                    for a in alts {
+                        if self.seq(a, caps, ctx).is_ok() && self.i > at {
+                            matched = true;
+                            break;
+                        }
+                        if self.fatal.is_some() {
+                            return Err(Miss);
+                        }
+                        self.i = at;
+                        caps.reset(m);
+                    }
+                    if !matched {
+                        break;
+                    }
+                },
             }
         }
         Ok(())
@@ -564,6 +618,21 @@ impl<'a> P<'a> {
                 })
             }
             Kind::Ignore => return Parsed::Ignore,
+            Kind::Package => return Parsed::Package(names.next().unwrap_or_default(), line),
+            Kind::Import | Kind::ImportFrom => {
+                let mut specs: Vec<Spec> = c.imports.drain(..).flat_map(|i| i.specs).collect();
+                let from = if f.kind == Kind::ImportFrom { names.next() } else { None };
+                // a spec itself: Go's [name] "path", Python's name [as name]
+                if specs.is_empty() && f.kind == Kind::Import {
+                    let n: Vec<String> = names.collect();
+                    let (path, alias) = match c.strs.pop() {
+                        Some(p) => (String::from_utf8_lossy(&p).to_string(), n.first().cloned()),
+                        None => (n.first().cloned().unwrap_or_default(), n.get(1).cloned()),
+                    };
+                    specs.push(Spec { path, alias, line });
+                }
+                return Parsed::Import(Import { from, specs, line, at: 0 });
+            }
             Kind::Var => Stmt::Var {
                 name: names.next().unwrap_or_default(),
                 ty: c.types.first().cloned().unwrap_or_default(),
@@ -645,7 +714,7 @@ impl<'a> P<'a> {
                     let Some(i) = lo else { return self.miss("an index") };
                     e = Expr::Index(Box::new(e), i, line);
                 }
-            } else if (!self.l.methods.is_empty() || !self.l.qualified.is_empty()) && self.text() == Some(".") {
+            } else if (!self.l.methods.is_empty() || self.l.dotted()) && self.text() == Some(".") {
                 self.i += 1;
                 let name = match self.peek().clone() {
                     T::Ident(s) => {
@@ -654,6 +723,13 @@ impl<'a> P<'a> {
                     }
                     _ => return self.miss("a method's name"),
                 };
+                // m.x, pkg.X: a name of another module, not a call
+                if self.l.dotted() && self.text() != Some("(") {
+                    if let Expr::Var(n, l) = &e {
+                        e = Expr::Var(format!("{n}.{name}"), *l);
+                        continue;
+                    }
+                }
                 self.expect("(")?;
                 let a = self.args()?;
                 self.expect(")")?;
@@ -757,7 +833,7 @@ impl<'a> P<'a> {
             }
             T::Str(s) => {
                 self.i += 1;
-                (Expr::Str(s), false)
+                (self.postfix(Expr::Str(s))?, false)
             }
             // C's (type) value: type words, and nothing else, up to the `)`
             T::Punct(p) if p == "(" && l.casts && self.cast_ahead() => {
@@ -807,7 +883,9 @@ impl<'a> P<'a> {
                 } else if matches!(t, T::Ident(_))
                     && (!l.keywords.contains(&word)
                         // a type called like a function: Python's int(...)
-                        || (l.type_words.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "(")))
+                        || (l.type_words.contains(&word) && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == "("))
+                        // a package a form names, used otherwise: fmt.Sprint(x)
+                        || (l.dotted() && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(T::Punct(p)) if p == ".")))
                 {
                     self.i += 1;
                     let e = if self.eat("(") {
@@ -860,6 +938,11 @@ pub fn parse(toks: &[Tok], l: &Lang) -> Result<Program, Failure> {
         match p.statement(Ctx::Top) {
             Ok(Parsed::Func(f)) => prog.funcs.push(f),
             Ok(Parsed::Stmt(s)) => prog.top.push(s),
+            Ok(Parsed::Import(mut i)) => {
+                i.at = prog.top.len();
+                prog.imports.push(i);
+            }
+            Ok(Parsed::Package(n, line)) => prog.package = Some((n, line)),
             Ok(Parsed::Ignore) => {}
             Err(Miss) => return Err(fail(&p)),
         }

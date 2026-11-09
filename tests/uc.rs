@@ -158,6 +158,51 @@ fn python_stops_on_floats_where_python_raises() {
     }
 }
 
+#[test]
+fn strings_are_what_clang_go_and_python_make_of_them() {
+    for file in ["strings.c", "strings.go", "strings.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+    runs_with_input_as_the_real_one("strings_input.py", "strings_input.in");
+}
+
+/// What a string cannot be stops the program as the language stops it
+/// (Python's IndexError, ValueError, TypeError and EOFError with exit code
+/// 1, Go's panic with 2), with what was printed before it and nothing
+/// after; and what Strike's strings do not hold stops it with Strike's
+/// reason, never a wrong string.
+#[test]
+fn a_string_that_cannot_be_stops_the_program_as_python_and_go_stop_it() {
+    let r = root("string-errors");
+    for (name, src, stdin, code, says) in [
+        ("index.py", "s = \"abc\"\nprint(s[-3])\nprint(s[3])\nprint(9)\n", "", 1, "IndexError: string index out of range"),
+        ("int.py", "print(int(\" 1_0 \"))\nprint(int(\"1__0\"))\n", "", 1, "ValueError"),
+        ("ord.py", "print(ord(\"a\"))\nprint(ord(\"ab\"))\n", "", 1, "TypeError"),
+        ("chr.py", "print(chr(97))\nprint(chr(1114112))\n", "", 1, "ValueError"),
+        ("eof.py", "print(input())\nprint(input())\n", "one\n", 1, "EOFError"),
+        ("byte.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 3\n\tfmt.Println(s[2])\n\tfmt.Println(s[i])\n}\n", "", 2, "index out of range"),
+        ("cut.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 2\n\tfmt.Println(s[1:3])\n\tfmt.Println(s[i:1])\n}\n", "", 2, "slice bounds out of range"),
+        ("past.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"abc\"\n\ti := 4\n\tfmt.Println(s[:3])\n\tfmt.Println(s[:i])\n}\n", "", 2, "slice bounds out of range"),
+        // not exact yet: refused while running, with the reason
+        ("chr_past.py", "print(chr(65))\nprint(chr(233))\n", "", 1, "past ASCII"),
+        ("read_past.py", "print(input())\nprint(input())\n", "ok\ncaf\u{e9}\n", 1, "past ASCII"),
+        ("lone_cr.py", "print(input())\nprint(input())\n", "ok\na\rb\n", 1, "carriage return"),
+        ("quote_past.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Printf(\"%q\\n\", \"ab\")\n\tfmt.Printf(\"%q\\n\", \"caf\u{e9}\")\n}\n", "", 1, "%q of a string past ASCII"),
+    ] {
+        let p = r.join(name);
+        std::fs::write(&p, src).unwrap();
+        for mode in [vec!["--plain"], vec![], vec!["--release"]] {
+            let exe = r.join("a.exe");
+            let o = compile_with(&r, &p, &exe, &mode, None);
+            assert!(o.status.success(), "{name}: {}", text(&o));
+            let got = run_with(&exe, stdin.as_bytes());
+            assert_eq!(got.status.code(), Some(code), "{name} {mode:?}");
+            assert_eq!(String::from_utf8_lossy(&got.stdout).lines().count(), 1, "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stdout));
+            assert!(String::from_utf8_lossy(&got.stderr).contains(says), "{name} {mode:?}: {}", String::from_utf8_lossy(&got.stderr));
+        }
+    }
+}
+
 /// An index out of range stops the program as the language stops it:
 /// Python's IndexError with exit code 1, Go's panic with exit code 2, and
 /// nothing printed after it.
@@ -379,7 +424,7 @@ impl Gen {
         }
     }
     fn program(&mut self) -> String {
-        let mut out = String::from("#include <stdio.h>\n");
+        let mut out = String::from("#include <stdio.h>\n#include <string.h>\n");
         // two globals every function may read and change
         out += &format!("long long g0 = {};\nlong long g1;\n", self.constant());
         let mut funcs: Vec<(String, usize)> = Vec::new();
@@ -508,10 +553,28 @@ impl Gen {
             );
             floats.push(format!("d{k}"));
         }
+        // strings: a char array made from a literal and changed in place,
+        // a pointer to a literal, strlen (compared unsigned) and strcmp
+        let word = |g: &mut Gen| -> String { (0..1 + g.below(20)).map(|_| (b'a' + g.below(26) as u8) as char).collect() };
+        let mut texts = Vec::new();
+        for k in 0..3 {
+            let names = vec!["n".to_string(), "i".to_string(), "buf[i]".to_string(), "p[i % 3]".to_string()];
+            out += &format!(
+                "long long t{k}(long long n) {{\n    char buf[24] = \"{}\";\n    const char *p = \"{}\";\n    for (long long i = 0; buf[i]; i++) {{\n        buf[i] = 'a' + (({}) & 15);\n    }}\n    printf(\"%s %c %zu\\n\", buf, buf[0], strlen(p));\n    return strlen(buf) * 3 + strcmp(buf, p) + (strlen(buf) > n) + (n <= strlen(p));\n}}\n",
+                word(self),
+                // at least three chars: p[i % 3] is always one of them or its zero
+                word(self) + "abc",
+                self.expr(&names, &[], 3)
+            );
+            texts.push(format!("t{k}"));
+        }
         out += "int main() {\n";
         for f in &floats {
             let c = |g: &mut Gen| ["1.5", "-0.0", "1e308", "3", "0.1", "-2.5e-300"][g.below(6) as usize];
             out += &format!("    printf(\"%.17g %e %g\\n\", {f}({}, {}, {}), {f}(2, -1, 5), {f}({}, 0.5, -3));\n", c(self), c(self), self.constant(), c(self));
+        }
+        for f in &texts {
+            out += &format!("    printf(\"%lld\\n\", {f}({}));\n", self.constant());
         }
         for (f, a) in &sums {
             out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
@@ -691,7 +754,37 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         ("mixed.py", "a = [1, True]\nprint(a)\n", "one kind per list"),
         ("uint.go", "package main\nfunc main() {\n\tvar x uint = 1\n\tx = x + 1\n}\n", "unsigned numbers are not in Strike yet"),
         ("unbound.py", "n = 1\ndef f():\n    print(n)\n    n = 2\nf()\n", "read before this function assigns it"),
-        ("string.py", "x = input()\nprint(x)\n", "strings are not in Strike yet"),
+        // the preprocessor: what it does not do, and a header it does not know
+        ("pragma.c", "#pragma pack(1)\nint main() { return 0; }\n", "#pragma pack(1) is not in Strike yet"),
+        ("windows.c", "#include <windows.h>\nint main() { return 0; }\n", "the header <windows.h> is not one Strike knows"),
+        ("error.c", "#if 1\n#error stop here\n#endif\nint main() { return 0; }\n", "error.c:2: #error stop here"),
+        ("file.c", "#include <stdio.h>\nint main() { puts(__FILE__); return 0; }\n", "__FILE__ depends on how and when clang is run"),
+        ("unterminated.c", "#ifdef X\nint main() { return 0; }\n", "unterminated conditional directive"),
+        // packages and modules
+        ("init.go", "package main\nfunc init() {\n}\nfunc main() {\n}\n", "a package's init function is not in Strike yet"),
+        ("lib.go", "package lib\nfunc main() {\n}\n", "package lib is not a main package"),
+        ("os.go", "package main\nimport \"os\"\nfunc main() {\n}\n", "the package os is not in Strike yet"),
+        ("sprintf.go", "package main\nimport \"fmt\"\nfunc main() {\n\tx := fmt.Sprint(1)\n\tfmt.Println(x)\n}\n", "fmt.Sprint is not in Strike yet"),
+        ("os.py", "import os\nprint(1)\n", "os is one of Python's own modules"),
+        ("mathfrom.py", "from math import sqrt\nprint(sqrt(2.0))\n", "from math import ... is not in Strike yet"),
+        ("mathas.py", "import math as m\nprint(m.sqrt(2.0))\n", "import math as ... is not in Strike yet"),
+        ("missing.py", "import nowhere\nprint(1)\n", "there is no nowhere.py next to missing.py"),
+        ("nested.py", "def f():\n    import nowhere\n    return 1\nprint(f())\n", "an import inside a function or a block is not in Strike yet"),
+        // strings: what is not exact yet
+        ("unicode.py", "s = \"caf\u{e9}\"\nprint(len(s))\n", "past ASCII"),
+        ("unicode_print.py", "print(\"caf\u{e9}\")\n", "past ASCII"),
+        ("change.py", "s = \"abc\"\ns[0] = \"x\"\n", "a string is not changed in place"),
+        ("str_int.py", "print(\"a\" + 1)\n", "this operator on a string and a number"),
+        ("list_in.py", "print(1 in [1, 2])\n", "this operator on a number and a list"),
+        ("split_sep.py", "print(\"a,b\".split(\",\"))\n", ".split() with these values"),
+        ("bytes.go", "package main\nimport \"fmt\"\nfunc main() {\n\tb := []byte{1}\n\tfmt.Println(b)\n}\n", "a slice or an array of bytes is not in Strike yet"),
+        ("atoi.go", "package main\nimport \"strconv\"\nfunc main() {\n\tn := strconv.Atoi(\"1\")\n\tn = n + 1\n}\n", "strconv.Atoi is not in Strike yet"),
+        ("quote_int.go", "package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Printf(\"%q\\n\", 65)\n}\n", "%q is given a number"),
+        ("string_cond.go", "package main\nimport \"fmt\"\nfunc main() {\n\ts := \"a\"\n\tif s {\n\t\tfmt.Println(s)\n\t}\n}\n", "a string is not a condition"),
+        ("pointer_math.c", "#include <stdio.h>\nint main() { const char *p = \"abc\"; puts(p + 1); return 0; }\n", "this operator on a pointer"),
+        ("strlen_div.c", "#include <string.h>\nint main() { return strlen(\"abcd\") / 2; }\n", "unsigned division"),
+        ("char_array.c", "int main() { char s[2] = \"abc\"; return s[0]; }\n", "a string of 3 chars is given to an array of 2"),
+        ("int_string.c", "int main() { int s[4] = \"abc\"; return s[0]; }\n", "only a char array is given a string"),
     ] {
         let p = r.join(name);
         std::fs::write(&p, src).unwrap();
@@ -699,4 +792,133 @@ fn what_strike_cannot_do_yet_is_refused_not_guessed() {
         assert!(!o.status.success(), "{name} compiled");
         assert!(text(&o).contains(says), "{name}: {}", text(&o));
     }
+}
+
+/// Builds a program of several files in every mode, given as its
+/// directory and as its files one by one: what it prints must be what the
+/// real toolchain printed for it (tests/uc/<dir>.out).
+fn program_runs_in_every_mode_as_the_real_one(dir: &str, files: &[&str], lang: &str) {
+    let want = std::fs::read(suite(&format!("{dir}.out"))).unwrap();
+    let r = root(&format!("program-{dir}"));
+    let named: Vec<String> = files.iter().map(|f| suite(dir).join(f).to_str().unwrap().to_string()).collect();
+    for (round, given) in [vec![suite(dir).to_str().unwrap().to_string()], named].into_iter().enumerate() {
+        for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+            let exe = r.join("a.exe");
+            let o = Command::new(env!("CARGO_BIN_EXE_strike"))
+                .arg("compile")
+                .args(&given)
+                .args(["-o", exe.to_str().unwrap()])
+                .args(&mode)
+                .env("STRIKE_HOME", r.join("home"))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{given:?} {mode:?}: {}", text(&o));
+            assert!(text(&o).contains(&format!("read as {lang};")), "{}", text(&o));
+            // the same program given the other way is the same IR: every
+            // function is struck from its brand
+            if round == 1 && mode.is_empty() {
+                assert!(text(&o).contains(" struck, 0 compiled"), "{}", text(&o));
+            }
+            let got = Command::new(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&want), "{given:?} {mode:?}");
+            assert!(got.status.success(), "{given:?} {mode:?}");
+        }
+    }
+}
+
+/// C: three files linked by a header's functions and extern globals; the
+/// static names of two files are the same, and each file has its own.
+#[test]
+fn several_c_files_are_one_program_as_clang_links_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_c", &["main.c", "calc.c", "counter.c"], "C");
+}
+
+/// Go: package main in two files, and two packages of the module, one
+/// importing the other; their variables are given before main's.
+#[test]
+fn go_packages_of_a_module_are_what_go_makes_of_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_go", &["main.go", "helper.go"], "Go");
+}
+
+/// Python: modules next to the main one, each run once where it is first
+/// imported; `from m import x` copies x as it is then.
+#[test]
+fn python_modules_run_as_python_imports_them() {
+    program_runs_in_every_mode_as_the_real_one("multi_py", &["__main__.py"], "Python");
+}
+
+/// Macros, conditionals and a header, compiled and run as clang's.
+#[test]
+fn the_preprocessed_program_prints_what_clangs_prints() {
+    runs_in_every_mode_as_the_real_one("preprocess.c");
+}
+
+/// A program of several files that Strike cannot make what the language
+/// makes of it is refused, at the file and line it stops on.
+#[test]
+fn what_several_files_cannot_do_yet_is_refused_not_guessed() {
+    let r = root("refused-programs");
+    let go_mod = ("go.mod", "module example.com/m\n\ngo 1.22\n");
+    let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+        (
+            "unexported",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n\tcalc.add(1, 2)\n}\n"), ("calc/calc.go", "package calc\nfunc add(a, b int) int {\n\treturn a + b\n}\n")],
+            "main.go:4: name add not exported by package calc",
+        ),
+        (
+            "unused",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n}\n"), ("calc/calc.go", "package calc\nfunc Add(a, b int) int {\n\treturn a + b\n}\n")],
+            "\"example.com/m/calc\" imported and not used",
+        ),
+        (
+            "cycle",
+            vec![
+                go_mod,
+                ("main.go", "package main\nimport \"example.com/m/a\"\nfunc main() {\n\ta.F()\n}\n"),
+                ("a/a.go", "package a\nimport \"example.com/m/b\"\nfunc F() {\n\tb.G()\n}\n"),
+                ("b/b.go", "package b\nimport \"example.com/m/a\"\nfunc G() {\n\ta.F()\n}\n"),
+            ],
+            "import cycle not allowed",
+        ),
+        (
+            "require",
+            vec![("go.mod", "module example.com/m\n\ngo 1.22\n\nrequire example.com/other v1.0.0\n"), ("main.go", "package main\nfunc main() {\n}\n")],
+            "go.mod:5: require in go.mod is not in Strike yet",
+        ),
+        (
+            "twice",
+            vec![("a.c", "int f(void) { return 1; }\nint main() { return f(); }\n"), ("b.c", "int f(void) { return 2; }\n")],
+            "b.c:1: f is defined in",
+        ),
+        ("static", vec![("a.c", "int helper(void);\nint main() { return helper(); }\n"), ("b.c", "static int helper(void) { return 2; }\n")], "there is no function helper"),
+        ("header_line", vec![("main.c", "#include \"bad.h\"\nint main() { return 0; }\n"), ("bad.h", "/* a header */\n\nint x = ;\n")], "bad.h:3:"),
+        (
+            "circular",
+            vec![("__main__.py", "import a\nprint(a.x)\n"), ("a.py", "import b\nx = 1\n"), ("b.py", "import a\ny = 2\n")],
+            "a circular import is not in Strike yet",
+        ),
+        ("noname", vec![("__main__.py", "from m import nothing\n"), ("m.py", "x = 1\n")], "__main__.py:1: cannot import name nothing from m"),
+        ("star", vec![("__main__.py", "from m import *\n"), ("m.py", "x = 1\n")], "from m import * is not in Strike yet"),
+        ("module_line", vec![("__main__.py", "import m\n"), ("m.py", "x = 1\nprint(x ** 2)\n")], "m.py:2:"),
+        ("module_value", vec![("__main__.py", "import m\nprint(m)\n"), ("m.py", "x = 1\n")], "m is a module"),
+    ];
+    for (name, files, says) in cases {
+        let d = r.join(name);
+        for (f, src) in files {
+            let p = d.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, src).unwrap();
+        }
+        let o = compile(&r, &d, &r.join("a.exe"));
+        assert!(!o.status.success(), "{name} compiled");
+        assert!(text(&o).replace('\\', "/").contains(says), "{name}: {}", text(&o));
+    }
+    // Python runs one file: the others are imported, not given
+    let d = r.join("noname");
+    let o = Command::new(env!("CARGO_BIN_EXE_strike"))
+        .args(["compile", d.join("__main__.py").to_str().unwrap(), d.join("m.py").to_str().unwrap(), "-o", r.join("a.exe").to_str().unwrap()])
+        .env("STRIKE_HOME", r.join("home"))
+        .output()
+        .unwrap();
+    assert!(!o.status.success() && text(&o).contains("Python runs one file"), "{}", text(&o));
 }
