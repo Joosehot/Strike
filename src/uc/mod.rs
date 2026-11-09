@@ -22,6 +22,8 @@ mod lower;
 mod opt;
 mod parse;
 mod pe;
+mod rotate;
+mod scev;
 mod x64;
 mod x64opt;
 
@@ -115,6 +117,8 @@ pub struct Report {
     /// --release: operations the algebra changed, expressions moved out of loops
     pub simplified: usize,
     pub hoisted: usize,
+    /// --release: loops replaced by the closed form of their sums
+    pub closed: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -268,13 +272,15 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
-    let (mut simplified, mut hoisted) = (0, 0);
+    let (mut simplified, mut hoisted, mut closed) = (0, 0, 0);
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
             simplified += opt::simplify(f);
             hoisted += opt::hoist(f);
+            closed += scev::run(f);
             fold::run(f);
+            rotate::run(f);
         }
     }
     let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
@@ -354,6 +360,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
         evaluated,
         simplified,
         hoisted,
+        closed,
     })
 }
 

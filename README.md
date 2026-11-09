@@ -386,12 +386,48 @@ would compute something else. Mean of 5 runs:
 | pow2 (`s += i*8 + (i*4+1)*1 + 0`) | 0.0340 s | 0.0050 s | clang worked the loop out while compiling |
 
 On pow2, clang found the loop's sum while compiling, from the loop's
-recurrences (SCEV). With evaluation on, Strike's `--release` does the
-same: it runs the program once while compiling, and the executable prints
-the number in 4 ms. Strike does not yet have the recurrence algebra clang
-used, so a loop like that whose numbers come from input stays a loop.
-That, and SIMD vectorisation, are what clang -O2 still has that Strike
-does not.
+recurrences (SCEV). Two more release passes followed:
+
+- **A sum's closed form** ([src/uc/scev.rs](src/uc/scev.rs)), as clang's
+  SCEV does. Take a loop `for (c = a; c < N; c++) s = s + P(c)`, where P
+  is a polynomial of degree up to 3. The stored expression is read as a
+  polynomial in s and c, and must be s plus P(c). P(a + k) is written in
+  the binomial basis, and sum_{k<T} C(k, m) = C(T, m+1), so the loop
+  becomes sum b_m C(T, m+1).
+  - The arithmetic is modulo 2^64, as the loop's own wrapping arithmetic
+    would be. The binomials are exact, because m! is divided out of the
+    factors before they are multiplied.
+  - The loop may add to several locals.
+  - A local copying the counter (Python's `for i in range(...)`) gets the
+    counter's last value.
+  - If N is known while compiling, any degree up to 3 works. If N is in a
+    local, degree up to 1 works, and the result is worked out when the
+    program runs.
+  - Unit tests check the binomials against exact numbers, and the closed
+    form against the loop for 300 random polynomials, with overflow. The
+    random-program test also writes three sum loops per program, in every
+    shape plus one that must stay a loop (`s = s * 3 + ...`). 438 loops
+    were replaced, and all printed what the plain code prints.
+- **Loop rotation and unrolling** ([src/uc/rotate.rs](src/uc/rotate.rs)).
+  The test moves to the loop's bottom, so there is one jump less each time
+  round. A short body with no jump in it goes round twice per jump back.
+- **A remainder by a magic number is three instructions**
+  (`imul; neg; add`), not eight.
+
+Against clang -O2 again, the mean of 7 runs, with `--no-evaluate`:
+
+| | Strike --release | clang -O2 | go | Strike against clang -O2 |
+|---|---|---|---|---|
+| pow2 | 0.0044 s | 0.0051 s | 0.0415 s | as fast (both worked the loop out) |
+| invariant loops | 0.0271 s (0.031 s before) | 0.0275 s | 0.0283 s | 1% faster (13% slower before) |
+| primes | 0.0206 s | 0.0220 s | 0.0283 s | 6% faster |
+| 30 million calls | 0.0845 s | 0.0994 s | 0.0911 s | 15% faster |
+| fib(36) | 0.0293 s | 0.0345 s | 0.0591 s | 15% faster |
+
+On these five, Strike's release build is now as fast as clang -O2 or
+faster. What clang -O2 still has and Strike does not is SIMD
+vectorisation, and everything for the parts of the languages Strike does
+not have yet: arrays, strings, floats, memory.
 
 ## A program that reads nothing is worked out while compiling (--release)
 

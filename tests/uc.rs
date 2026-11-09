@@ -182,7 +182,50 @@ impl Gen {
             );
             recs.push((format!("r{k}"), depth));
         }
+        // loops that only add up a polynomial of their counter, in every
+        // shape the closed form takes, and some it must leave alone
+        let mut sums = Vec::new();
+        for k in 0..3 {
+            let c = |g: &mut Gen| -> String {
+                match g.below(4) {
+                    0 => format!("{}", g.next() as i64 >> g.below(64)),
+                    _ => format!("{}", g.below(50) as i64 - 25),
+                }
+            };
+            let mut poly = c(self);
+            for _ in 0..self.below(4) {
+                let term = match self.below(5) {
+                    0 => format!("i * {}", c(self)),
+                    1 => format!("i * i * {}", c(self)),
+                    2 => format!("i * i * i * {}", c(self)),
+                    3 => format!("(i << {})", self.below(70)),
+                    _ => format!("-(i * {})", c(self)),
+                };
+                poly = format!("({poly} {} {term})", ["+", "-"][self.below(2) as usize]);
+            }
+            let (bound, arg) = match self.below(3) {
+                0 => (format!("< {}", self.below(3000)), String::new()),
+                1 => (format!("<= {}", self.below(3000)), String::new()),
+                _ => ("< n".to_string(), format!("{}", self.below(3000) as i64 - 50)),
+            };
+            let stmt = match self.below(5) {
+                0 => format!("s = s + {poly};"),
+                1 => format!("s += {poly};"),
+                2 => format!("s = {poly} + s;"),
+                3 => format!("s -= {poly};"),
+                _ => format!("s = s * 3 + {poly};"), // not a sum: must stay a loop
+            };
+            out += &format!(
+                "long z{k}(long n) {{\n    long s = {};\n    for (long i = {}; i {bound}; i++) {{\n        {stmt}\n    }}\n    return s + n;\n}}\n",
+                c(self),
+                self.below(40)
+            );
+            sums.push((format!("z{k}"), if arg.is_empty() { format!("{}", self.below(100)) } else { arg }));
+        }
         out += "int main() {\n";
+        for (f, a) in &sums {
+            out += &format!("    printf(\"%lld\\n\", {f}({a}));\n");
+        }
         for (f, n) in &funcs {
             let args: Vec<String> = (0..*n).map(|_| self.constant()).collect();
             out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));

@@ -205,7 +205,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 r.exe_bytes
             );
             if gen == uc::Gen::Release {
-                println!("  release: {} operations simplified, {} expressions moved out of loops", r.simplified, r.hoisted);
+                println!("  release: {} operations simplified, {} expressions moved out of loops, {} loops replaced by their sums' closed form", r.simplified, r.hoisted, r.closed);
             }
             if let Some(how) = &r.evaluated {
                 println!("  the program reads nothing: {how}; the executable only prints its output");

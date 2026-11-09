@@ -649,7 +649,7 @@ impl G {
                 let Opd::Imm(d) = o else { unreachable!() };
                 let (m, s) = magic(d as i64);
                 self.a.e(&[0x49, 0x89, 0xC0]); // mov r8, rax (n)
-                self.mov_imm(RCX, m);
+                self.mov_imm(RCX, m); // (read from memory instead: measured no faster)
                 self.a.e(&[0x48, 0xF7, 0xE9]); // imul rcx: rdx = high(n * m)
                 if d > 0 && m < 0 {
                     self.a.e(&[0x4C, 0x01, 0xC2]); // add rdx, r8
@@ -660,6 +660,14 @@ impl G {
                     self.a.e(&[0x48, 0xC1, 0xFA, s as u8]); // sar rdx, s
                 }
                 self.a.e(&[0x48, 0x89, 0xD0, 0x48, 0xC1, 0xE8, 0x3F, 0x48, 0x01, 0xD0]); // rax = q (+1 if negative)
+                if b == BinOp::ModTrunc {
+                    // the remainder is n - q * d, and nothing more is needed
+                    self.a.e(&[0x48, 0x69, 0xC0]); // imul rax, rax, d
+                    self.a.d32(d);
+                    self.a.e(&[0x48, 0xF7, 0xD8, 0x4C, 0x01, 0xC0]); // neg rax; add rax, r8
+                    self.v.push(V::Rax);
+                    return;
+                }
                 if b != BinOp::DivTrunc {
                     // rdx = n - q * d, rcx = d: as idiv leaves them
                     self.a.e(&[0x48, 0x89, 0xC2, 0x48, 0x69, 0xD2]); // mov rdx, rax; imul rdx, rdx, d
