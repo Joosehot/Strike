@@ -16,7 +16,9 @@ use super::ir::{label_count, BinOp, Func, Op};
 pub fn run(f: &mut Func) -> usize {
     // a call may be given the address of this one's own memory (C's
     // `return f(a)` with a local array), which a jump would reuse
-    if f.frame > 0 {
+    // (and vector locals, which a new call would start at zero, are not
+    // made to start again)
+    if f.frame > 0 || super::ir::vector_locals(&f.code) > 0 {
         return 0;
     }
     let me = f.name.clone();

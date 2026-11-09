@@ -13,7 +13,7 @@
 //! The plain generator (x64.rs) is the reference: every program compiled
 //! here must print what it prints.
 
-use super::ir::{BinOp, Func, Op, UnOp};
+use super::ir::{BinOp, Func, Lanes, Op, UnOp};
 use super::x64::{call, Asm, Code, Target};
 
 pub const RULES: &str = include_str!("../../codegen.toml");
@@ -205,6 +205,8 @@ fn weights(f: &Func, r: &Rules) -> (Vec<f64>, Vec<f64>) {
 /// general register saves a float nothing).
 fn choose(f: &Func, r: &Rules) -> Vec<Place> {
     let (w, wf) = weights(f, r);
+    // the vector locals take the last xmm registers (x64vec.rs)
+    let float_regs = XSAVED.len() - super::ir::vector_locals(&f.code) as usize;
     let mut order: Vec<usize> = (0..w.len()).collect();
     order.sort_by(|&a, &b| (w[b] + wf[b]).total_cmp(&(w[a] + wf[a])).then(a.cmp(&b)));
     let mut beam: Vec<(f64, Vec<Place>)> = vec![(0.0, vec![Place::Mem; w.len()])];
@@ -212,7 +214,7 @@ fn choose(f: &Func, r: &Rules) -> Vec<Place> {
         let mut next = Vec::new();
         for (score, pick) in &beam {
             next.push((*score, pick.clone()));
-            for (kind, gain, limit) in [(Place::Gpr, w[s], SAVED.len()), (Place::Xmm, wf[s], XSAVED.len())] {
+            for (kind, gain, limit) in [(Place::Gpr, w[s], SAVED.len()), (Place::Xmm, wf[s], float_regs)] {
                 if pick.iter().filter(|&&p| p == kind).count() < limit && gain > 0.0 {
                     let mut p = pick.clone();
                     p[s] = kind;
@@ -295,7 +297,9 @@ fn float_uses(code: &[Op]) -> Vec<bool> {
             Op::StoreM(_) | Op::OpM(..) | Op::PrintMem => (2, 0),
             Op::Call(_, n) => (*n as usize, 1),
             Op::ReadToken => (0, 2),
-            Op::PrintStr(_) => (0, 0),
+            Op::PrintStr(_) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) => (0, 0),
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => (1, 0),
+            Op::VReduce(..) => (0, 1),
             Op::Dup | Op::Label(_) | Op::Jmp(_) | Op::Ret | Op::Fail(..) | Op::FailMem(_) => {
                 st.clear();
                 if matches!(op, Op::Dup) {
@@ -1639,6 +1643,44 @@ impl G {
             self.a.jcc(0, t); // jo
         }
     }
+    /// A vector operation (x64vec.rs): its vector locals are registers, an
+    /// address is used where it is, a value splatted comes from where it is.
+    fn vector(&mut self, op: &Op) {
+        use super::x64vec as xv;
+        let r = xv::reg;
+        match *op {
+            Op::VLoad(l, v) | Op::VStore(l, v) => {
+                let x = self.pop();
+                let addr = self.address(x);
+                let (p, ld, st) = xv::moves(l);
+                self.a.e(&[p]);
+                let code = if matches!(op, Op::VLoad(..)) { ld } else { st };
+                self.mem(false, false, &[0x0F, code], r(v), addr);
+            }
+            Op::VSplat(l, v) => match self.pop() {
+                V::X(k) if l == Lanes::F64 => xv::splat_xmm(&mut self.a, r(v), k),
+                V::Slot(s) if l == Lanes::F64 && matches!(self.loc[s as usize], Loc::Xmm(_)) => {
+                    let Loc::Xmm(k) = self.loc[s as usize] else { unreachable!() };
+                    xv::splat_xmm(&mut self.a, r(v), k)
+                }
+                x => {
+                    self.to_reg(x, R11);
+                    xv::splat_gpr(&mut self.a, l, r(v), R11);
+                }
+            },
+            Op::VConst(v, lo, hi) => xv::constant(&mut self.a, r(v), lo, hi),
+            Op::VBin(l, b, d, x, y) => xv::bin(&mut self.a, l, b, r(d), r(x), r(y)),
+            Op::VShift(l, b, d, x, k) => xv::shift(&mut self.a, l, b, r(d), r(x), k),
+            Op::VUn(l, u, d, x) => xv::un(&mut self.a, l, u, r(d), r(x)),
+            Op::VReduce(l, b, v) => {
+                self.need_rax();
+                xv::reduce(&mut self.a, l, b, RAX, r(v));
+                self.v.push(V::Rax);
+            }
+            _ => unreachable!("not a vector operation"),
+        }
+    }
+
     fn trap(&mut self) -> u32 {
         match self.trap_at {
             Some(t) => t,
@@ -1943,7 +1985,9 @@ fn float_operands(code: &[Op]) -> Vec<bool> {
             Op::StoreM(_) | Op::OpM(..) | Op::PrintMem => (2, 0),
             Op::Call(_, n) => (*n as usize, 1),
             Op::ReadToken => (0, 2),
-            Op::PrintStr(_) => (0, 0),
+            Op::PrintStr(_) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) => (0, 0),
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => (1, 0),
+            Op::VReduce(..) => (0, 1),
             Op::Dup | Op::Label(_) | Op::Jmp(_) | Op::Ret | Op::Fail(..) | Op::FailMem(_) => {
                 st.clear();
                 if matches!(op, Op::Dup) {
@@ -1953,7 +1997,7 @@ fn float_operands(code: &[Op]) -> Vec<bool> {
                 continue;
             }
         };
-        let float = matches!(op, Op::Bin(b) if b.is_float()) || matches!(op, Op::Un(u) if u.is_float());
+        let float = matches!(op, Op::Bin(b) if b.is_float()) || matches!(op, Op::Un(u) if u.is_float()) || matches!(op, Op::VSplat(Lanes::F64, _));
         for _ in 0..ins {
             if let Some(Some(p)) = st.pop() {
                 out[p] = float;
@@ -1991,7 +2035,8 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     let mut saved = Vec::new();
     let mut mem = 0i32;
     let mut free = SAVED.iter();
-    let mut xfree = XSAVED.iter();
+    let vectors = super::ir::vector_locals(&f.code) as usize;
+    let mut xfree = XSAVED[..XSAVED.len() - vectors].iter();
     let mut xused = Vec::new();
     for s in 0..f.slots as usize {
         match place[s] {
@@ -2018,7 +2063,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     // bytes of each xmm register it saves
     let memory = widest + 8 * mem;
     let xbase = memory + (f.frame as i32 + 7) / 8 * 8;
-    let xsaved: Vec<(u8, i32)> = xused.iter().enumerate().map(|(i, &k)| (k, xbase + 16 * i as i32)).collect();
+    let xsaved: Vec<(u8, i32)> = xused.iter().copied().chain((0..vectors as u8).map(super::x64vec::reg)).enumerate().map(|(i, k)| (k, xbase + 16 * i as i32)).collect();
     let mut frame = xbase + 16 * xsaved.len() as i32;
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
@@ -2085,6 +2130,10 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             Loc::Xmm(k) => g.sse_rr(None, 0x57, k, k), // xorps
         }
         zero[s as usize] = true;
+    }
+    for v in 0..vectors as u8 {
+        let k = super::x64vec::reg(v);
+        super::x64vec::rr(&mut g.a, 0x66, 0xEF, k, k); // pxor: a vector local starts at zero
     }
 
     let labels = super::ir::label_count(&f.code);
@@ -2434,6 +2483,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 }
                 g.a.bind(labels_of[l]);
             }
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) | Op::VReduce(..) => g.vector(op),
             Op::Ret => {
                 let x = g.pop();
                 g.to_reg(x, RAX);

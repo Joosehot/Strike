@@ -132,7 +132,9 @@ pub fn compile(f: &Func) -> Code {
     let mut depth_at: Vec<Option<u32>> = vec![None; labels as usize];
     // the slots below rbp, then the function's own memory below them
     let memory = -(f.slots as i32 * 8 + (f.frame as i32 + 7) / 8 * 8);
-    let frame = (-memory + 15) / 16 * 16;
+    // and the vector locals below that (x64vec.rs)
+    let vectors = super::ir::vector_locals(&f.code);
+    let frame = (-memory + 16 * vectors as i32 + 15) / 16 * 16;
     a.prologue(frame);
     // the parameters into their slots; every other slot starts at zero
     const STORE: [[u8; 3]; 4] = [[0x48, 0x89, 0x8D], [0x48, 0x89, 0x95], [0x4C, 0x89, 0x85], [0x4C, 0x89, 0x8D]];
@@ -151,6 +153,7 @@ pub fn compile(f: &Func) -> Code {
         a.d32(slot(s));
         a.d32(0);
     }
+    super::x64vec::plain_zero(&mut a, memory, vectors);
 
     let mut depth: u32 = 0;
     // where checked operations go when a number would not fit
@@ -386,6 +389,9 @@ pub fn compile(f: &Func) -> Code {
                     depth_at[*l as usize] = Some(depth);
                 }
                 a.bind(labels_of[*l as usize]);
+            }
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) | Op::VReduce(..) => {
+                super::x64vec::plain(&mut a, op, memory, &mut depth);
             }
             Op::Ret => {
                 a.e(&[0x58]);

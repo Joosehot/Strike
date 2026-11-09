@@ -33,8 +33,10 @@ mod scev;
 mod simplify;
 mod strs;
 mod values;
+mod vectorize;
 mod x64;
 mod x64opt;
+mod x64vec;
 
 use lang::Lang;
 use std::collections::HashMap;
@@ -140,6 +142,9 @@ pub struct Report {
     pub hoisted: usize,
     /// --release: loops replaced by the closed form of their sums
     pub closed: usize,
+    /// --release: loops made to work on several elements an instruction
+    #[serde(default)]
+    pub vectorized: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -324,7 +329,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
     let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
-    let (mut simplified, mut hoisted, mut closed) = (0, 0, 0);
+    let (mut simplified, mut hoisted, mut closed, mut vectorized) = (0, 0, 0, 0);
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
@@ -338,6 +343,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             simplified += ranges::run(f);
             closed += scev::run(f);
             fold::run(f);
+            vectorized += vectorize::run(f);
             rotate::run(f);
             simplified += values::run(f);
             fold::run(f);
@@ -424,6 +430,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
         simplified,
         hoisted,
         closed,
+        vectorized,
     })
 }
 

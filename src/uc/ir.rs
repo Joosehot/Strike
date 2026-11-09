@@ -341,6 +341,69 @@ pub enum Op {
     /// pushes the address of these bytes, kept in the read-only data (a
     /// string literal: never written)
     Data(Vec<u8>),
+    /// SSE2 vectors (vectorize.rs). A vector local holds 16 bytes as
+    /// lanes; vector locals are numbered from 0, apart from the slots, and
+    /// start at zero. VLoad pops an address and loads the 16 bytes there
+    /// into vector local v
+    VLoad(Lanes, u8),
+    /// pops an address and writes vector local v's 16 bytes there
+    VStore(Lanes, u8),
+    /// pops a value: every lane of v is it (an I32 lane its low 32 bits)
+    VSplat(Lanes, u8),
+    /// v holds these two 64-bit halves, the low one first
+    VConst(u8, i64, i64),
+    /// d = a op b, lane by lane: Add, Sub, Mul, Band, Bor, Bxor wrapping at
+    /// the lane's width; FAdd, FSub, FMul, FDiv as the scalar operation on
+    /// each lane, bit for bit
+    VBin(Lanes, BinOp, u8, u8, u8),
+    /// d = a shifted by the constant k (Shl, or Shr: arithmetic), k below
+    /// the lane's width
+    VShift(Lanes, BinOp, u8, u8, u8),
+    /// d = op a, lane by lane: FSqrt, FNeg, FAbs as the scalar operation
+    VUn(Lanes, UnOp, u8, u8),
+    /// pushes v's lanes combined by op (Add, Band, Bor, Bxor: an integer
+    /// reduction, which any order gives exactly), an I32 lane's result
+    /// sign-extended
+    VReduce(Lanes, BinOp, u8),
+}
+
+/// What a vector's 16 bytes are: two 64-bit integers, four 32-bit integers
+/// or two doubles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Lanes {
+    I64,
+    I32,
+    F64,
+}
+
+impl Lanes {
+    pub fn count(self) -> i64 {
+        match self {
+            Lanes::I32 => 4,
+            Lanes::I64 | Lanes::F64 => 2,
+        }
+    }
+    /// the bytes of one lane
+    pub fn width(self) -> u8 {
+        match self {
+            Lanes::I32 => 4,
+            Lanes::I64 | Lanes::F64 => 8,
+        }
+    }
+}
+
+/// How many vector locals a function's code uses (one more than the
+/// highest named).
+pub fn vector_locals(code: &[Op]) -> u32 {
+    code.iter()
+        .map(|o| match o {
+            Op::VLoad(_, v) | Op::VStore(_, v) | Op::VSplat(_, v) | Op::VConst(v, ..) | Op::VReduce(_, _, v) => *v as u32 + 1,
+            Op::VBin(_, _, d, a, b) => *d.max(a).max(b) as u32 + 1,
+            Op::VShift(_, _, d, a, _) | Op::VUn(_, _, d, a) => *d.max(a) as u32 + 1,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The runtime's allocator, called as a function: it pops a size in bytes
@@ -408,7 +471,7 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-6";
+pub const CODEGEN: &str = "strike-x64-7";
 
 /// How the IR's stack changes at an operation (None: nothing comes after
 /// it on the same way, a return or a stop).
@@ -421,6 +484,9 @@ pub fn stack_effect(op: &Op) -> Option<i32> {
         Op::ReadToken => 2,
         Op::Call(_, n) => 1 - *n as i32,
         Op::Ret | Op::Fail(..) | Op::FailMem(_) => return None,
+        Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => -1,
+        Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) => 0,
+        Op::VReduce(..) => 1,
     })
 }
 
@@ -484,6 +550,19 @@ impl Func {
                 }
                 Op::PrintMem => (27, 0),
                 Op::FailMem(code) => (28, *code as i64),
+                Op::VLoad(l, v) => (30, (*l as i64) << 8 | *v as i64),
+                Op::VStore(l, v) => (31, (*l as i64) << 8 | *v as i64),
+                Op::VSplat(l, v) => (32, (*l as i64) << 8 | *v as i64),
+                Op::VConst(v, lo, hi) => {
+                    h.update(&[33]);
+                    h.update(&lo.to_le_bytes());
+                    h.update(&hi.to_le_bytes());
+                    (33, *v as i64)
+                }
+                Op::VBin(l, b, d, x, y) => (34, (*l as i64) << 32 | (*b as i64) << 24 | (*d as i64) << 16 | (*x as i64) << 8 | *y as i64),
+                Op::VShift(l, b, d, x, k) => (35, (*l as i64) << 32 | (*b as i64) << 24 | (*d as i64) << 16 | (*x as i64) << 8 | *k as i64),
+                Op::VUn(l, u, d, x) => (36, (*l as i64) << 24 | (*u as i64) << 16 | (*d as i64) << 8 | *x as i64),
+                Op::VReduce(l, b, v) => (37, (*l as i64) << 16 | (*b as i64) << 8 | *v as i64),
             };
             h.update(&[tag]);
             h.update(&a.to_le_bytes());

@@ -15,7 +15,8 @@ pub fn run(funcs: &mut [Func], r: &Rules, release: bool) -> usize {
     let rule = r.inline_for(release);
     let leaves: HashMap<String, Func> = funcs
         .iter()
-        .filter(|f| !f.code.iter().any(|o| matches!(o, Op::Call(..))))
+        // (a callee with vector locals keeps them its own)
+        .filter(|f| !f.code.iter().any(|o| matches!(o, Op::Call(..))) && super::ir::vector_locals(&f.code) == 0)
         .map(|f| (f.name.clone(), f.clone()))
         .collect();
     let mut copied = 0;
@@ -96,7 +97,7 @@ pub fn unroll(funcs: &mut [Func], r: &Rules) -> usize {
         let me = f.name.clone();
         let calls = |code: &[Op]| code.iter().filter(|o| matches!(o, Op::Call(s, _) if *s == me)).count();
         let sites = calls(&f.code);
-        if sites == 0 || f.code.len() > r.unroll.max_ops {
+        if sites == 0 || f.code.len() > r.unroll.max_ops || super::ir::vector_locals(&f.code) > 0 {
             continue;
         }
         for _ in 0..r.unroll.levels {

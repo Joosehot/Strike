@@ -133,6 +133,8 @@ struct Frame {
     base: usize,
     /// where the function's own memory begins in the frames' memory
     mem: usize,
+    /// where its vector locals begin
+    vbase: usize,
 }
 
 /// The program's memory as the runner keeps it: the globals, the heap,
@@ -201,12 +203,14 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
             at
         })
         .collect();
+    let vcount: Vec<usize> = funcs.iter().map(|f| super::ir::vector_locals(&f.code) as usize).collect();
+    let mut vlocals: Vec<super::vectorize::V128> = vec![[0, 0]; vcount[*index.get(entry)?]];
     let first = *index.get(entry)?;
     if funcs[first].params != 0 {
         return None;
     }
     let mut locals: Vec<i64> = vec![0; funcs[first].slots as usize];
-    let mut frames = vec![Frame { func: first, pc: 0, base: 0, mem: 0 }];
+    let mut frames = vec![Frame { func: first, pc: 0, base: 0, mem: 0, vbase: 0 }];
     let mut stack: Vec<i64> = Vec::new();
     let mut m = Memory { regions: [vec![0u8; globals as usize * 8], Vec::new(), vec![0u8; funcs[first].frame as usize], Vec::new()], data: HashMap::new() };
     let mut output = Vec::new();
@@ -334,13 +338,48 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 stack.truncate(args);
                 let mem = m.regions[2].len();
                 m.regions[2].resize(mem + c.frame as usize, 0);
-                frames.push(Frame { func: callee, pc: 0, base, mem });
+                let vbase = vlocals.len();
+                vlocals.resize(vbase + vcount[callee], [0, 0]);
+                frames.push(Frame { func: callee, pc: 0, base, mem, vbase });
             }
+            Op::VLoad(_, v) => {
+                let a = stack.pop()?;
+                let lo = m.load(a, 8)? as u64;
+                let hi = m.load(a.wrapping_add(8), 8)? as u64;
+                m.place(a, 16)?;
+                vlocals[fr.vbase + *v as usize] = [lo, hi];
+            }
+            Op::VStore(_, v) => {
+                let a = stack.pop()?;
+                m.place(a, 16)?;
+                let x = vlocals[fr.vbase + *v as usize];
+                m.store(a, 8, x[0] as i64)?;
+                m.store(a.wrapping_add(8), 8, x[1] as i64)?;
+            }
+            Op::VSplat(l, v) => {
+                let x = stack.pop()?;
+                vlocals[fr.vbase + *v as usize] = super::vectorize::splat(*l, x);
+            }
+            Op::VConst(v, lo, hi) => vlocals[fr.vbase + *v as usize] = [*lo as u64, *hi as u64],
+            Op::VBin(l, b, d, x, y) => {
+                let r = super::vectorize::bin(*l, *b, vlocals[fr.vbase + *x as usize], vlocals[fr.vbase + *y as usize])?;
+                vlocals[fr.vbase + *d as usize] = r;
+            }
+            Op::VShift(l, b, d, x, k) => {
+                let r = super::vectorize::shift(*l, *b, vlocals[fr.vbase + *x as usize], *k)?;
+                vlocals[fr.vbase + *d as usize] = r;
+            }
+            Op::VUn(l, u, d, x) => {
+                let r = super::vectorize::un(*l, *u, vlocals[fr.vbase + *x as usize])?;
+                vlocals[fr.vbase + *d as usize] = r;
+            }
+            Op::VReduce(l, b, v) => stack.push(super::vectorize::reduce(*l, *b, vlocals[fr.vbase + *v as usize])?),
             Op::Ret => {
                 let v = stack.pop()?;
                 let done = frames.pop()?;
                 locals.truncate(done.base);
                 m.regions[2].truncate(done.mem);
+                vlocals.truncate(done.vbase);
                 if frames.is_empty() {
                     return Some(Done { output, returned: v, steps });
                 }

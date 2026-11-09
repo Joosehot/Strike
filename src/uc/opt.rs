@@ -66,7 +66,13 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
             Op::Store(_) | Op::StoreG(_) | Op::Pop | Op::PrintInt => {
                 st.pop();
             }
-            Op::PrintStr(_) => {}
+            Op::PrintStr(_) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) => {}
+            // a vector operation's address or value is used up; a lane
+            // combined is not a plain expression
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => {
+                st.pop();
+            }
+            Op::VReduce(..) => st.push(None),
             Op::Jz(_) | Op::Jnz(_) => {
                 st.pop();
                 st.iter_mut().for_each(|x| *x = None);

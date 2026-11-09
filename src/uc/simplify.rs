@@ -1269,7 +1269,9 @@ fn consumers(code: &[Op]) -> Vec<Option<(usize, usize)>> {
             Op::StoreM(_) | Op::OpM(..) | Op::PrintMem => (2, 0),
             Op::Call(_, n) => (*n as usize, 1),
             Op::ReadToken => (0, 2),
-            Op::PrintStr(_) => (0, 0),
+            Op::PrintStr(_) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) => (0, 0),
+            Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => (1, 0),
+            Op::VReduce(..) => (0, 1),
             Op::Label(_) | Op::Jmp(_) | Op::Fail(..) | Op::FailMem(_) => {
                 st.iter_mut().for_each(|x| *x = None);
                 (0, 0)
