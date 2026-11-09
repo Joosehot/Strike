@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-19 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-20 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -1295,7 +1295,7 @@ impl G {
                     // the remainder is n - q * d, and nothing more is needed
                     self.a.e(&[0x48, 0x69, 0xC0]); // imul rax, rax, d
                     self.a.d32(d);
-                    self.a.e(&[0x48, 0xF7, 0xD8, 0x4C, 0x01, 0xC0]); // neg rax; add rax, r8
+                    self.a.e(&[0x49, 0x29, 0xC0, 0x4C, 0x89, 0xC0]); // sub r8, rax; mov rax, r8 (one step shorter than neg, add)
                     self.v.push(V::Rax);
                     return;
                 }
@@ -1518,7 +1518,9 @@ impl G {
     /// An element that is at once the right side of float arithmetic: the
     /// operation takes it from memory (`mulsd xmm, [address]`). False, and
     /// nothing emitted, where the left side is not where this can be done.
-    fn load_into_op(&mut self, b: BinOp) -> bool {
+    /// With `into`, a float local in an xmm register the result is stored
+    /// into at once: worked out there (nothing is pushed then).
+    fn load_into_op(&mut self, b: BinOp, into: Option<u32>) -> bool {
         let op = match b {
             BinOp::FAdd => 0x58,
             BinOp::FMul => 0x59,
@@ -1532,6 +1534,21 @@ impl G {
         }
         let addr = self.pop();
         let left = self.pop();
+        if let Some(s) = into {
+            let Loc::Xmm(k) = self.loc[s as usize] else { unreachable!() };
+            if let Some(i) = self.reads(s) {
+                self.flush_to(i);
+            }
+            self.keep_xmm(k);
+            match left {
+                V::Slot(t) if t == s => {}
+                x => self.to_xmm_any(x, k),
+            }
+            let at = self.address(addr);
+            self.a.e(&[0xF2]);
+            self.mem(false, false, &[0x0F, op], k, at);
+            return true;
+        }
         let a = match left {
             V::X(k) => k,
             V::Slot(s) if matches!(self.loc[s as usize], Loc::Xmm(_)) && self.dead(s) => {
@@ -2474,7 +2491,15 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             // operand
             (Op::LoadM(8), Some(Op::Bin(b))) if b.is_float() => {
                 g.op_at = at + 1;
-                if g.load_into_op(*b) {
+                // stored at once into a float local in an xmm register
+                if let Some(&Op::Store(s)) = f.code.get(at + 2) {
+                    if matches!(g.loc[s as usize], Loc::Xmm(_)) && g.load_into_op(*b, Some(s)) {
+                        zero[s as usize] = false;
+                        skip = 2;
+                        continue;
+                    }
+                }
+                if g.load_into_op(*b, None) {
                     skip = 1;
                     continue;
                 }

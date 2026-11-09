@@ -19,6 +19,12 @@ use super::ir::{label_count, BinOp, Func, Op, UnOp};
 /// value begins; None where it is not a plain expression (a label, a jump,
 /// a call or a Dup is on the way).
 pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
+    starts_with(code, &|_| false)
+}
+
+/// The same, where a load at an operation `plain_load` takes is a plain
+/// expression too (memory nothing in its loop can change).
+pub(super) fn starts_with(code: &[Op], plain_load: &dyn Fn(usize) -> bool) -> Vec<Option<usize>> {
     let mut at = vec![None; code.len()];
     let mut st: Vec<Option<usize>> = Vec::new();
     for (i, op) in code.iter().enumerate() {
@@ -28,6 +34,11 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
             Op::Push(_) | Op::Load(_) | Op::AddrG(_) | Op::Frame(_) => {
                 st.push(Some(i));
                 at[i] = Some(i);
+            }
+            Op::LoadM(_) if plain_load(i) => {
+                let s = pop(&mut st);
+                st.push(s);
+                at[i] = s;
             }
             Op::Un(_) | Op::Sext(_) => {
                 let s = pop(&mut st);
@@ -154,12 +165,15 @@ fn known_address(run: &[Op]) -> bool {
     }
 }
 
-/// LICM; returns how many expressions it moved.
-pub fn hoist(f: &mut Func) -> usize {
+/// LICM; returns how many expressions it moved. An element read in the
+/// loop moves too where alias.rs shows that no write of the loop can reach
+/// it and that it lies inside the globals or the frame (`globals`: how many
+/// the program has), so reading it before the loop cannot fault.
+pub fn hoist(f: &mut Func, globals: u32) -> usize {
     let mut moved = 0;
     'again: loop {
         let code = &f.code;
-        let st = starts(code);
+        let facts = code.iter().any(|o| matches!(o, Op::LoadM(_))).then(|| super::alias::Facts::new(f, globals));
         let mut label_at = vec![usize::MAX; label_count(code) as usize];
         for (i, op) in code.iter().enumerate() {
             if let Op::Label(l) = op {
@@ -188,6 +202,21 @@ pub fn hoist(f: &mut Func) -> usize {
                 continue;
             }
             let stored: Vec<u32> = code[t..=j].iter().filter_map(|o| if let Op::Store(s) = o { Some(*s) } else { None }).collect();
+            // the loads nothing in the loop can change
+            let mut fixed = vec![false; code.len()];
+            if let Some(facts) = &facts {
+                let writes = facts.loop_writes(t, j);
+                for i in t + 1..j {
+                    if !matches!(code[i], Op::LoadM(_)) {
+                        continue;
+                    }
+                    // read where it will be: before the loop's top
+                    if let Some(m) = facts.reads_at(i, t) {
+                        fixed[i] = facts.in_bounds(m) && writes.iter().all(|w| !super::alias::may_alias(m, *w));
+                    }
+                }
+            }
+            let st = starts_with(code, &|i| fixed[i]);
             // the addresses used where they are, and every part of them
             let mut inside = vec![false; j + 1];
             for i in t + 1..j {
@@ -202,22 +231,48 @@ pub fn hoist(f: &mut Func) -> usize {
             let mut best: Option<(usize, usize)> = None;
             for i in t + 1..j {
                 let Some(s) = st[i] else { continue };
-                if s <= t || !matches!(code[i], Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)) {
+                if s <= t || !(matches!(code[i], Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)) || fixed[i]) {
                     continue;
                 }
                 let run = &code[s..=i];
-                let plain = run.iter().all(|o| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)));
+                let plain = run.iter().enumerate().all(|(k, o)| matches!(o, Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_)) || fixed[s + k]);
                 let invariant = run.iter().all(|o| !matches!(o, Op::Load(x) if stored.contains(x)));
                 // a row's address (a global array plus a row offset) is worth a register
-                let has_load = run.iter().any(|o| matches!(o, Op::Load(_) | Op::AddrG(_) | Op::Frame(_)));
+                let has_load = run.iter().any(|o| matches!(o, Op::Load(_) | Op::AddrG(_) | Op::Frame(_) | Op::LoadM(_)));
                 if plain && invariant && has_load && !inside[i] && cannot_fail(run) && best.is_none_or(|(bs, bi)| i - s > bi - bs) {
                     best = Some((s, i));
                 }
             }
             let Some((s, i)) = best else { continue };
+            let run: Vec<Op> = code[s..=i].to_vec();
+            // the same expression already moved out before this loop's top
+            // (an element read three times): its local is read instead
+            let reads: Vec<u32> = run.iter().filter_map(|o| if let Op::Load(x) = o { Some(*x) } else { None }).collect();
+            let mut same = None;
+            let mut p = t;
+            while p > 0 {
+                p -= 1;
+                match &code[p] {
+                    Op::Store(x) if reads.contains(x) => break,
+                    Op::Store(x) if p >= run.len() && code[p - run.len()..p] == run[..] && code.iter().filter(|o| **o == Op::Store(*x)).count() == 1 => {
+                        same = Some(*x);
+                        break;
+                    }
+                    Op::Store(_) | Op::Push(_) | Op::Load(_) | Op::Bin(_) | Op::Un(_) | Op::Sext(_) | Op::AddrG(_) | Op::Frame(_) | Op::LoadM(_) => {}
+                    _ => break,
+                }
+            }
+            if let Some(x) = same {
+                let mut out = Vec::with_capacity(f.code.len());
+                out.extend_from_slice(&f.code[..s]);
+                out.push(Op::Load(x));
+                out.extend_from_slice(&f.code[i + 1..]);
+                f.code = out;
+                moved += 1;
+                continue 'again;
+            }
             let tmp = f.slots;
             f.slots += 1;
-            let run: Vec<Op> = f.code[s..=i].to_vec();
             let mut out = Vec::with_capacity(f.code.len() + 2);
             out.extend_from_slice(&f.code[..t]);
             out.extend(run);
@@ -415,7 +470,7 @@ mod tests {
         );
         f.code.insert(0, Op::Store(3));
         f.code.insert(0, Op::Push(7));
-        assert_eq!(hoist(&mut f), 1);
+        assert_eq!(hoist(&mut f, 0), 1);
         assert_eq!(&f.code[2..6], &[Op::Load(2), Op::Load(3), Op::Bin(BinOp::Mul), Op::Store(4)]);
         assert!(f.code.contains(&Op::Load(4)));
     }
@@ -440,6 +495,6 @@ mod tests {
             ],
             4,
         );
-        assert_eq!(hoist(&mut f), 0);
+        assert_eq!(hoist(&mut f, 0), 0);
     }
 }

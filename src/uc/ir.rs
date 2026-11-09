@@ -408,7 +408,7 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-8";
+pub const CODEGEN: &str = "strike-x64-9";
 
 /// How the IR's stack changes at an operation (None: nothing comes after
 /// it on the same way, a return or a stop).

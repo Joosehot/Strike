@@ -27,6 +27,7 @@ mod modules;
 mod opt;
 mod parse;
 mod pe;
+mod alias;
 mod ranges;
 mod rotate;
 mod scev;
@@ -330,6 +331,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
     let (mut simplified, mut hoisted, mut closed) = (0, 0, 0);
+    let globals = low.globals;
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
@@ -338,7 +340,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             }
             simplified += opt::simplify(f);
             simplified += simplify::run(f, rules.loop_weight);
-            hoisted += opt::hoist(f);
+            hoisted += opt::hoist(f, globals);
             simplified += opt::counters(f);
             simplified += ranges::run(f);
             closed += scev::run(f);

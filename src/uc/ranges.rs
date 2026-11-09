@@ -19,8 +19,8 @@ use super::simplify::{tree, E};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct R {
-    lo: i64,
-    hi: i64,
+    pub(super) lo: i64,
+    pub(super) hi: i64,
 }
 
 const ALL: R = R { lo: i64::MIN, hi: i64::MAX };
@@ -143,6 +143,40 @@ const ROUNDS: usize = 12;
 
 /// Every local's interval.
 pub(super) fn ranges(f: &Func) -> Vec<R> {
+    sites(f).at
+}
+
+/// Every local's interval, and the counted loops whose tests bound their
+/// counters where the body reads them.
+pub(super) struct Sites {
+    at: Vec<R>,
+    /// (top, the counter's store, counter, bound, `<=`)
+    loops: Vec<(usize, usize, u32, E, bool)>,
+}
+
+impl Sites {
+    /// The interval of a local read at operation k: its own, and below the
+    /// bound of a counted loop whose test came before k and whose store
+    /// comes at k or after.
+    pub(super) fn local_at(&self, k: usize, s: u32) -> R {
+        let mut v = self.at.get(s as usize).copied().unwrap_or(ALL);
+        for (t, sc, c, bound, le) in &self.loops {
+            if *c == s && *t + 4 < k && k <= *sc {
+                let b = range(bound, &|q| self.at.get(q as usize).copied().unwrap_or(ALL));
+                let hi = if *le { b.hi } else { b.hi.saturating_sub(1) };
+                v.hi = v.hi.min(hi);
+                v.lo = v.lo.min(v.hi);
+            }
+        }
+        v
+    }
+    /// The interval of an expression whose locals are read at operation k.
+    pub(super) fn at(&self, k: usize, e: &E) -> R {
+        range(e, &|s| self.local_at(k, s))
+    }
+}
+
+pub(super) fn sites(f: &Func) -> Sites {
     let code = &f.code;
     let st = super::opt::starts(code);
     // the counted loops: (top, back jump, counter, bound, `<=`)
@@ -172,7 +206,7 @@ pub(super) fn ranges(f: &Func) -> Vec<R> {
         let [sc] = stores[..] else { continue };
         // no way back between the test and the store (an inner loop round
         // the store would add to c without testing it)
-        let back = code.iter().enumerate().any(|(k, o)| matches!(o, Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) if *l != *top && (t + 4..sc).contains(&label_at[*l as usize]) && k >= label_at[*l as usize]));
+        let back = code.iter().enumerate().any(|(k, o)| matches!(o, Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) if *l != *top && (t + 4..sc).contains(&label_at[*l as usize]) && k >= sc));
         if !entered && !back {
             loops.push((t, sc, *c, bound, *cmp == BinOp::Le));
         }
@@ -254,7 +288,7 @@ pub(super) fn ranges(f: &Func) -> Vec<R> {
         }
         at = next.iter().zip(&at).map(|(a, b)| R { lo: a.lo.max(b.lo), hi: a.hi.min(b.hi) }).collect();
     }
-    at
+    Sites { at, loops }
 }
 
 /// Leaves out every cut that cannot change its value; returns how many.
