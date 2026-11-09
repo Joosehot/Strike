@@ -27,7 +27,7 @@
 
 use super::ir::{BinOp, Func, Op, UnOp};
 use super::simplify::{fallible, same_masked, to_ops, tree, E};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How many of a value's lowest bits are known to be zero (64: it is 0).
 fn tz(e: &E, z: &[u32]) -> u32 {
@@ -427,8 +427,8 @@ fn lazy(e: &E) -> Option<Lazy> {
 }
 
 /// x64opt works an expression out in rax: where both operands of an
-/// operation must be worked out, the left one waits on the machine's stack
-/// (a push and a pop), with every value under it. Such a right operand is
+/// operation must be worked out, the left one waits (in a scratch register,
+/// or past those on the machine's stack). Such a right operand is
 /// worked out first, into a new local (a register), when it cannot fail
 /// (so nothing that could stop the program moves). Returns how many.
 fn spill(f: &mut Func) -> usize {
@@ -451,9 +451,27 @@ fn spill(f: &mut Func) -> usize {
             },
             _ => None,
         };
+        // the values made just before it in the same straight code: locals
+        // stored there and not read there before (a value worked out this
+        // round, not one that comes round from the last); and whether the
+        // value is cut (a C int)
+        let from = f.code[..s].iter().rposition(|o| matches!(o, Op::Label(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Call(..))).map_or(0, |k| k + 1);
+        let (mut fresh, mut came): (HashSet<u32>, HashSet<u32>) = (HashSet::new(), HashSet::new());
+        for op in &f.code[from..s] {
+            match op {
+                Op::Load(x) if !fresh.contains(x) => {
+                    came.insert(*x);
+                }
+                Op::Store(x) if !came.contains(x) => {
+                    fresh.insert(*x);
+                }
+                _ => {}
+            }
+        }
+        let cut = f.code[s..=i + 1].iter().any(|o| matches!(o, Op::Sext(_)));
         let mut pre: Vec<Op> = Vec::new();
         let mut used = 0u32;
-        let new = split(&e, first, target, &mut used, &mut pre);
+        let new = split(&e, first, target.map(|t| (t, cut, &fresh)), &mut used, &mut pre);
         if used == 0 {
             continue;
         }
@@ -470,16 +488,25 @@ fn spill(f: &mut Func) -> usize {
     n
 }
 
-/// (`target`: a right operand that reads the local the value goes into is
-/// on the chain from one time round the loop to the next, and a move
-/// into a new local would lengthen it: measured slower, it stays.)
-fn split(e: &E, first: u32, target: Option<u32>, used: &mut u32, pre: &mut Vec<Op>) -> E {
+/// `target`: the local the value goes into, whether the value is cut, and
+/// the locals stored just before it in the same straight code. A right
+/// operand that reads the target is on the chain from one time round the
+/// loop to the next. Worked out first, the chain starts the round before
+/// the rest of the statement (chain.c: 0.185 s to 0.177 s), now that the
+/// left operand waits in a scratch register, not on the machine's stack.
+/// It stays where it is when it also reads a value just made this round
+/// (its work waits for that one, and the work that does not would queue
+/// behind it: chains.c, 0.190 s against 0.195 s), and in a C int (a new local between
+/// the value and its cut keeps the cut from moving to the loop's exits:
+/// intchain.c, 0.264 s against 0.340 s).
+fn split(e: &E, first: u32, target: Option<(u32, bool, &HashSet<u32>)>, used: &mut u32, pre: &mut Vec<Op>) -> E {
     let reads = |e: &E, t: u32| to_ops(e).contains(&Op::Load(t));
+    let stays = |r: &E| target.is_some_and(|(t, cut, fresh)| reads(r, t) && (cut || fresh.iter().any(|&x| reads(r, x))));
     match e {
         E::Bin(b, l, r) => {
             let l = split(l, first, target, used, pre);
             let r = split(r, first, target, used, pre);
-            if lazy(&l).is_none() && lazy(&r).is_none() && !fallible(&r) && !fallible(&l) && !target.is_some_and(|t| reads(&r, t)) {
+            if lazy(&l).is_none() && lazy(&r).is_none() && !fallible(&r) && !fallible(&l) && !stays(&r) {
                 // the right operand first, into the next new local; the
                 // locals are new for every expression (used only inside it)
                 let t = first + *used;

@@ -835,15 +835,22 @@ enum K {
     Scaled(u8),
     Index,
     Rax,
+    /// a result that made room in rax, waiting in a scratch register
+    Reg,
     Stack,
     Flags,
 }
+
+/// How many results x64opt keeps waiting in scratch registers before the
+/// machine's stack (it has up to four; a local may take some).
+const SCRATCH: usize = 2;
 
 /// The cost of moving a value into a register: instructions, latency.
 fn mat(k: K) -> (f64, f64) {
     match k {
         K::Rax => (0.0, 0.0),
-        K::Imm(_) | K::Slot(_, true) => (1.0, 0.0),
+        // a register move, which the core does without waiting
+        K::Imm(_) | K::Slot(_, true) | K::Reg => (1.0, 0.0),
         K::Slot(_, false) => (1.0, 4.0),
         // a lea of base + displacement takes 1 cycle; with a scaled index,
         // 2 (Zen 4, and most cores of three parts)
@@ -866,6 +873,23 @@ fn sim(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &Ha
     ins + lat
 }
 
+/// In a loop, a value that comes back round into itself (its run reads the
+/// local it is stored into) is on the loop's chain from one round to the
+/// next: its latency is the round's time, while the core overlaps the
+/// instructions, and other work, from one round to the next. That latency
+/// is counted CARRIED times more: from when the local's own value is
+/// ready, every local the loop stores coming as late as the run that makes
+/// it (chain.c's x waits for y, which waits for the x before). 0 where the
+/// run does not read the local.
+fn carried(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &HashMap<u32, f64>) -> f64 {
+    let Some(t) = target.filter(|t| run.contains(&Op::Load(*t))) else { return 0.0 };
+    let from = ready.get(&t).copied().unwrap_or(0.0);
+    CARRIED * (sim2(run, address, regs, target, ready).1 - from).max(0.0)
+}
+
+/// What a cycle on a value's way round its loop is worth, in instructions.
+const CARRIED: f64 = 4.0;
+
 /// sim's instructions and latency apart.
 fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &HashMap<u32, f64>) -> (f64, f64) {
     let reg = |s: u32| regs.get(s as usize).copied().unwrap_or(true);
@@ -880,6 +904,13 @@ fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &H
     let mut ins = 0.0;
     let need_rax = |v: &mut Vec<(K, f64)>, ins: &mut f64| {
         if let Some(i) = v.iter().rposition(|x| x.0 == K::Rax) {
+            // a free scratch register: one move, and the value is ready
+            // where it was
+            if v.iter().filter(|x| x.0 == K::Reg).count() < SCRATCH {
+                *ins += 1.0;
+                v[i].0 = K::Reg;
+                return;
+            }
             for x in v[..=i].iter_mut() {
                 if x.0 != K::Stack {
                     *ins += match x.0 {
@@ -909,7 +940,7 @@ fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &H
                 if own(r) && !own(l) && *b != BinOp::Sub {
                     std::mem::swap(&mut l, &mut r);
                 }
-                let fits = |x: (K, f64)| matches!(x.0, K::Imm(c) if i32::try_from(c).is_ok()) || matches!(x.0, K::Slot(..) | K::Rax);
+                let fits = |x: (K, f64)| matches!(x.0, K::Imm(c) if i32::try_from(c).is_ok()) || matches!(x.0, K::Slot(..) | K::Rax | K::Reg);
                 if fits(l) && fits(r) && !(own(r) && !own(l)) {
                     let (li, ll) = if own(l) { (0.0, 0.0) } else { mat(l.0) };
                     let (i, lat) = match (b, r.0) {
@@ -1004,7 +1035,7 @@ fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &H
                 // the right operand: an immediate or a register stays, else rcx
                 let (ri, rl) = match right.0 {
                     K::Imm(c) if fits(c) => (0.0, 0.0),
-                    K::Slot(_, true) => (0.0, 0.0),
+                    K::Slot(_, true) | K::Reg => (0.0, 0.0),
                     // a memory operand: no instruction, the load's wait
                     K::Slot(_, false) => (0.0, 4.0),
                     k => mat(k),
@@ -1012,7 +1043,7 @@ fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &H
                 ins += ri;
                 let tr = right.1 + rl;
                 if b.is_comparison() {
-                    let (li, ll) = if matches!(left.0, K::Slot(_, true)) { (0.0, 0.0) } else { mat(left.0) };
+                    let (li, ll) = if matches!(left.0, K::Slot(_, true) | K::Reg) { (0.0, 0.0) } else { mat(left.0) };
                     ins += li + 1.0;
                     v.push((K::Flags, (left.1 + ll).max(tr) + 1.0));
                     continue;
@@ -1043,7 +1074,7 @@ fn sim2(run: &[Op], address: bool, regs: &[bool], target: Option<u32>, ready: &H
     // into a local's register, one mov or lea
     let fin = if target.is_some() {
         match k {
-            K::Rax | K::Slot(..) | K::Imm(_) => 1.0,
+            K::Rax | K::Reg | K::Slot(..) | K::Imm(_) => 1.0,
             k if is_lazy(k) => 2.0,
             _ => 0.0,
         }
@@ -1137,7 +1168,7 @@ impl Cx {
             at = e + 1;
         }
         inside.extend_from_slice(&run[at..]);
-        self.weight * sim(&inside, self.address, &self.regs, target, &self.ready) + self.outer * outside
+        self.weight * (sim(&inside, self.address, &self.regs, target, &self.ready) + carried(&inside, self.address, &self.regs, target, &self.ready)) + self.outer * outside
     }
 }
 

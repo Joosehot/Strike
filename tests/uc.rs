@@ -650,6 +650,164 @@ impl Gen {
         out + "    printf(\"%lld\\n\", t);\n    return 0;\n}\n"
     }
 
+    /// An integer expression nested to the right, every left side worked
+    /// out (a product, a division, a shift by a variable, a comparison, a
+    /// call, a choice by a jump), so each one waits, in a scratch register
+    /// or on the stack, while the right side is worked out: up to `depth`
+    /// values wait at once, and a division, a call or a shift comes while
+    /// they do.
+    fn waiting(&mut self, names: &[String], depth: u32) -> String {
+        if depth == 0 || self.below(6) == 0 {
+            return self.waiting_leaf(names, 1);
+        }
+        let op = ["+", "-", "*", "^", "&", "|", "+", "-"][self.below(8) as usize];
+        format!("({} {op} {})", self.waiting_leaf(names, 2), self.waiting(names, depth - 1))
+    }
+    fn waiting_leaf(&mut self, names: &[String], depth: u32) -> String {
+        let name = |g: &mut Gen| names[g.below(names.len() as u64) as usize].clone();
+        if depth == 0 {
+            return if self.below(5) > 0 { name(self) } else { self.constant() };
+        }
+        let d = depth - 1;
+        let (a, b) = (self.waiting_leaf(names, d), self.waiting_leaf(names, d));
+        match self.below(14) {
+            0 | 1 => format!("({a} * {b})"),
+            2 => format!("({a} / ((({b}) & 7) + 1))"),
+            3 => format!("({a} % ((({b}) & 7) + 1))"),
+            4 => format!("({a} / {})", [3, 7, -5, 1000003][self.below(4) as usize]),
+            5 => format!("({a} % {})", [3, 10, -7][self.below(3) as usize]),
+            6 => format!("({a} << (({b}) & 15))"),
+            7 => format!("({a} >> (({b}) & 63))"),
+            8 => format!("({a} {} {b})", ["<", "<=", "==", "!=", ">"][self.below(5) as usize]),
+            9 => format!("w2({a}, {b})"),
+            10 => {
+                let (c, e) = (self.waiting_leaf(names, d), self.waiting_leaf(names, d));
+                format!("w6({a}, {b}, {c}, {e}, {}, {})", name(self), self.waiting_leaf(names, d))
+            }
+            11 => format!("({a} || {b})"),
+            12 => format!("({a} && {b})"),
+            _ => format!("(-({a}) + {b} * {})", [3, 5, 9, -2][self.below(4) as usize]),
+        }
+    }
+
+    /// A C program whose statements keep several worked-out values waiting
+    /// at once (`waiting`): into locals, array elements (by a worked-out
+    /// index, and `+=`), a global, printf's arguments, tests and returns;
+    /// the helpers divide, so they write rdx and r8, and w6 takes stack
+    /// arguments; integer locals of every kind, in registers and not.
+    fn waiting_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n");
+        out += "long long gw;\n";
+        // calls that stay calls (each may call itself, so neither is
+        // inlined), with locals in the volatile registers and divisions:
+        // they write r8, r9, r10 and rdx
+        out += "long long w2(long long a, long long b) {\n    long long q = a / 3;\n    long long r = b % 7;\n    long long s = (a ^ b) + q * r;\n    long long t = s - (q >> 2) + r / 3;\n    if (b == 987654321) return w2(a, b + 1);\n    return t * 5 - q + s;\n}\n";
+        out += "long long w6(long long a, long long b, long long c, long long d, long long e, long long f) {\n    if (f == 987654321) return w6(b, a, d, c, e, f + 1);\n    return a - b * 3 + c / 5 - (d ^ e) + f % 9;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..4 {
+            let np = 1 + self.below(5) as usize;
+            let params: Vec<String> = (0..np).map(|p| format!("p{p}")).collect();
+            let nl = 2 + self.below(10) as usize;
+            let mut names = params.clone();
+            // an i the initializers may use; the loop's own shadows it
+            let mut body = String::from("    long long arr[8] = {0};\n    long long i = p0 * 3;\n");
+            for v in 0..nl {
+                body += &format!("    long long v{v} = {};\n", self.waiting(&names, 2));
+                names.push(format!("v{v}"));
+            }
+            names.push("i".into());
+            let locals: Vec<String> = (0..nl).map(|v| format!("v{v}")).collect();
+            let mut inner = String::new();
+            for _ in 0..2 + self.below(5) {
+                let a = &locals[self.below(nl as u64) as usize];
+                let dep = 2 + self.below(5) as u32;
+                inner += &match self.below(8) {
+                    0 | 1 => format!("        {a} = {};\n", self.waiting(&names, dep)),
+                    2 => format!("        {a} = {a} {} {};\n", ["+", "-", "*", "^"][self.below(4) as usize], self.waiting(&names, dep)),
+                    3 => format!("        arr[({}) & 7] = {};\n", self.waiting(&names, 2), self.waiting(&names, dep)),
+                    4 => format!("        arr[(i + {}) & 7] += {};\n", self.below(8), self.waiting(&names, dep)),
+                    5 => format!("        printf(\"%lld %lld\\n\", {}, {});\n", self.waiting(&names, dep), self.waiting(&names, 2)),
+                    6 => format!("        if ({}) {a} = {};\n", self.waiting(&names, 2), self.waiting(&names, dep)),
+                    _ => format!("        gw = gw * 3 + {};\n", self.waiting(&names, dep)),
+                };
+            }
+            body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", 1 + self.below(5));
+            body += &format!("    return {} + arr[{}] + arr[{}];\n", self.waiting(&names, 4), self.below(8), self.below(8));
+            let decl: Vec<String> = params.iter().map(|p| format!("long long {p}")).collect();
+            out += &format!("long long f{k}({}) {{\n{body}}}\n", decl.join(", "));
+            funcs.push((format!("f{k}"), np));
+        }
+        out += "int main() {\n";
+        for (f, np) in &funcs {
+            for _ in 0..2 {
+                let args: Vec<String> = (0..*np).map(|_| self.constant()).collect();
+                out += &format!("    printf(\"%lld\\n\", {f}({}));\n", args.join(", "));
+            }
+        }
+        out + "    printf(\"%lld\\n\", gw);\n    return 0;\n}\n"
+    }
+
+    /// The same with floats: integers made of floats (a cast, a comparison)
+    /// wait in general registers while float work, calls and other
+    /// integers are worked out, and floats made of them go on.
+    fn float_waiting_program(&mut self) -> String {
+        let mut out = String::from("#include <stdio.h>\n#include <math.h>\n");
+        out += "double h0(double a, double b, long long i) {\n    return a * b - i;\n}\n";
+        out += "double h1(double a, double b, double c, double d, double e, long long n) {
+    return (a - b) * c + d / (e + n);
+}
+";
+        out += "long long k2(double a, long long b) {\n    return (long long)(a * 0.5) / ((b & 7) + 1) - b;\n}\n";
+        let mut funcs = Vec::new();
+        for k in 0..3 {
+            let nl = 3 + self.below(8) as usize;
+            let mut names: Vec<String> = vec!["p0".into(), "p1".into()];
+            let mut body = String::from("    long long i = n;\n");
+            for v in 0..nl {
+                body += &format!("    double v{v} = {};\n", self.fexpr_names(&names, 2));
+                names.push(format!("v{v}"));
+            }
+            let mut inner = String::new();
+            for _ in 0..2 + self.below(4) {
+                let a = format!("v{}", self.below(nl as u64));
+                let dep = 3 + self.below(3) as u32;
+                let e = self.int_of_floats(&names, dep);
+                inner += &match self.below(4) {
+                    0 => format!("        {a} = {a} + (double)({e});\n"),
+                    1 => format!("        printf(\"%lld\\n\", (long long)({e}));\n"),
+                    2 => format!("        {a} = h0({a}, (double)({e}), {});\n", self.int_of_floats(&names, 2)),
+                    _ => format!("        if ({e}) {a} = {} * {a};\n", self.fexpr_names(&names, 1)),
+                };
+            }
+            body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", 1 + self.below(4));
+            body += &format!("    return (double)({}) + v0;\n", self.int_of_floats(&names, 3));
+            out += &format!("double g{k}(double p0, double p1, long long n) {{\n{body}}}\n");
+            funcs.push(format!("g{k}"));
+        }
+        out += "int main() {\n";
+        for f in &funcs {
+            for _ in 0..2 {
+                let a: Vec<&str> = (0..2).map(|_| ["1.5", "-0.0", "1e18", "3", "0.1", "-2.5", "7", "-1e-300"][self.below(8) as usize]).collect();
+                out += &format!("    printf(\"%.17g\\n\", {f}({}, {}, {}));\n", a[0], a[1], self.below(9));
+            }
+        }
+        out + "    return 0;\n}\n"
+    }
+    /// An integer of floats, nested to the right (as `waiting`).
+    fn int_of_floats(&mut self, names: &[String], depth: u32) -> String {
+        let leaf = match self.below(6) {
+            0 | 1 => format!("({} {} {})", self.fexpr_names(names, 1), ["<", "<=", "==", "!=", ">"][self.below(5) as usize], self.fexpr_names(names, 1)),
+            2 | 3 => format!("(long long)({} * 0.001)", self.fexpr_names(names, 2)),
+            4 => format!("k2({}, i)", self.fexpr_names(names, 1)),
+            _ => format!("(i * {})", self.below(9)),
+        };
+        if depth == 0 || self.below(5) == 0 {
+            return leaf;
+        }
+        let op = ["+", "-", "*", "^", "/ 3 +", "% 5 -"][self.below(6) as usize];
+        format!("({leaf} {op} {})", self.int_of_floats(names, depth - 1))
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -1131,6 +1289,22 @@ fn every_mode_as_plain(dir: &str, seed: u64, n: usize, gen: fn(&mut Gen) -> Stri
 #[test]
 fn integer_locals_in_every_register_print_what_the_plain_code_prints() {
     every_mode_as_plain("int-locals", 0x1234_5678_9ABC_DEF1, 40, Gen::int_program);
+}
+
+/// Random C programs whose expressions keep several worked-out values
+/// waiting at once (in scratch registers, then on the stack) across calls,
+/// divisions, shifts by a variable, comparisons and jumps: every mode prints
+/// what the plain code prints.
+#[test]
+fn values_waiting_in_scratch_registers_print_what_the_plain_code_prints() {
+    every_mode_as_plain("waiting", 0x5EED_0F_A11_7EA5, 40, Gen::waiting_program);
+}
+
+/// The same with integers made of floats waiting while float work, calls
+/// and other integers are worked out.
+#[test]
+fn integers_of_floats_waiting_print_what_the_plain_code_prints() {
+    every_mode_as_plain("float-waiting", 0x0FA1_7EA5_5EED_0001, 30, Gen::float_waiting_program);
 }
 
 /// Random C programs whose loops read elements that writes of the same

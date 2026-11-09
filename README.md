@@ -531,6 +531,22 @@ numbers are in [codegen.toml](codegen.toml).
   local plus a constant (one `lea` when needed) or a result in rax stays
   where it is until an operation needs it. A comparison followed by a jump
   is one `cmp` and one `jcc`. A value that crosses a jump stays in rax.
+- **Values worked out side by side wait in scratch registers.** When a
+  result in rax must make room for a new one, it moves to a free scratch
+  register (r10, r9, r8, rdx: those no local of the function lives in)
+  instead of being pushed, and the operation that takes it uses it from
+  there (`add rax, r10`, `cmp r9, ...`, `mov [r8], al`, an argument moved
+  straight into its register). No operation writes a register while a
+  value waits in it: before a call, a division or a checked shift (which
+  write rdx and r8), or printing, every value waiting in a register it
+  writes is pushed, except the operands it takes first. A value goes to a
+  register only where the IR shows it is taken before anything writes that
+  register or a jump comes; otherwise it is pushed at once. Each
+  operation says what it writes (a new one must too), and a call's
+  arguments are moved in parallel, as an argument may wait in another
+  argument's register. The machine's stack is the fallback, when all four
+  are taken. chain.c's two parallel halves (`7y + i` while `y(3x + 5)x` is
+  worked out) cost a `mov`, not a push and a pop.
 - **HotMotor chooses which locals live in registers.** Every local offers
   one of the seven callee-saved registers, or memory. The judge scores the
   memory operations a register saves, where a use in a loop weighs 8 times
@@ -690,11 +706,19 @@ that x64opt.rs would make.
 - **The judge.** It follows x64opt's compile-time stack:
   - a local plus a constant, times 1, 2, 4 or 8, plus another local, is one
     `lea` or an address;
-  - a value that waits under another goes to the machine's stack;
+  - a value that waits under another costs one `mov` into a scratch
+    register and no wait (the core does a register move at no latency);
+    past two at once, it goes to the machine's stack;
   - imul takes 3 cycles, and a scaled lea takes 2;
   - `t = t + rest` is worked out in t's own register.
 
-  The judge counts instructions plus latency. In a loop, it knows what LICM
+  The judge counts instructions plus latency. In a loop, a value that
+  comes back round into itself (`x = f(x, y)`) is the loop's chain, and its
+  latency from x's own value is the time of a round, while the core
+  overlaps the instructions of one round with the next: that latency
+  counts four times more (a cycle is worth about the four instructions the
+  core could issue in it). chain.c's `x` now takes `y(3x + 5)x + (7y + i)`,
+  9 cycles from x to x, not `((3x + 5)x + 7)y + i`, 10. In a loop, it also knows what LICM
   will take out, so the simplifier gathers invariant terms and factors into
   one expression that hoist can move: `(i*m + j)*8 + base` becomes
   `i*(8m) + (8j + base)`. A local just worked out is added last, so the
@@ -793,9 +817,16 @@ code. It does four things:
   new local, before the first of them.
 - **A waiting operand worked out first.** x64opt works an expression out
   in rax. When both operands of an operation must be worked out, the left
-  one waits on the machine's stack, with every value under it. Instead, the
-  right operand is worked out first into a new local, unless it reads the
-  local the statement stores (that would lengthen a loop's chain).
+  one waits (in a scratch register, or on the machine's stack). Instead,
+  the right operand is worked out first into a new local. One that reads
+  the local the statement stores is on the loop's chain: worked out first,
+  the chain starts the round before the rest of the statement (chain.c,
+  measured 0.185 s to 0.177 s). It stays where it is when it also reads a
+  value made just before in the same round (its work waits for that one,
+  and the work that does not would queue behind it: chains.c, 0.190 s
+  against 0.195 s), and in a C int (a new local between the value and its
+  cut keeps the cut from moving to the loop's exits: intchain.c, 0.264 s
+  against 0.340 s).
 
 Only expressions that cannot fail are moved or shared. Float operations
 are left where they are. Each rewrite is also checked against the original
@@ -1061,13 +1092,9 @@ What made the difference:
 
 What is left, and why:
 
-- **chain.c** is a dependency chain through x, 2-3% behind clang. clang
-  works x's new value into y's (`y' = y(5P + 6) + 5i + 1` from the same
-  `P = x(3x + 5) + 7`), so y' does not wait for x'. Written so by hand,
-  Strike's code is slower (0.214 s): the generator keeps one value in rax
-  and the others wait on the machine's stack, so two values worked out side
-  by side cost a push and a pop. Holding a second value in a register is
-  what is left.
+- ~~**chain.c** is a dependency chain through x, 2-3% behind clang.~~
+  Done: values worked out side by side now wait in scratch registers, and
+  chain.c is 8-9% faster than clang (see below).
 - **intexpr.c, index.c and the double matrix product** are vectorized by
   clang (`pmuludq`, `mulpd`), and now by Strike: see
   [Vectorization](#vectorization). intexpr.c is also slower than clang's scalar
@@ -1078,6 +1105,58 @@ What is left, and why:
   multiplication by 3, 5 or 9 as one `lea` (intexpr.c 0.155 s to
   0.176 s), and addresses with no displacement byte (intexpr.c 0.174 s
   against 0.155 s).
+
+**Values waiting in scratch registers.** Every benchmark above and in
+[bench/simplify/](bench/simplify/), `--release --no-evaluate`, against
+master at d222ae5 (the vectorizer merged). 11 interleaved runs, min /
+median in seconds, the machine busy with other work, so a few percent is
+noise. [chains.c](bench/simplify/chains.c) is chain.c with clang's
+substitution written by hand.
+
+| | master | **now** | clang -O2 | go | now against clang -O2 |
+|---|---|---|---|---|---|
+| chain.c | 0.199 / 0.201 | **0.178 / 0.179** | 0.194 / 0.196 | | **8-9% faster** (was 2-3% slower) |
+| chain.go | 0.200 / 0.202 | **0.177 / 0.180** | | 0.241 / 0.243 | 1.35 times as fast as Go |
+| chains.c | 0.208 / 0.208 | **0.191 / 0.192** | 0.200 / 0.202 | | **5% faster** (was 4% slower) |
+| intchain.c | 0.265 / 0.267 | 0.264 / 0.265 | 0.274 / 0.278 | | 4% faster |
+| factor.c | 0.103 / 0.104 | 0.103 / 0.104 | 0.124 / 0.128 | | 17% faster |
+| factor.go | 0.103 / 0.104 | 0.102 / 0.104 | | 0.317 / 0.318 | 3 times as fast as Go |
+| poly.c | 0.125 / 0.127 | 0.126 / 0.130 | 0.137 / 0.140 | | 8% faster (the same bytes as master) |
+| poly.go | 0.125 / 0.128 | 0.125 / 0.129 | | 0.224 / 0.227 | the same bytes as master |
+| walk.c | 0.054 / 0.057 | 0.055 / 0.058 | 0.059 / 0.060 | | the same bytes as master |
+| intexpr.c | 0.074 / 0.075 | 0.073 / 0.075 | 0.072 / 0.074 | | as fast |
+| index.c | 0.0100 / 0.0106 | 0.0099 / 0.0103 | 0.0115 / 0.0119 | | 14% faster |
+| n-body | 0.087 / 0.089 | 0.088 / 0.091 | 0.053 / 0.054 | | its loop the same bytes as master (see below) |
+| fib(36) | 0.0287 / 0.0293 | 0.0286 / 0.0298 | 0.0297 / 0.0302 | | 3% faster |
+| 30 million calls | 0.0879 / 0.0897 | 0.0878 / 0.0889 | 0.0969 / 0.0989 | | 10% faster |
+| primes below 300 000 | 0.0188 / 0.0196 | 0.0190 / 0.0197 | 0.0189 / 0.0198 | | as fast |
+| invariant loops | 0.0236 / 0.0241 | 0.0234 / 0.0243 | 0.0243 / 0.0250 | | 3% faster |
+| a sum loop | 0.0036 / 0.0041 | 0.0038 / 0.0041 | 0.0042 / 0.0046 | | as fast (both closed it) |
+| integration | 0.055 / 0.057 | 0.054 / 0.058 | 0.056 / 0.060 | | 4% faster |
+| 300x300 product (`double`) | 0.0170 / 0.0178 | 0.0172 / 0.0179 | 0.0172 / 0.0180 | | as fast |
+| 600x600 product (`long long`) | 0.052 / 0.053 | 0.052 / 0.053 | 0.054 / 0.056 | | 4-5% faster |
+| sieve of 100 million | 0.501 / 0.508 | 0.504 / 0.509 | 0.499 / 0.504 | | as fast |
+
+Nothing is slower beyond the noise; poly, walk and the n-body's loop are
+byte for byte master's code; elsewhere a `push` and `pop` became a `mov`
+(intchain's loop, the runtime's float printing, whose powers of 5 are now
+`lea`s on their chain). What made the difference:
+
+- **chain.c**: `x = y(3x + 5)x + (7y + i)`. The judge's new cost of a
+  waiting value and of a round's chain (see
+  [the simplifier](#the-algebraic-simplifier)) takes it over Horner's
+  `((3x + 5)x + 7)y + i`: 9 cycles from x to x, not 10, and `7y + i` waits
+  in r9 (`lea rax, [i + 8y]; sub rax, y; mov r9, rax`) while the chain is
+  worked out. values.rs works the chain's operand out first, so the chain
+  starts the round.
+- **chains.c**: the judge now writes y's statement `(5i + 1) + y(5p + 6)`,
+  y's own chain last, worked out in y's register: `5i + 1` waits in rdx
+  while `y(5p + 6)` is worked out (master had `y(5p + 6) + (5i + 1)`, with
+  `5i + 1` a lazy `lea` into rcx). The chain is as long, but the loop is
+  now unrolled twice, which is most of the gain.
+- The n-body's 0.087 s is master's own since the vectorizer: at 79dc5b8 it
+  ran in 0.047 s (measured again: 0.047 / 0.048 against master's 0.087 /
+  0.090), so it is not this work's.
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds

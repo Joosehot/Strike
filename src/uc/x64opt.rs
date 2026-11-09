@@ -1,9 +1,11 @@
 //! Strike's optimizing code generator. The IR's stack is kept at compile
 //! time: a constant, a local, a local plus a constant (one `lea` when it is
 //! needed) or a result in rax stays where it is until an operation needs
-//! it, and a comparison followed by a jump is one `cmp` and one `jcc`. Only
-//! what must cross a call is pushed; a value that crosses a jump stays in
-//! rax. The frame has no rbp: saved registers are pushed and popped.
+//! it, and a comparison followed by a jump is one `cmp` and one `jcc`. A
+//! result that must make room in rax waits in a free scratch register
+//! (V::Reg); only what must cross a call, or finds none free, is pushed. A
+//! value that crosses a jump stays in rax. The frame has no rbp: saved
+//! registers are pushed and popped.
 //!
 //! HotMotor chooses which locals live in callee-saved registers
 //! (codegen.toml): every local offers a register or memory, the judge
@@ -70,7 +72,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-21 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-22 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -104,6 +106,12 @@ const ARGS: [u8; 4] = [1, 2, 8, 9];
 /// read (`clobbers`); such a register costs nothing to save
 const VOL: [u8; 4] = [10, 9, 8, 2];
 
+/// The scratch registers a waiting value may be kept in (V::Reg), in the
+/// order they are taken: those of VOL no local of the function lives in.
+/// r10 and r9 first, as only a call writes them; rdx and r8 a division
+/// and a checked shift write too. (rax, rcx and r11 are the emitters' own.)
+const SCRATCH: [u8; 4] = [R10, 9, 8, 2];
+
 /// Which of the VOL registers an operation may write (bit k for VOL[k]): a
 /// call takes all, a division and a checked shift rdx and r8.
 fn clobbers(op: &Op) -> u8 {
@@ -111,6 +119,38 @@ fn clobbers(op: &Op) -> u8 {
         Op::Call(..) | Op::PrintInt | Op::PrintStr(_) | Op::PrintMem | Op::ReadToken | Op::ReadLine | Op::Fail(..) | Op::FailMem(_) => 0b1111,
         Op::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor | BinOp::ShlOv) => 0b1100,
         _ => 0,
+    }
+}
+
+/// The scratch registers an operation writes (bit r for register r), and
+/// how many of the values on top it takes before writing them (those may
+/// wait in one). A call writes every volatile register (call_direct moves
+/// its arguments in order), a division and a checked shift rdx and r8 (the
+/// divider, the magic multiplication, a floor's correction), and printing
+/// a string rdx. Every operation is named (a new one must say what it
+/// writes: r8, r9, r10 and rdx are no longer free for its emitter).
+fn scratch_writes(op: &Op) -> (u16, usize) {
+    let vol: u16 = VOL.iter().fold(0, |m, &r| m | 1 << r);
+    match op {
+        Op::Call(_, n) => (vol, *n as usize),
+        Op::PrintInt => (vol, 1),
+        Op::PrintMem | Op::FailMem(_) => (vol, 2),
+        Op::PrintStr(_) | Op::ReadToken | Op::ReadLine | Op::Fail(..) => (vol, 0),
+        Op::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor | BinOp::ShlOv) => (1 << 2 | 1 << 8, 2),
+        Op::Bin(_) | Op::Push(_) | Op::Load(_) | Op::Store(_) | Op::Un(_) | Op::Jmp(_) | Op::Jz(_) | Op::Jnz(_) | Op::Label(_) | Op::Ret | Op::Pop | Op::Dup | Op::Sext(_) | Op::LoadG(_) | Op::StoreG(_) | Op::LoadM(_) | Op::StoreM(_) | Op::OpM(..) | Op::Frame(_) | Op::AddrG(_) | Op::Data(_) => (0, 0),
+        // vector operations work in xmm registers (and rax, r11)
+        Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) | Op::VReduce(..) => (0, 0),
+    }
+}
+
+/// How many values an operation takes from the IR's stack.
+fn takes(op: &Op) -> usize {
+    match op {
+        Op::Bin(_) | Op::StoreM(_) | Op::OpM(..) | Op::PrintMem | Op::FailMem(_) => 2,
+        Op::Un(_) | Op::Sext(_) | Op::LoadM(_) | Op::Store(_) | Op::StoreG(_) | Op::Pop | Op::PrintInt | Op::Jz(_) | Op::Jnz(_) | Op::Ret => 1,
+        Op::Call(_, n) => *n as usize,
+        Op::VLoad(..) | Op::VStore(..) | Op::VSplat(..) => 1,
+        Op::Push(_) | Op::Load(_) | Op::Jmp(_) | Op::Label(_) | Op::Dup | Op::PrintStr(_) | Op::LoadG(_) | Op::ReadToken | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) | Op::Fail(..) | Op::Data(_) | Op::VConst(..) | Op::VBin(..) | Op::VShift(..) | Op::VUn(..) | Op::VReduce(..) => 0,
     }
 }
 
@@ -178,6 +218,12 @@ enum V {
     /// the same plus index << k, the index a local in a register:
     /// [index * size + address], [rsp + index * size + d]
     AtIdx(B, u32, u8, i32),
+    /// a worked-out value that made room in rax for a newer one, kept in a
+    /// free scratch register (one no local of the function lives in)
+    /// instead of the machine's stack. Nothing writes the register while
+    /// the value waits: an operation that would is preceded by pushing it
+    /// (`evict`), and no consumer works in it.
+    Reg(u8),
 }
 
 /// Memory whose address the code knows without a register: the zeros at a
@@ -749,6 +795,15 @@ struct G {
     /// the locals live after each operation (computed where a local is in
     /// an xmm register: its register may then take a result in place)
     live: Vec<Vec<u64>>,
+    /// the scratch registers of this function (SCRATCH less those a local
+    /// lives in); none on the fast path, where they hold the arguments
+    scratch: Vec<u8>,
+    /// the scratch registers the operation being compiled writes (bit r
+    /// for register r): no value is put in one of them meanwhile
+    busy: u16,
+    /// the function's code and the IR stack's depth before each operation
+    code: Vec<Op>,
+    at_depth: Vec<Option<i32>>,
 }
 
 impl G {
@@ -947,6 +1002,7 @@ impl G {
                 Loc::Xmm(k) => self.movq_from_xmm(r, k),
             },
             V::Rax => self.mov_rr(r, RAX),
+            V::Reg(y) => self.mov_rr(r, y),
             V::Stack => self.pop_r(r),
             V::X(k) => self.movq_from_xmm(r, k),
             V::Flags(cc) => self.setcc_into(r, cc),
@@ -1011,6 +1067,7 @@ impl G {
                 }
             },
             V::Rax => self.push_r(RAX),
+            V::Reg(y) => self.push_r(y),
             V::Flags(cc) => {
                 self.setcc_into(R11, cc);
                 self.push_r(R11);
@@ -1040,8 +1097,59 @@ impl G {
             self.flush_to(self.v.len() - 1);
         }
     }
+    /// rax made free: the value in it (a result, or an address made from
+    /// it) is moved to a free scratch register, and only where none is free
+    /// pushed, with everything under it.
     fn need_rax(&mut self) {
         if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::RIdx(..))) {
+            match self.free_scratch(i) {
+                Some(r) => {
+                    let x = self.v[i];
+                    self.to_reg(x, r);
+                    self.v[i] = V::Reg(r);
+                }
+                None => self.flush_to(i),
+            }
+        }
+    }
+    /// A scratch register for the value at index i: one no waiting value
+    /// holds, the operation being compiled does not write, and the value
+    /// will be taken from (`keeps`).
+    fn free_scratch(&self, i: usize) -> Option<u8> {
+        self.scratch.iter().copied().find(|&r| self.busy & (1 << r) == 0 && !self.v.contains(&V::Reg(r)) && self.keeps(i, r))
+    }
+    /// Is the value at index i of the stack taken by a later operation
+    /// before anything writes register r, or the value has to be pushed at
+    /// a label or a jump? Where not, it is pushed at once (a move first
+    /// would only add one instruction). Read from the IR: the stack's depth
+    /// before each operation and how many values it takes.
+    fn keeps(&self, i: usize, r: u8) -> bool {
+        for j in self.op_at + 1..self.code.len().min(self.op_at + 256) {
+            let Some(d) = self.at_depth[j] else { return false };
+            let d = d as usize;
+            let op = &self.code[j];
+            if d <= i || matches!(op, Op::Label(_) | Op::Jmp(_)) {
+                return d <= i;
+            }
+            let (mask, keep) = scratch_writes(op);
+            if mask & (1 << r) != 0 && d.saturating_sub(keep) > i {
+                return false;
+            }
+            if d.saturating_sub(takes(op)) <= i {
+                return true;
+            }
+            if matches!(op, Op::Jz(_) | Op::Jnz(_) | Op::Ret | Op::Fail(..) | Op::FailMem(_)) {
+                return false;
+            }
+        }
+        true
+    }
+    /// Before an operation that writes the registers in `mask`: every value
+    /// waiting in one of them is pushed (with everything under it), except
+    /// the top `keep`, which the operation takes before it writes them.
+    fn evict(&mut self, mask: u16, keep: usize) {
+        let n = self.v.len().saturating_sub(keep);
+        if let Some(i) = self.v[..n].iter().rposition(|x| matches!(x, V::Reg(r) if mask & (1 << r) != 0)) {
             self.flush_to(i);
         }
     }
@@ -1091,6 +1199,7 @@ impl G {
                     Opd::Reg(RCX)
                 }
             },
+            V::Reg(r) => Opd::Reg(r),
             other => {
                 self.to_reg(other, RCX);
                 Opd::Reg(RCX)
@@ -1221,6 +1330,7 @@ impl G {
                         RAX
                     }
                 },
+                V::Reg(r) => r,
                 _ => {
                     self.to_reg(left, RAX);
                     RAX
@@ -1596,6 +1706,7 @@ impl G {
             V::Imm(0) => self.sse_rr(None, 0x57, xmm, xmm), // xorps xmm, xmm
             V::Imm(c) => self.sse_const(Some(0xF2), 0x10, xmm, c), // movsd xmm, [rip + c]
             V::Rax => self.movq_to_xmm(xmm, RAX),
+            V::Reg(r) => self.movq_to_xmm(xmm, r),
             x => {
                 self.to_reg(x, R11);
                 self.movq_to_xmm(xmm, R11);
@@ -1633,6 +1744,7 @@ impl G {
                 },
                 V::X(k) => self.sse_rsp(Some(0xF2), 0x11, k, d),
                 V::Rax => self.rm(&[0x89], RAX, d),
+                V::Reg(r) => self.rm(&[0x89], r, d),
                 other => {
                     self.to_reg(other, R11);
                     self.rm(&[0x89], R11, d);
@@ -1654,6 +1766,7 @@ impl G {
                     Loc::Reg(y) => self.movq_to_xmm(k, y),
                 },
                 V::Rax => self.movq_to_xmm(k, RAX),
+                V::Reg(r) => self.movq_to_xmm(k, r),
                 other => {
                     self.to_reg(other, R11);
                     self.movq_to_xmm(k, R11);
@@ -1689,15 +1802,16 @@ impl G {
             return;
         }
         let args: Vec<V> = self.v.split_off(at);
-        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::RIdx(..) | V::X(_))) {
+        // what waits under the arguments in a register the call writes
+        if let Some(i) = self.v.iter().rposition(|x| matches!(x, V::Rax | V::RIdx(..) | V::X(_) | V::Reg(_))) {
             self.flush_to(i);
         }
-        // a comparison's flags become a number before anything changes them
-        let flags_in_r10 = if let Some(&V::Flags(cc)) = args.last() {
-            self.setcc_into(R10, cc);
-            true
-        } else {
-            false
+        // a comparison's flags (only ever the last argument) become a
+        // number last: nothing below changes the flags (moves, leas, and rsp
+        // moved by a lea)
+        let flags = match args.last() {
+            Some(&V::Flags(cc)) => Some(cc),
+            _ => None,
         };
         let physical = self.v.iter().filter(|x| **x == V::Stack).count() as u32;
         let k = n.saturating_sub(4) as u32;
@@ -1707,39 +1821,67 @@ impl G {
             s += 8;
         }
         if s > 0 {
-            self.a.sub_rsp(s as i32);
+            if flags.is_some() {
+                self.a.e(&[0x48, 0x8D, 0xA4, 0x24]); // lea rsp, [rsp - s]
+                self.a.d32(-(s as i32));
+            } else {
+                self.a.sub_rsp(s as i32);
+            }
         }
         self.extra = s as i32;
-        // no source is an argument register, so the order does not matter
-        for (i, x) in args.iter().enumerate() {
-            let src = if flags_in_r10 && i == n - 1 { None } else { Some(*x) };
-            if i < 4 {
-                match src {
-                    None => self.mov_rr(ARGS[i], R10),
-                    Some(x) => self.to_reg(x, ARGS[i]),
+        let plain = |i: usize| flags.is_none() || i != n - 1;
+        // the arguments past the fourth first: they write only memory (and
+        // r11), and every source is still where it was
+        for (i, x) in args.iter().enumerate().skip(4).filter(|(i, _)| plain(*i)) {
+            let disp = 32 + 8 * (i as i32 - 4);
+            let reg = match *x {
+                V::Rax => RAX,
+                V::Reg(r) => r,
+                V::Imm(c) if i32::try_from(c).is_ok() => {
+                    self.a.e(&[0x48, 0xC7, 0x84, 0x24]); // mov qword [rsp + d], imm32
+                    self.a.d32(disp);
+                    self.a.d32(c as i32);
+                    continue;
                 }
+                V::Slot(t) if matches!(self.loc[t as usize], Loc::Reg(_)) => {
+                    let Loc::Reg(y) = self.loc[t as usize] else { unreachable!() };
+                    y
+                }
+                x => {
+                    self.to_reg(x, R11);
+                    R11
+                }
+            };
+            self.a.e(&[rex(reg, 0), 0x89, 0x84 | (reg & 7) << 3, 0x24]); // mov [rsp + d], reg
+            self.a.d32(disp);
+        }
+        // the first four, a parallel move: a value waiting in a scratch
+        // register may be in another argument's register (rdx, r8, r9), so
+        // none is written while a later move still reads it (a cycle is
+        // broken through r11). No other source reads an argument register.
+        let mut moves: Vec<(u8, V)> = args.iter().enumerate().take(4).filter(|(i, _)| plain(*i)).map(|(i, x)| (ARGS[i], *x)).collect();
+        while !moves.is_empty() {
+            let free = |d: u8, m: &[(u8, V)]| !m.iter().any(|(e, x)| *e != d && *x == V::Reg(d));
+            if let Some(j) = (0..moves.len()).find(|&j| free(moves[j].0, &moves)) {
+                let (d, x) = moves.remove(j);
+                self.to_reg(x, d);
             } else {
-                let disp = 32 + 8 * (i as i32 - 4);
-                let reg = match src {
-                    None => R10,
-                    Some(V::Rax) => RAX,
-                    Some(V::Imm(c)) if i32::try_from(c).is_ok() => {
-                        self.a.e(&[0x48, 0xC7, 0x84, 0x24]); // mov qword [rsp + d], imm32
-                        self.a.d32(disp);
-                        self.a.d32(c as i32);
-                        continue;
+                let r = moves.iter().find_map(|(_, x)| if let V::Reg(r) = x { Some(*r) } else { None }).expect("a cycle goes through registers");
+                self.mov_rr(R11, r);
+                for m in moves.iter_mut() {
+                    if m.1 == V::Reg(r) {
+                        m.1 = V::Reg(R11);
                     }
-                    Some(V::Slot(t)) if matches!(self.loc[t as usize], Loc::Reg(_)) => {
-                        let Loc::Reg(y) = self.loc[t as usize] else { unreachable!() };
-                        y
-                    }
-                    Some(x) => {
-                        self.to_reg(x, R11);
-                        R11
-                    }
-                };
-                self.a.e(&[rex(reg, 0), 0x89, 0x84 | (reg & 7) << 3, 0x24]); // mov [rsp + d], reg
-                self.a.d32(disp);
+                }
+            }
+        }
+        if let Some(cc) = flags {
+            if n - 1 < 4 {
+                self.setcc_into(ARGS[n - 1], cc);
+            } else {
+                self.setcc_into(R11, cc);
+                self.a.e(&[0x4C, 0x89, 0x9C, 0x24]); // mov [rsp + d], r11
+                self.a.d32(32 + 8 * (n as i32 - 5));
             }
         }
         self.extra = 0;
@@ -1791,7 +1933,7 @@ impl G {
         }
         let fits = |x: V| match x {
             V::Imm(c) => i32::try_from(c).is_ok(),
-            V::Slot(_) | V::Rax => true,
+            V::Slot(_) | V::Rax | V::Reg(_) => true,
             _ => false,
         };
         // a shift takes a constant count (a variable one needs cl)
@@ -1830,6 +1972,7 @@ impl G {
         let o = match right {
             V::Imm(c) => Opd::Imm(c as i32),
             V::Rax => Opd::Reg(RAX),
+            V::Reg(r) => Opd::Reg(r),
             V::Slot(t) => match self.loc[t as usize] {
                 Loc::Reg(y) => Opd::Reg(y),
                 Loc::Mem(m) => Opd::Mem(m),
@@ -1865,6 +2008,7 @@ impl G {
             V::RIdx(i, k, d) => Addr::Index(Some(RAX), self.slot_reg(i), k, d),
             V::At(b, d) => self.at_addr(b, None, d),
             V::AtIdx(b, i, k, d) => self.at_addr(b, Some((i, k)), d),
+            V::Reg(r) => Addr::Base(r, 0),
             x => {
                 self.need_rax();
                 self.to_reg(x, RAX);
@@ -1907,7 +2051,7 @@ impl G {
         };
         // an address that needs no register of its own leaves rax alone
         let in_place = match a {
-            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..) => true,
+            V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..) | V::Reg(_) => true,
             V::Slot(s) => self.in_reg(s),
             _ => false,
         };
@@ -1915,6 +2059,7 @@ impl G {
         if imm.is_none() {
             src = Some(match x {
                 V::Slot(s) if self.in_reg(s) => self.slot_reg(s),
+                V::Reg(r) => r,
                 V::Rax if in_place => RAX,
                 // the address is popped first where it is pushed, so every
                 // later address counts what is really pushed
@@ -2052,6 +2197,7 @@ impl G {
                 let r = match x {
                     V::Slot(s) if self.in_reg(s) => self.slot_reg(s),
                     V::Rax => RAX,
+                    V::Reg(r) => r,
                     x => {
                         self.to_reg(x, R11);
                         R11
@@ -2158,6 +2304,18 @@ impl G {
             self.pop_r(r);
         }
         self.a.e(&[0xC3]);
+    }
+
+    /// A length into rdx and an address into rcx (the runtime's string
+    /// arguments): an address waiting in rdx is moved out first.
+    fn len_and_at(&mut self, len: V, at: V) {
+        if at == V::Reg(2) {
+            self.to_reg(at, RCX);
+            self.to_reg(len, 2);
+        } else {
+            self.to_reg(len, 2);
+            self.to_reg(at, RCX);
+        }
     }
 
     /// What a label expects: with `carry`, the top value in rax and the rest
@@ -2397,7 +2555,9 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, xsaved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory, live };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, xsaved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, trap_at: None, div32: rules.division.bypass_32, memory, live, scratch: Vec::new(), busy: 0, code: f.code.clone(), at_depth: at_depth.clone() };
+    // the scratch registers: none on the fast path (they hold arguments)
+    let scratch: Vec<u8> = SCRATCH.iter().copied().filter(|r| !g.loc.iter().any(|l| matches!(l, Loc::Reg(y) if y == r))).collect();
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9
@@ -2415,6 +2575,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         g.v.clear();
         g.loc = real;
     }
+    g.scratch = scratch;
     for r in g.saved.clone() {
         g.push_r(r);
     }
@@ -2533,6 +2694,13 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             continue; // no way reaches here
         }
         g.op_at = at;
+        // a value waiting in a scratch register this operation writes is
+        // pushed first, and none is put in one meanwhile
+        let (mask, keep) = scratch_writes(op);
+        g.busy = mask;
+        if mask != 0 {
+            g.evict(mask, keep);
+        }
         // a local in a register this operation writes holds zero no more
         // (it is not live here, so it is stored before it is read again)
         if clobbers(op) != 0 {
@@ -2626,7 +2794,14 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
             }
             Op::StoreG(gl) => {
                 let x = g.pop();
-                let r = if x == V::Rax { RAX } else { g.to_reg(x, R11); R11 };
+                let r = match x {
+                    V::Rax => RAX,
+                    V::Reg(r) => r,
+                    x => {
+                        g.to_reg(x, R11);
+                        R11
+                    }
+                };
                 g.a.e(&[rex(r, 0), 0x89, 0x05 | (r & 7) << 3]); // mov [global], r
                 g.a.reloc(super::x64::global(*gl));
             }
@@ -2680,13 +2855,13 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 let len = g.pop();
                 let at = g.pop();
                 g.need_rax();
-                g.to_reg(len, 2); // rdx
-                g.to_reg(at, RCX);
+                g.len_and_at(len, at);
                 super::x64::fail_mem(&mut g.a, *code);
                 live = false;
             }
             Op::Dup => match g.v.last().copied() {
-                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..))) => g.push(x),
+                // (a value in a scratch register too: no consumer writes it)
+                Some(x @ (V::Imm(_) | V::Slot(_) | V::Lea(..) | V::Scaled(..) | V::Index(..) | V::At(..) | V::AtIdx(..) | V::Reg(_))) => g.push(x),
                 _ => {
                     g.flush();
                     g.a.e(&[0xFF, 0x34, 0x24]);
@@ -2710,8 +2885,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                 let len = g.pop();
                 let at = g.pop();
                 g.need_rax();
-                g.to_reg(len, 2); // rdx
-                g.to_reg(at, RCX);
+                g.len_and_at(len, at);
                 g.flush();
                 g.call_runtime("rt.print_str");
             }
@@ -2755,6 +2929,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
                     x => {
                         let r = match x {
                             V::Slot(s) if matches!(g.loc[s as usize], Loc::Reg(_)) => g.slot_reg(s),
+                            V::Reg(r) => r,
                             x => {
                                 g.need_rax();
                                 g.to_reg(x, RAX);
