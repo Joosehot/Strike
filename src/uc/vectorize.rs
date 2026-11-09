@@ -1216,6 +1216,30 @@ fn insert(f: &mut Func, sh: &Shape, vector: Vec<Op>, slots: u32, done: &mut Vec<
 }
 
 /// Vectorizes the function's innermost counted loops; returns how many.
+/// How many float locals the float work in loops deeper than the loop at
+/// label `top` (outside it) uses: the locals read or written next to a
+/// float operation there, which want xmm registers more than this loop.
+fn floats_deeper(code: &[Op], top: u32) -> usize {
+    let Some(t) = code.iter().position(|o| *o == Op::Label(top)) else { return 0 };
+    let Some(j) = code.iter().rposition(|o| matches!(o, Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) if *l == top)) else { return 0 };
+    let depth = super::ir::loop_depths(code);
+    let here = depth[t];
+    let float = |o: &Op| matches!(o, Op::Bin(BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv) | Op::Un(UnOp::FSqrt));
+    let mut slots: Vec<u32> = Vec::new();
+    for k in 0..code.len() {
+        if (t..=j).contains(&k) || depth[k] <= here {
+            continue;
+        }
+        if let Op::Load(s) | Op::Store(s) = code[k] {
+            let near = code[k.saturating_sub(3)..(k + 4).min(code.len())].iter().any(float);
+            if near && !slots.contains(&s) {
+                slots.push(s);
+            }
+        }
+    }
+    slots.len()
+}
+
 pub fn run(f: &mut Func, globals: u32) -> usize {
     if std::env::var_os("STRIKE_DUMP_VEC").is_some() {
         eprintln!("{} ({} params, {} slots) before vectorizing:", f.name, f.params, f.slots);
@@ -1236,6 +1260,13 @@ pub fn run(f: &mut Func, globals: u32) -> usize {
                 continue;
             }
             done.push(sh.top);
+            // HotMotor's judge: a vector local holds an xmm register for the
+            // whole function, so a loop is not vectorized where the float
+            // locals of a deeper loop elsewhere would then not fit the ten
+            // xmm registers (n-body: its energy loop vectorized took them
+            // from the steps' loop, 0.047 s to 0.087 s)
+            let deeper = floats_deeper(&f.code, sh.top);
+            let before = (f.code.clone(), f.slots);
             // four or two vectors each time round (independent work, one
             // test for all), or one where the registers do not suffice; after
             // an unrolled loop, a loop of one vector each time round takes
@@ -1256,6 +1287,10 @@ pub fn run(f: &mut Func, globals: u32) -> usize {
                         insert(f, &sh, vector, slots, &mut done);
                     }
                 }
+            }
+            if deeper > 0 && deeper + super::ir::vector_locals(&f.code) as usize > 10 {
+                (f.code, f.slots) = before;
+                continue 'again;
             }
             count += 1;
             continue 'again;

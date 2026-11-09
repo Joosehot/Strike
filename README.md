@@ -1126,7 +1126,7 @@ substitution written by hand.
 | walk.c | 0.054 / 0.057 | 0.055 / 0.058 | 0.059 / 0.060 | | the same bytes as master |
 | intexpr.c | 0.074 / 0.075 | 0.073 / 0.075 | 0.072 / 0.074 | | as fast |
 | index.c | 0.0100 / 0.0106 | 0.0099 / 0.0103 | 0.0115 / 0.0119 | | 14% faster |
-| n-body | 0.087 / 0.089 | 0.088 / 0.091 | 0.053 / 0.054 | | its loop the same bytes as master (see below) |
+| n-body | 0.087 / 0.089 | **0.048 / 0.056** | 0.054 / 0.056 | | **faster again** (the vectorizer had cost it; see below) |
 | fib(36) | 0.0287 / 0.0293 | 0.0286 / 0.0298 | 0.0297 / 0.0302 | | 3% faster |
 | 30 million calls | 0.0879 / 0.0897 | 0.0878 / 0.0889 | 0.0969 / 0.0989 | | 10% faster |
 | primes below 300 000 | 0.0188 / 0.0196 | 0.0190 / 0.0197 | 0.0189 / 0.0198 | | as fast |
@@ -1154,9 +1154,14 @@ byte for byte master's code; elsewhere a `push` and `pop` became a `mov`
   while `y(5p + 6)` is worked out (master had `y(5p + 6) + (5i + 1)`, with
   `5i + 1` a lazy `lea` into rcx). The chain is as long, but the loop is
   now unrolled twice, which is most of the gain.
-- The n-body's 0.087 s is master's own since the vectorizer: at 79dc5b8 it
-  ran in 0.047 s (measured again: 0.047 / 0.048 against master's 0.087 /
-  0.090), so it is not this work's.
+- The n-body's 0.087 s came from the vectorizer, and is fixed: its energy
+  loop was vectorized, and a vector local holds an xmm register for the
+  whole function, so the steps' loop lost the registers its float locals
+  had. Now a loop is not vectorized where the float locals of a deeper loop
+  elsewhere in the function and the vector locals would not fit the ten
+  xmm registers together: the n-body runs in 0.048 / 0.056 s again against
+  clang's 0.054 / 0.056 (bench/vector/nbody.c is kept, so this is measured
+  from now on).
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds
