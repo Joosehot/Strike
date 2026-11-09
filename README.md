@@ -634,7 +634,16 @@ bits, because C's `long` is 32 bits on Windows. clang does not cut,
 because signed overflow is undefined in C. Proving that no overflow can
 happen, and so leaving the cut out, would win that back.
 
-FLOATSBENCH
+Floats: a 5-body simulation, 1 million steps, mean of 7 runs. Both print
+the same energies.
+
+| | Strike | clang -O2 | Strike against clang -O2 |
+|---|---|---|---|
+| n-body | 0.147 s | 0.054 s | 2.7 times as slow |
+
+A float local lives in a general register today, so each use is a move
+to an xmm register and back; float locals in xmm registers are being
+built.
 
 With evaluation on, `--release` builds the input-free benchmarks into
 executables that run in 4-5 ms, which is the process start. The builds
