@@ -1,4 +1,17 @@
-//! --release: loop vectorization (SSE2).
+//! --release: loop vectorization (SSE2), before loops are rotated.
+//!
+//! An innermost counted loop (`c < bound`, `c + 1` at its bottom) whose
+//! body only stores expressions gets a vector loop before it: two 64-bit
+//! lanes or four 32-bit ones an instruction, four (or two, or one) vectors
+//! each time round, and the scalar loop finishes what is left. Lane by
+//! lane every operation is the scalar one, bit for bit: integers wrap at
+//! the lane's width (a C int's cut is the 32-bit lane), floats round as
+//! addsd does and keep their operands' order. Integer reductions (+ - ^ |
+//! &) are reordered, which wrapping arithmetic allows; float reductions
+//! never are. A store and another access are at the same address every
+//! time round, or apart as alias.rs finds them, or checked apart before
+//! the vector loop runs (else the scalar loop does it all). STRIKE_DUMP_VEC
+//! prints each function before and after.
 
 use super::ir::{sext, BinOp, Func, Lanes, Op, UnOp};
 
@@ -819,7 +832,9 @@ fn reaches(nodes: &[N], n: usize, target: &N) -> usize {
 
 /// The loop vectorized: the code to put before its top (the vector loop,
 /// and after it the reductions' lanes added in), and the slots it made.
-fn vectorize(f: &Func, sh: &Shape, globals: u32, unroll: i64) -> Option<(Vec<Op>, u32)> {
+/// `checked`: only ever entered past the checks of the loop before it,
+/// which covered every time round left.
+fn vectorize(f: &Func, sh: &Shape, globals: u32, unroll: i64, checked: bool) -> Option<(Vec<Op>, u32)> {
     let code = &f.code;
     let (nodes, stmts, node_at, stmt_at) = read(code, sh)?;
     let stored: Vec<u32> = stmts.iter().filter_map(|s| if let S::Store(x, _) = s { Some(*x) } else { None }).collect();
@@ -1129,7 +1144,7 @@ fn vectorize(f: &Func, sh: &Shape, globals: u32, unroll: i64) -> Option<(Vec<Op>
     // it, counted round the addresses modulo 2^64 (exact: memory's own
     // addresses wrap so); bound - c must be below 2^40, so the lengths do
     // not wrap. Where they may meet, only the scalar loop runs.
-    if !checks.is_empty() {
+    if !checks.is_empty() && !checked {
         z.copy = 0;
         let w = k.width();
         let len = z.slots;
@@ -1227,7 +1242,7 @@ pub fn run(f: &mut Func, globals: u32) -> usize {
             // what is left of whole vectors
             let mut made = None;
             for u in [4, 2, 1] {
-                if let Some(v) = vectorize(f, &sh, globals, u) {
+                if let Some(v) = vectorize(f, &sh, globals, u, false) {
                     made = Some((v, u));
                     break;
                 }
@@ -1237,7 +1252,7 @@ pub fn run(f: &mut Func, globals: u32) -> usize {
             if u > 1 {
                         let again = (0..f.code.len()).find_map(|j| shape(&f.code, j).filter(|s| s.top == sh.top));
                 if let Some(sh) = again {
-                    if let Some((vector, slots)) = vectorize(f, &sh, globals, 1) {
+                    if let Some((vector, slots)) = vectorize(f, &sh, globals, 1, true) {
                         insert(f, &sh, vector, slots, &mut done);
                     }
                 }

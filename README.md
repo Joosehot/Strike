@@ -486,7 +486,23 @@ the line and the reason, and never guessed. Refused today:
   `--release --no-evaluate`, and must print the same. Each was checked to
   fail with the rule it guards broken (the calls' or divisions' registers,
   the alias test, the cut at a loop's way out).
-- 102 tests in all (every target of `cargo test --release`), in about 70 s.
+- Vectorization ([tests/vector.rs](tests/vector.rs)): 60 random C programs
+  of loops in the shapes it vectorizes and the shapes it must not, with
+  lengths 0 to 37 (so the loops that finish the leftover elements run every
+  way), offsets, `long long`, C `int` and `double` elements, every
+  reduction, locals made in the body, 2D rows and a frame array, pointer
+  parameters given the same array (with a dependency either way), and NaNs
+  of both signs meeting lane by lane. Every mode prints what the plain code
+  prints, and the release builds vectorize 554 of their loops. Each was checked to
+  fail with the rule it guards broken (the check before the loop, the
+  dependency test, the order of a float operation's operands, FNeg's mask).
+  [tests/uc/vector.c](tests/uc/vector.c) prints what clang -O2 printed in
+  every mode, and seven shapes that must stay scalar are checked to. A unit
+  test runs every vector operation in the IR runner and in both
+  generators' machine code against the scalar operations lane by lane, on
+  random lanes and the edges (NaN payloads, signalling NaNs, both zeros,
+  the infinities, the extremes), every way its registers can be shared.
+- 106 tests in all (every target of `cargo test --release`), in about 80 s.
 
 The tests have found real bugs, all fixed:
 
@@ -627,6 +643,9 @@ these is also something clang -O2 does:
   cut back to 32 bits is left out where the loop has just found it below a
   bound that fits: clang leaves it out because signed overflow cannot
   happen, Strike shows that it cannot.
+- **Loop vectorization** ([src/uc/vectorize.rs](src/uc/vectorize.rs)),
+  with SSE2, as clang -O2 vectorizes without `-march`. See
+  [below](#vectorization).
 - **Inlining callees of up to 200 operations.**
 - **A program that reads nothing is worked out while compiling**
   ([src/uc/eval.rs](src/uc/eval.rs)). Strike's IR runner tries first,
@@ -839,6 +858,98 @@ Compile time, minimum of the rounds, against master:
 | the 100 random test programs | 1.48 s | 1.59 s |
 | genbig.py's 2000 functions | 1.63 s | 1.71 s |
 
+### Vectorization
+
+[src/uc/vectorize.rs](src/uc/vectorize.rs) runs in `--release` before
+loops are rotated. It makes an innermost loop work on two 64-bit elements
+(`long long`, `double`) or four 32-bit ones (C `int`) an instruction, with
+SSE2 only, which every x86-64 has: clang -O2 targets the same without
+`-march`, so there is no AVX and no FMA.
+
+- **The loops it takes.** `for (c = s; c < bound; c++)`: the bound a
+  constant or a local the loop never stores, a body of stores only (no
+  call, no jump, no print). The body may store elements, locals it makes
+  and reads in the same time round, and reductions, read from elements at
+  the counter's own stride (`a[i + k]`, a row's `m[r][j]`, a pointer
+  parameter's `p[i]`), the counter itself, invariants and constants.
+- **Where the loop goes.** A vector loop goes before the scalar one and
+  stops where fewer than its elements are left; the scalar loop, unchanged,
+  does the rest. The vector loop does four vectors each time round, or two
+  where the registers do not suffice, and after it a loop of one vector
+  takes what is left of whole vectors.
+- **Exact, lane by lane.** Integer lanes wrap as the scalar operations
+  wrap. In 32-bit lanes the low 32 bits of a ring expression (`+ - * & | ^
+  <<`) depend only on the low 32 bits of its inputs, so a C int's cut is
+  the lane itself; a shift right is taken only of a value known to fit 32
+  bits. `addpd`, `subpd`, `mulpd`, `divpd` and `sqrtpd` round each lane as
+  the scalar instruction does, and their operands are never swapped, so
+  with two NaNs the first comes out, as with `addsd`. `-x` and `fabs` are
+  the sign bit, flipped or cleared.
+- **Reductions.** `s += e`, `s -= e`, `s ^= e`, `s |= e`, `s &= e` of
+  integers get an accumulator vector per copy, added together after the
+  loop. Wrapping addition and the bitwise operations are associative and
+  commutative, so the sum is the scalar loop's own. A float reduction
+  (`s += a[i] * b[i]`) would add in another order and round otherwise: it
+  is never vectorized, as clang -O2 does not vectorize it without
+  `-ffast-math`.
+- **Dependencies.** A store and another access of the loop must be at the
+  same address every time round, so a time round reads only what it wrote
+  itself; or [alias.rs](src/uc/alias.rs) finds their bytes apart over the
+  whole loop; or else a check before the vector loop finds the bytes that
+  all the times round left will touch apart. The check counts round the
+  addresses modulo 2^64, as memory's own addresses wrap, so it is exact.
+  Where they may meet (a pointer parameter given the same array), only the
+  scalar loop runs. Nothing about C's types or arrays is assumed. Two
+  accesses of one base a few elements apart (`a[i + 1] = a[i]`) are never
+  vectorized.
+- **What SSE2 lacks.** There is no 64-bit product: clang's three `pmuludq`
+  per two elements lose to `imul`, so a `long long` product is left scalar
+  (the 600x600 matrix product stays Strike's scalar code, which is faster
+  than clang's vectors). A product by a constant that two shifts and an add
+  or a subtraction make (`x * 9`, `x * 7`, `x * -5`) is that. A 32-bit
+  product is two `pmuludq`, as clang makes it. A 64-bit arithmetic shift
+  right is a logical one with the sign shifted in from the top.
+- **The counter in the lanes.** A value affine in the counter (`j + r`,
+  `7k + 3`, the counter itself) is its own vector, one per copy, stepped
+  each time round, so it costs one `paddq` and no multiplication.
+- **The IR.** Vector locals are 16 bytes, numbered apart from the slots;
+  the operations are their loads and stores, splats, constants, lane-wise
+  arithmetic, shifts by a constant and reductions to a number. The IR
+  runner works them out lane by lane. [src/uc/x64vec.rs](src/uc/x64vec.rs)
+  writes their machine code for both generators: the plain one keeps
+  vector locals in its frame, the optimizing one in xmm15 downwards (the
+  float locals keep the rest of xmm6 to xmm15), and values made and used
+  in a loop's body in xmm2 to xmm5. An element's address is an address
+  mode as it is.
+- **Not vectorized:** Python's checked numbers (they must stop where a
+  number would not fit), elements of different widths in one loop,
+  conversions between ints and floats, comparisons and selects, a division
+  of integers, a stride that is not the element's, and an element whose
+  address is read from memory.
+
+**Running times**, against master at 79dc5b8 (`python bench/vector/run.py`,
+with STRIKE_BASE set to a build of master). 15 interleaved runs, min /
+median in seconds, the machine busy with other builds. "clang scalar" is
+`-O2 -fno-vectorize -fno-slp-vectorize`.
+
+| | master | **now** | clang -O2 | clang scalar | now against clang -O2 |
+|---|---|---|---|---|---|
+| 300x300 product (`double`), 4 times ([matd.c](bench/vector/matd.c)) | 0.0339 / 0.0344 | **0.0175 / 0.0181** | 0.0176 / 0.0180 | 0.0272 / 0.0279 | as fast (was 1.9 times as slow) |
+| index.c | 0.0192 / 0.0198 | **0.0099 / 0.0107** | 0.0112 / 0.0119 | 0.0149 / 0.0159 | **10% faster** (was 1.7 times as slow) |
+| intexpr.c | 0.1540 / 0.1555 | **0.0729 / 0.0747** | 0.0709 / 0.0733 | 0.1275 / 0.1319 | 2-3% slower (was 2.2 times as slow) |
+| element by element ([saxpy.c](bench/vector/saxpy.c)) | 0.0071 / 0.0076 | **0.0045 / 0.0048** | 0.0049 / 0.0054 | 0.0057 / 0.0063 | **8-11% faster** |
+| 600x600 product (`long long`) | 0.0523 / 0.0538 | 0.0527 / 0.0541 | 0.0546 / 0.0562 | 0.0514 / 0.0521 | 4% faster (not vectorized) |
+| integration | 0.0495 / 0.0566 | 0.0479 / 0.0574 | 0.0561 / 0.0601 | 0.0551 / 0.0603 | 5-15% faster (a float reduction) |
+
+Every other benchmark (chain, factor, poly, walk, intchain, the sieve, the
+Go ones, the integration and the `long long` product) has no loop it
+vectorizes, and its executable is byte for byte master's: nothing else
+changed. intexpr.c is within the noise of clang: both do the same
+`pmuludq` product, and its loop holds more values than xmm registers for
+four vectors at once. Compile time: suite.c, algebra.c, arrays.c, values.c
+and vector.c in 0.069 s against master's 0.063 s; the 60 random test
+programs in 1.51 s against 1.52 s.
+
 ### Measured
 
 A whole build of one program of 2000 functions, from source to
@@ -891,16 +1002,16 @@ results.
 |---|---|---|---|
 | midpoint integration of 4/(1+x²), 50 million steps | 0.050 / 0.054 s | 0.055 / 0.058 s | 7-10% faster |
 | n-body, 5 bodies, 1 million steps | 0.087 / 0.087 s | 0.052 / 0.054 s | 1.6 times as slow |
-| 300x300 matrix product (`double`), 4 times | 0.031 / 0.032 s | 0.017 / 0.018 s | 1.8 times as slow |
+| 300x300 matrix product (`double`), 4 times | 0.0175 / 0.0181 s | 0.0176 / 0.0180 s | as fast (vectorized) |
 
 Float locals in xmm registers brought the n-body from 0.147 s to 0.087 s,
 and the integration from 0.097 s to 0.050 s. The n-body is now faster than
 clang: see below.
 
 clang does no FMA here: x86-64 without `-march` has none, so the two do
-the same roundings. clang vectorizes the matrix product with `mulpd` and
-`addpd`, two elements an instruction; Strike's loop is six scalar
-instructions an element.
+the same roundings. Both vectorize the matrix product with `mulpd` and
+`addpd`, two elements an instruction (it was six scalar instructions an
+element in Strike before [vectorization](#vectorization)).
 
 **The gaps that are not vectorization.** Every benchmark above and in
 [bench/simplify/](bench/simplify/), `--release --no-evaluate`, against
@@ -925,9 +1036,9 @@ min / median in seconds; the machine was busy, so a few percent is noise.
 | integration | 0.052 / 0.091 | 0.051 / 0.086 | 0.053 / 0.103 | | 4% faster |
 | 600x600 product (`long long`) | 0.055 / 0.058 | 0.054 / 0.055 | 0.056 / 0.058 | | 4% faster |
 | sieve of 100 million | 0.507 / 0.522 | 0.508 / 0.520 | 0.505 / 0.514 | | as fast |
-| 300x300 product (`double`) | 0.035 / 0.035 | 0.035 / 0.036 | 0.018 / 0.018 | | clang vectorizes |
-| intexpr.c | 0.158 / 0.162 | 0.156 / 0.160 | 0.070 / 0.072 | | clang vectorizes |
-| index.c | 0.0197 / 0.0201 | 0.0195 / 0.0200 | 0.0115 / 0.0120 | | clang vectorizes |
+| 300x300 product (`double`) | 0.035 / 0.035 | 0.035 / 0.036 | 0.018 / 0.018 | | clang vectorizes: now as fast, see [Vectorization](#vectorization) |
+| intexpr.c | 0.158 / 0.162 | 0.156 / 0.160 | 0.070 / 0.072 | | clang vectorizes: now within 3%, see [Vectorization](#vectorization) |
+| index.c | 0.0197 / 0.0201 | 0.0195 / 0.0200 | 0.0115 / 0.0120 | | clang vectorizes: now 10% faster, see [Vectorization](#vectorization) |
 
 What made the difference:
 
@@ -958,7 +1069,8 @@ What is left, and why:
   by side cost a push and a pop. Holding a second value in a register is
   what is left.
 - **intexpr.c, index.c and the double matrix product** are vectorized by
-  clang (`pmulld`, `mulpd`). intexpr.c is also slower than clang's scalar
+  clang (`pmuludq`, `mulpd`), and now by Strike: see
+  [Vectorization](#vectorization). intexpr.c is also slower than clang's scalar
   code (0.127 s): clang works in 32-bit registers. Removing the cut of `s`
   on its add-only chain made the loop slower (0.155 s to 0.177 s, measured,
   and not by its alignment), so the judge keeps it.

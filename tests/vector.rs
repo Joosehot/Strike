@@ -307,7 +307,7 @@ fn vectorized_loops_print_what_the_plain_code_prints() {
         }
     }
     eprintln!("{total} loops vectorized");
-    assert!(total >= 100, "only {total} loops vectorized");
+    assert!(total >= 400, "only {total} loops vectorized");
 }
 
 /// tests/uc/vector.c (lane-wise loops, reductions of every kind, the loops
