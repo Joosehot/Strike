@@ -383,7 +383,7 @@ the line and the reason, and never guessed. Refused today:
   TypeError, EOFError, Go's panics) and each refusal. The random C
   programs make strings in char arrays too, and compare them with strlen
   and strcmp.
-- 72 tests in all (every target of `cargo test --release`), in about 45 s.
+- 82 tests in all (every target of `cargo test --release`), in about 50 s.
 
 The tests have found real bugs, all fixed:
 
@@ -442,6 +442,8 @@ these is also something clang -O2 does:
 - **Algebra** ([src/uc/opt.rs](src/uc/opt.rs)). `x + 0` and `x * 1` become
   `x`, and `x * 2^k` becomes a shift. Python's `// 2^k` and `% 2^k` become
   a shift and a mask.
+- **The algebraic simplifier** ([src/uc/simplify.rs](src/uc/simplify.rs)),
+  in the way of Nuome's. See [below](#the-algebraic-simplifier).
 - **Loop-invariant code motion.** An expression that cannot fail, made of
   locals the loop never stores, is worked out once before the loop.
 - **Division by a constant as a magic multiplication**, where HotMotor's
@@ -479,6 +481,113 @@ these is also something clang -O2 does:
 
 A checked Python operation is never folded, moved, summed or worked out
 where it could stop the program.
+
+### The algebraic simplifier
+
+The simplifier is built the way Nuome's is. Nuome is the owner's math
+engine, and its simplifier does a beam search over rewrite paths: rules
+offer moves, and judges score the states. Here the rules are Nuome's ring
+rules, ported to the machine's integers, and the judge is the x86-64 code
+that x64opt.rs would make.
+
+- **What it reads.** Every pure integer expression of the IR is read as a
+  polynomial over Z/2^64 in its atoms. An atom is a leaf, or any operation
+  that is not a ring operation: division, remainder, comparisons, `& | ^`,
+  shifts right, shifts by a variable, and Python's checked operations. An
+  atom's own operands are simplified separately.
+- **The rules.** Each one is an identity mod 2^64, so it holds for the
+  machine's wrapping arithmetic:
+  - associativity and commutativity, and `x - y = x + (-1)y`;
+  - `~x = -x - 1`, and `x << k = 2^(k mod 64) x`;
+  - multiplying out;
+  - collecting like terms, and the full normal form;
+  - taking out a factor that two or more terms share. Done again and again,
+    this is Horner's form;
+  - taking out a constant (2, 4, 8 or the gcd);
+  - splitting `(2^k ± 1)x` into `2^k x ± x`;
+  - `0x = 0`, `1x = x`, `x + 0 = x`.
+- **Narrow widths.** The low n bits of a ring expression depend only on the
+  low n bits of its inputs. So under a C int's `Sext(32)`, every inner
+  `Sext(m >= 32)` is dropped and the coefficients are taken mod 2^32. A cut
+  is never moved across an atom, and a narrower cut stays where it is.
+- **The judge.** It follows x64opt's compile-time stack:
+  - a local plus a constant, times 1, 2, 4 or 8, plus another local, is one
+    `lea` or an address;
+  - a value that waits under another goes to the machine's stack;
+  - imul takes 3 cycles, and a scaled lea takes 2;
+  - `t = t + rest` is worked out in t's own register.
+
+  The judge counts instructions plus latency. In a loop, it knows what LICM
+  will take out, so the simplifier gathers invariant terms and factors into
+  one expression that hoist can move: `(i*m + j)*8 + base` becomes
+  `i*(8m) + (8j + base)`. A local just worked out is added last, so the
+  dependency chain through it stays short.
+- **Kept only if it is cheaper, and checked.** A rewrite is kept only when
+  it is strictly cheaper. It is also checked first: the old and the new
+  code must give the same value on 200 sets of inputs (0, ±1, the extremes,
+  powers of two and random numbers), evaluated with the machine's rules.
+  This is a guard. The proof is that every rule is an identity.
+- **Operations that can stop the program are left alone.** An expression
+  with a division by a variable or a checked operation is not rewritten
+  around it. It still stops exactly where it would. Python's numbers are all
+  checked, so a Python program is not changed.
+
+The simplifier is tested in several ways:
+
+- [tests/uc/algebra.c](tests/uc/algebra.c) and `algebra.go` must print what
+  clang and Go print, in every mode.
+- The random differential test now also writes ring expressions, in C
+  `long` and `long long`, with index arithmetic in loops.
+- Unit tests check every move of the beam against the original expression
+  on random expressions, and check that the guard catches wrong rewrites.
+
+**Running times.** These are from [bench/simplify/](bench/simplify/)
+(`python bench/simplify/run.py`, with STRIKE_BASE set to a build of master).
+Each program was run 11 times, with the builds interleaved. Times are in
+seconds, given as the minimum / the median. The machine is a Ryzen 5 7600X
+that other builds were also using. The first column is Strike before the
+simplifier. "clang scalar" is `-O2 -fno-vectorize -fno-slp-vectorize`.
+
+| | Strike before | **Strike now** | clang -O2 | clang scalar | go |
+|---|---|---|---|---|---|
+| poly.c (Horner) | 0.294 / 0.297 | **0.150 / 0.153** | 0.137 / 0.141 | 0.136 / 0.142 | |
+| poly.go | 0.296 / 0.297 | **0.151 / 0.154** | | | 0.222 / 0.224 |
+| factor.c (`ab+ac+ad-ae`) | 0.272 / 0.276 | **0.191 / 0.193** | 0.107 / 0.113 | 0.093 / 0.095 | |
+| factor.go | 0.272 / 0.274 | **0.191 / 0.193** | | | 0.311 / 0.314 |
+| chain.c (a recurrence) | 0.246 / 0.248 | **0.206 / 0.208** | 0.195 / 0.197 | | |
+| chain.go | 0.247 / 0.248 | **0.206 / 0.209** | | | 0.235 / 0.238 |
+| intchain.c (C int) | 0.605 / 0.607 | **0.376 / 0.377** | 0.275 / 0.276 | | |
+| intexpr.c (C int) | 0.360 / 0.362 | **0.204 / 0.207** | 0.072 / 0.073 | 0.127 / 0.130 | |
+| index.c (rows) | 0.027 / 0.028 | **0.020 / 0.021** | 0.012 / 0.012 | 0.015 / 0.016 | |
+| walk.c (dependent index) | 0.064 / 0.068 | **0.055 / 0.056** | 0.059 / 0.061 | | |
+| poly.py (checked) | 0.062 / 0.063 | 0.063 / 0.063 | | | |
+
+Strike is now 1.15 to 2 times as fast as before on these programs, and
+faster than Go on every Go one. Against clang -O2:
+
+- **walk.c: Strike is 6% faster.** The row's address is taken out of the
+  loop and the step is one address mode.
+- **chain.c: 6% slower; poly.c: 10% slower.**
+- **The rest are slower, for reasons that are not algebra:**
+  - clang vectorizes (intexpr, index);
+  - clang works across the copies of an unrolled loop and through locals,
+    for example `(i+1) >> 1` against `i >> 1`, and in intchain the next
+    iteration's x put into y;
+  - clang leaves out the C int cuts, because signed overflow is undefined
+    in C. Strike keeps one cut per expression, which is the exact result.
+
+**Compile time** (`python bench/simplify/compile_time.py`), what Strike
+reports, minimum of the rounds:
+
+| program | before | now |
+|---|---|---|
+| suite.c, algebra.c and arrays.c | 0.007 s | 0.013 s |
+| the 100 random test programs | 0.523 s | 0.562 s (+7%) |
+| 2000 functions of dense random polynomials ([genbig.py](bench/simplify/genbig.py)) | 0.86 s | 1.51 s |
+
+The last row is a stress test: every function has two expressions of up
+to 31 leaves over four names. The beam keeps 4 states for up to 8 rounds,
+and judges at most 30 states for each expression, fewer for a large one.
 
 ### Measured
 
