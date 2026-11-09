@@ -212,7 +212,7 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
         let src = r.join(format!("p{n}.c"));
         std::fs::write(&src, g.program()).unwrap();
         let mut outs = Vec::new();
-        for mode in ["--plain", "--opt", "--release", "--release-magic"] {
+        for mode in ["--plain", "--opt", "--release", "--release-magic", "--release-run"] {
             let exe = r.join(format!("p{n}{mode}.exe"));
             let mut c = Command::new(env!("CARGO_BIN_EXE_strike"));
             c.args(["compile", src.to_str().unwrap(), "-o", exe.to_str().unwrap()]).env("STRIKE_HOME", r.join("home"));
@@ -220,6 +220,10 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
                 "--opt" => {}
                 "--release-magic" => {
                     c.arg("--release").env("STRIKE_CODEGEN", &magic);
+                }
+                // the release optimizations as machine code that runs
+                "--release-run" => {
+                    c.args(["--release", "--no-evaluate"]);
                 }
                 m => {
                     c.arg(m);
@@ -233,6 +237,7 @@ fn the_optimized_code_prints_what_the_plain_code_prints() {
         assert_eq!(outs[0], outs[1], "p{n}.c: the optimized and the plain code differ");
         assert_eq!(outs[0], outs[2], "p{n}.c: the release and the plain code differ");
         assert_eq!(outs[0], outs[3], "p{n}.c: division by multiplying and the plain code differ");
+        assert_eq!(outs[0], outs[4], "p{n}.c: the release optimizations and the plain code differ");
     }
 }
 

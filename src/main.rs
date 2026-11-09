@@ -32,7 +32,7 @@ const USAGE: &str = "usage:
   strike arc devices
   strike arc receive [--into DIR] [--port N] [--once]
   strike arc send <path> --to <device|host:port> [--streams N]
-  strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release]
+  strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
   strike brand";
 
 fn main() -> ExitCode {
@@ -164,6 +164,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             let mut explain = false;
             let mut brands = true;
             let mut gen = uc::Gen::Opt;
+            let mut evaluate = true;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -172,6 +173,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                     "--no-brand" => brands = false,
                     "--plain" => gen = uc::Gen::Plain,
                     "--release" => gen = uc::Gen::Release,
+                    "--no-evaluate" => evaluate = false,
                     s if s.starts_with('-') => return Err(format!("unknown option {s}\n{USAGE}")),
                     s if file.is_none() => file = Some(PathBuf::from(s)),
                     s => return Err(format!("one file only, got also {s}\n{USAGE}")),
@@ -179,7 +181,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             }
             let file = file.ok_or(USAGE)?;
             let out = out.unwrap_or_else(|| file.with_extension("exe"));
-            let r = uc::compile(&file, &out, brands, gen)?;
+            let r = uc::compile(&file, &out, brands, gen, evaluate)?;
             if explain {
                 for line in &r.explain {
                     println!("  {line}");
@@ -202,6 +204,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 out.display(),
                 r.exe_bytes
             );
+            if gen == uc::Gen::Release {
+                println!("  release: {} operations simplified, {} expressions moved out of loops", r.simplified, r.hoisted);
+            }
             if let Some(how) = &r.evaluated {
                 println!("  the program reads nothing: {how}; the executable only prints its output");
             }

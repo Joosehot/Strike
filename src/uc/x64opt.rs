@@ -172,6 +172,86 @@ fn choose(f: &Func, r: &Rules) -> Vec<bool> {
     beam.swap_remove(0).1
 }
 
+/// HotMotor's judge for each division by a constant (--release): the
+/// divider, or the multiplication by the magic number. A division whose
+/// value comes back round its loop into what it divides waits on itself,
+/// and there the divider's shorter wait wins (measured: 30 million
+/// `s = (s * 31 + i) % 1000003`, 0.085 s with it against 0.095 s). Any
+/// other gets the multiplication, whose instructions can overlap from one
+/// time round to the next (measured: `s += (k ^ j) % 1000`, 0.0285 s
+/// against 0.040 s). True where the multiplication is taken.
+fn magic_where(f: &Func) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+    let code = &f.code;
+    let st = super::opt::starts(code);
+    let mut label_at = HashMap::new();
+    for (i, op) in code.iter().enumerate() {
+        if let Op::Label(l) = op {
+            label_at.insert(*l, i);
+        }
+    }
+    let loops: Vec<(usize, usize)> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(j, op)| match op {
+            Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) => label_at.get(l).filter(|&&t| t < j).map(|&t| (t, j)),
+            _ => None,
+        })
+        .collect();
+    let loads = |from: usize, to: usize| -> HashSet<u32> {
+        code[from..to].iter().filter_map(|o| if let Op::Load(s) = o { Some(*s) } else { None }).collect()
+    };
+    let mut take = vec![false; code.len()];
+    for i in 1..code.len() {
+        let Op::Bin(BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor) = code[i] else { continue };
+        let Op::Push(_) = code[i - 1] else { continue };
+        // the innermost loop around it; outside every loop it waits on nothing
+        let Some(&(t, j)) = loops.iter().filter(|(t, j)| *t < i && i < *j).min_by_key(|(t, j)| j - t) else {
+            take[i] = true;
+            continue;
+        };
+        let Some(s) = st[i] else { continue };
+        let divided = loads(s, i - 1);
+        // where its value goes: the store that ends its statement
+        let Some(dest) = code[i + 1..j].iter().find_map(|o| if let Op::Store(x) = o { Some(*x) } else { None }) else { continue };
+        // what each local stored in the loop is made from
+        let mut from: HashMap<u32, Option<HashSet<u32>>> = HashMap::new();
+        for k in t..=j {
+            if let Op::Store(x) = code[k] {
+                let made = st.get(k.wrapping_sub(1)).copied().flatten().map(|s0| loads(s0, k));
+                let e = from.entry(x).or_insert_with(|| Some(HashSet::new()));
+                match (e.as_mut(), made) {
+                    (Some(set), Some(m)) => set.extend(m),
+                    _ => *e = None, // not known: taken as made from anything
+                }
+            }
+        }
+        // does dest reach what is divided, through the loop's stores?
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut todo: Vec<u32> = divided.into_iter().collect();
+        let mut chain = false;
+        while let Some(x) = todo.pop() {
+            if x == dest {
+                chain = true;
+                break;
+            }
+            if !seen.insert(x) {
+                continue;
+            }
+            match from.get(&x) {
+                Some(Some(m)) => todo.extend(m.iter().copied()),
+                Some(None) => {
+                    chain = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        take[i] = !chain;
+    }
+    take
+}
+
 /// The magic number and shift that divide by d with a multiplication
 /// (Hacker's Delight, 10-1), for |d| >= 2.
 pub fn magic(d: i64) -> (i64, u32) {
@@ -264,8 +344,12 @@ struct G {
     frame: i32,
     /// bytes taken below the pushed values (a call's argument room)
     extra: i32,
-    /// division by a constant as a multiplication (codegen.toml)
+    /// division by a constant as a multiplication (codegen.toml), at the
+    /// operations magic_where takes
     magic: bool,
+    magic_at: Vec<bool>,
+    /// the operation being compiled
+    op_at: usize,
     /// division of numbers that fit 32 bits by the 32-bit instruction
     div32: bool,
 }
@@ -560,7 +644,7 @@ impl G {
                 }
             }
             BinOp::DivTrunc | BinOp::ModTrunc | BinOp::DivFloor | BinOp::ModFloor
-                if self.magic && matches!(o, Opd::Imm(d) if d.unsigned_abs() >= 2) =>
+                if self.magic && self.magic_at.get(self.op_at) == Some(&true) && matches!(o, Opd::Imm(d) if d.unsigned_abs() >= 2) =>
             {
                 let Opd::Imm(d) = o else { unreachable!() };
                 let (m, s) = magic(d as i64);
@@ -1057,7 +1141,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;
     }
-    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, div32: rules.division.bypass_32 };
+    let mut g = G { a: Asm::new(), v: Vec::new(), loc, saved, frame, extra: 0, magic: release && rules.release.magic_division, magic_at: if release && rules.release.magic_division { magic_where(f) } else { Vec::new() }, op_at: 0, div32: rules.division.bypass_32 };
     let fast = fast_path(f);
     if let Some(fp) = &fast {
         // before the frame: the parameters are still in rcx, rdx, r8, r9
@@ -1184,6 +1268,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
         if !live && !matches!(op, Op::Label(_)) {
             continue; // no way reaches here
         }
+        g.op_at = at;
         match (op, f.code.get(at + 1)) {
             (Op::Push(0), Some(Op::Store(s))) if zero[*s as usize] => {
                 skip = 1;

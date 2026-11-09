@@ -344,6 +344,55 @@ Primes below 300 000, mean of 7 runs:
 | clang -O0 | 0.0208 s | the same |
 | go | 0.0283 s | 26% faster |
 
+## What clang -O2 does, in --release
+
+On top of the default generator, `--release` makes these optimizations,
+each of which clang -O2 also makes:
+
+- **Algebra** (clang's instcombine; [src/uc/opt.rs](src/uc/opt.rs)).
+  `x + 0`, `x * 1` and `x | 0` become `x`, and `x * 2^k` becomes `x << k`.
+  Python's `x // 2^k` becomes `x >> k`, and `x % 2^k` becomes
+  `x & (2^k - 1)`.
+- **Loop-invariant code motion** (LICM). An expression in a loop whose
+  locals the loop never stores is worked out once, before the loop, into a
+  new slot. Only expressions that cannot fail are moved (no division by a
+  variable), since a loop may not run at all. Only loops entered by falling
+  into their top are touched.
+- **Division by a constant as a multiplication by its magic number**,
+  where HotMotor's judge takes it (`magic_where` in x64opt.rs). A division
+  whose value comes back round its loop into what it divides waits on
+  itself, and there the divider is faster. Any other division gets the
+  multiplication, whose instructions overlap from one time round to the
+  next.
+- **Constant folding, readier inlining, and working out a program that
+  reads nothing** (above). Clang does the same. On pow2 its executable is
+  one constant and one printf.
+
+The random-program test now has a fifth mode, `--release --no-evaluate`:
+the release optimizations as machine code that runs. In the 100 programs,
+128 operations were simplified and 1053 expressions were moved out of
+loops. All printed what the plain code prints.
+
+Measured with `--no-evaluate`, so the generated code runs. Every C file
+uses 64-bit `long long`, since on Windows clang's `long` is 32 bits and
+would compute something else. Mean of 5 runs:
+
+| | Strike --release | clang -O2 | Strike against clang -O2 |
+|---|---|---|---|
+| fib(36) | 0.0300 s | 0.0335 s | 10% faster |
+| 30 million calls | 0.0857 s | 0.0995 s | 14% faster |
+| primes below 300 000 | 0.0204 s | 0.0208 s | 2% faster |
+| invariant loops (`s += (a*b + i*7 ^ j) % 1000`) | 0.0310 s (0.040 s before) | 0.0275 s | 13% slower |
+| pow2 (`s += i*8 + (i*4+1)*1 + 0`) | 0.0340 s | 0.0050 s | clang worked the loop out while compiling |
+
+On pow2, clang found the loop's sum while compiling, from the loop's
+recurrences (SCEV). With evaluation on, Strike's `--release` does the
+same: it runs the program once while compiling, and the executable prints
+the number in 4 ms. Strike does not yet have the recurrence algebra clang
+used, so a loop like that whose numbers come from input stays a loop.
+That, and SIMD vectorisation, are what clang -O2 still has that Strike
+does not.
+
 ## A program that reads nothing is worked out while compiling (--release)
 
 A program with no input has a fixed result: what it prints and what it

@@ -19,6 +19,7 @@ pub mod ir;
 mod lang;
 mod lex;
 mod lower;
+mod opt;
 mod parse;
 mod pe;
 mod x64;
@@ -111,6 +112,9 @@ pub struct Report {
     pub unrolled: usize,
     /// --release: how the program was worked out while compiling
     pub evaluated: Option<String>,
+    /// --release: operations the algebra changed, expressions moved out of loops
+    pub simplified: usize,
+    pub hoisted: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -188,7 +192,7 @@ pub fn languages() -> Result<Vec<Lang>, String> {
     Ok(v)
 }
 
-pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report, String> {
+pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -> Result<Report, String> {
     let start = Instant::now();
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let langs = languages()?;
@@ -249,7 +253,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     let mut low = low;
     // --release: a program that reads nothing, worked out now
     let mut evaluated = None;
-    if gen == Gen::Release {
+    if gen == Gen::Release && evaluate {
         if let Some(d) = eval::run(&low.funcs, &low.entry, &rules.release.evaluate) {
             let mut code = Vec::new();
             if !d.output.is_empty() {
@@ -264,10 +268,14 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     let tail_calls: usize = if gen == Gen::Plain { 0 } else { low.funcs.iter_mut().map(tail::run).sum() };
     let unrolled = if gen == Gen::Plain { 0 } else { inline::unroll(&mut low.funcs, &rules) };
     let inlined = if gen == Gen::Plain { 0 } else { inline::run(&mut low.funcs, &rules, gen == Gen::Release) };
+    let (mut simplified, mut hoisted) = (0, 0);
     if gen == Gen::Release {
-        low.funcs.iter_mut().for_each(|f| {
+        for f in low.funcs.iter_mut() {
             fold::run(f);
-        });
+            simplified += opt::simplify(f);
+            hoisted += opt::hoist(f);
+            fold::run(f);
+        }
     }
     let mut pack = if brands { Some(Pack::open(brand_dir().join("pack"))) } else { None };
     let mut funcs: Vec<(String, Code)> = x64::runtime(&low.entry);
@@ -305,7 +313,7 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
     let mut exe = pe::link(&funcs, "rt.start")?;
     // --release, too long for the IR runner: the program run once as it
     // was compiled, and the executable only gives its output
-    if gen == Gen::Release && evaluated.is_none() && rules.release.evaluate.max_seconds > 0.0 {
+    if gen == Gen::Release && evaluate && evaluated.is_none() && rules.release.evaluate.max_seconds > 0.0 {
         let run = Instant::now();
         let mut baking = funcs.clone();
         baking[0] = ("rt.start".to_string(), x64::bake_start(&low.entry));
@@ -344,6 +352,8 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen) -> Result<Report,
         tail_calls,
         unrolled,
         evaluated,
+        simplified,
+        hoisted,
     })
 }
 

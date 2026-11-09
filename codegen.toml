@@ -44,12 +44,14 @@ bypass_32 = true
 # number, constant expressions are worked out while compiling, and calls
 # are copied in more readily.
 [release]
-# division by a constant as a multiplication by its magic number. Off:
-# measured on this machine (30 million `% 1000003` in a dependent chain),
-# its divider is as fast as the multiplication's chain of seven
-# instructions (0.095 s against 0.085 s with idiv; clang -O2's own
-# multiplication 0.100 s)
-magic_division = false
+# division by a constant as a multiplication by its magic number, where
+# HotMotor's judge takes it (x64opt.rs, magic_where): a division whose value
+# comes back round its loop into what it divides keeps the divider, whose
+# wait is shorter there (30 million dependent `% 1000003`: 0.085 s against
+# 0.095 s); any other gets the multiplication, whose instructions overlap
+# from one time round to the next (`s += (k ^ j) % 1000`: 0.0285 s against
+# 0.040 s)
+magic_division = true
 
 # A program that reads nothing has a fixed result. --release runs it while
 # compiling, by the machine's own rules, and when it ends within these
