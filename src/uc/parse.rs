@@ -490,6 +490,11 @@ impl<'a> P<'a> {
 
     fn ty(&mut self) -> R<Vec<String>> {
         let start = self.i;
+        // C's type begins with a word (*p = v is no declaration); Go's *P
+        // begins with its star
+        if !self.l.param_first && self.text() == Some("*") {
+            return self.miss("a type");
+        }
         let mut words = Vec::new();
         loop {
             // Go's []T and [n]T: the brackets before the element's type
@@ -588,6 +593,16 @@ impl<'a> P<'a> {
                             caps.places.push(Lv::Target(Expr::Deref(Box::new(e), line)));
                             continue;
                         }
+                    }
+                    // (*p).x = v
+                    if self.l.records.is_some() && self.text() == Some("(") {
+                        let p = self.l.unary.values().map(|u| u.0).max().unwrap_or(0);
+                        let e = self.expr(p)?.0;
+                        if !matches!(e, Expr::Field(..) | Expr::Index(..) | Expr::Deref(..)) {
+                            return self.miss("a place a value is given to");
+                        }
+                        caps.places.push(Lv::Target(e));
+                        continue;
                     }
                     let mut n = self.name()?;
                     // pkg.X = v, m.x = v: a name of another module, or a

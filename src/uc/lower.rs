@@ -2487,12 +2487,27 @@ impl Fx<'_, '_> {
     /// An element of the container `c` is given a value of kind t: Python
     /// learns the container's elements from it.
     fn elem_kind(&mut self, c: &Expr, e: &Ty, t: &Ty) -> Result<(), E> {
-        if unify(e, t).is_some() || (e.scalar() && t.scalar() && !self.sh.bools) {
+        // a typed language converts a number to its element's type (or
+        // refuses it) where it is stored
+        if unify(e, t).is_some() || (e.scalar() && t.scalar() && (!self.sh.bools || self.typed())) {
             if let Expr::Var(n, _) = c {
                 if let Some((_, ct @ Ty::List(_))) = self.lookup(n) {
                     let _ = ct;
                     let n = n.clone();
                     self.refine(&n, &Ty::List(Box::new(t.clone())))?;
+                }
+            }
+            // a list an object's attribute holds: the attribute learns it
+            if let (Expr::Field(b, a, _), true) = (c, self.classes()) {
+                let (code, slots, labels) = (self.code.len(), self.slots, self.labels);
+                let bt = self.expr(b, true)?;
+                self.code.truncate(code);
+                (self.slots, self.labels) = (slots, labels);
+                if let Ty::Obj(k) = bt {
+                    let was = self.attr_kind(&k, a);
+                    if let Some(now) = unify(&was, &Ty::List(Box::new(t.clone()))) {
+                        self.saw(Self::attr_key(&k, a), now);
+                    }
                 }
             }
             return Ok(());
@@ -2681,7 +2696,10 @@ impl Fx<'_, '_> {
             Ty::Float => Elem::Float(FloatElem { f32: ew == 32, repr: self.sh.l.float_print == Some(FloatPrint::Repr), buf: self.float_buf() }),
             Ty::List(_) | Ty::Slice(..) => Elem::Nested(self.printer_plus(&e, plus)?, false),
             Ty::Arr(..) => Elem::Nested(self.printer_plus(&e, plus)?, true),
-            Ty::Struct(s) => Elem::Nested(self.struct_printer(s, plus)?, true),
+            Ty::Struct(s) => {
+                self.printed_plainly(s)?;
+                Elem::Nested(self.struct_printer(s, plus)?, true)
+            }
             // Python shows an object in a list by its __repr__
             Ty::Obj(c) => {
                 let Some(d) = self.resolve(c, "__repr__") else {
@@ -4627,7 +4645,10 @@ impl Fx<'_, '_> {
                 Ty::Bool => Elem::Bool,
                 Ty::Float => Elem::Float(FloatElem { f32: f.w == 32, repr: false, buf: self.float_buf() }),
                 Ty::Str => Elem::Str(false),
-                Ty::Struct(inner) => Elem::Nested(self.struct_printer(inner, plus)?, true),
+                Ty::Struct(inner) => {
+                    self.printed_plainly(inner)?;
+                    Elem::Nested(self.struct_printer(inner, plus)?, true)
+                }
                 Ty::Slice(..) => Elem::Nested(self.printer_plus(&f.ty, plus)?, false),
                 Ty::Arr(..) => Elem::Nested(self.printer_plus(&f.ty, plus)?, true),
                 Ty::Ptr(..) => return self.err(format!("struct {s} holds a pointer ({}), which Go prints as its address; Strike cannot print that as Go does", f.name)),
@@ -4652,9 +4673,59 @@ impl Fx<'_, '_> {
         Ok(name)
     }
 
+    /// Go's fmt prints a value through its String method (or Error,
+    /// Format, GoString) where its type has one: refused where Strike does
+    /// not do it as fmt does (inside another value, or the others).
+    fn printed_plainly(&self, s: &str) -> Result<(), E> {
+        for m in ["String", "Error", "Format", "GoString"] {
+            if self.sh.sigs.contains_key(&format!("{s}.{m}")) {
+                return self.err(format!("{s} has a {m} method, which Go's fmt calls; Strike prints it so only as the value printed itself (String with a value receiver)"));
+            }
+        }
+        Ok(())
+    }
+
     /// Prints a value as print, Println or %v does; plus: %+v (a struct's
     /// fields by name).
     fn print_struct(&mut self, t: &Ty, plus: bool) -> Result<(), E> {
+        let s = match t {
+            Ty::Struct(s) => s.clone(),
+            Ty::Ptr(e, _) => match &**e {
+                Ty::Struct(s) => s.clone(),
+                _ => return self.err("a pointer is not printed"),
+            },
+            _ => unreachable!(),
+        };
+        for m in ["Error", "Format", "GoString"] {
+            if self.sh.sigs.contains_key(&format!("{s}.{m}")) {
+                return self.err(format!("{s} has a {m} method, which Go's fmt calls; that is not in Strike yet"));
+            }
+        }
+        // a String method: what fmt prints (a value's only when it takes a
+        // value; a nil pointer's <nil>, as fmt gives when it would panic)
+        if let Some(sig) = self.sh.sigs.get(&format!("{s}.String")).cloned() {
+            let by_ptr = matches!(sig.params[0], Ty::Ptr(..));
+            let ptr = matches!(t, Ty::Ptr(..));
+            if ptr && by_ptr {
+                return self.err(format!("{s}'s String takes a pointer, and fmt gives a nil one <nil> only where String panics; that is not in Strike yet"));
+            }
+            if !by_ptr {
+                let (h, end) = (self.hidden(), self.label());
+                self.emit(Op::Store(h));
+                if ptr {
+                    let some = self.label();
+                    self.ops(&[Op::Load(h), Op::Jnz(some), Op::PrintStr(b"<nil>".to_vec()), Op::Jmp(end), Op::Label(some)]);
+                }
+                let line = self.line;
+                let r = self.call_sig(&format!("{s}.String"), &sig, Some((h, sig.params[0].clone())), &[], line, true)?;
+                if r != Ty::Str {
+                    return self.err(format!("{s}'s String returns {}, not a string", r.describe()));
+                }
+                self.lib("lib.str_print", 1);
+                self.ops(&[Op::Pop, Op::Label(end)]);
+                return Ok(());
+            }
+        }
         match t {
             Ty::Struct(s) => {
                 let f = self.struct_printer(s, plus)?;
@@ -4696,6 +4767,21 @@ impl Fx<'_, '_> {
     fn class_attr(&self, c: &str, a: &str) -> Option<String> {
         self.chain(c).into_iter().find(|k| self.class(k).is_some_and(|x| x.class_attrs.iter().any(|y| y == a)))
     }
+    /// The attributes an object of class c has a word for: those its
+    /// class's methods set, then those set elsewhere (learned as kinds are,
+    /// round by round), each at 8 * (1 + its place).
+    fn obj_attrs(&self, c: &str) -> Vec<String> {
+        let mut v = self.class(c).map(|k| k.attrs.clone()).unwrap_or_default();
+        let key = format!("attrs {c}");
+        let mut extra: Vec<&String> = self.sh.known.keys().filter(|k| k.0 == key).map(|k| &k.1).collect();
+        extra.sort();
+        for e in extra {
+            if !v.contains(e) {
+                v.push(e.clone());
+            }
+        }
+        v
+    }
     fn attr_key(c: &str, a: &str) -> (String, String) {
         (format!("class {c}"), a.to_string())
     }
@@ -4712,7 +4798,10 @@ impl Fx<'_, '_> {
     /// P(args): a new object, its attributes not set yet, given to the
     /// class's __init__ (its own, or a base's).
     fn construct(&mut self, c: &str, args: &[Expr], line: u32) -> Result<Ty, E> {
-        let n = self.class(c).map(|k| k.attrs.len()).unwrap_or(0);
+        let n = self.obj_attrs(c).len();
+        if n > MAX_ATTRS {
+            return self.err(format!("{c}'s objects have more than {MAX_ATTRS} attributes, which is not in Strike yet"));
+        }
         let h = self.hidden();
         self.emit(Op::Push(8 * (1 + n as i64)));
         self.lib("lib.bytes", 1);
@@ -4790,7 +4879,8 @@ impl Fx<'_, '_> {
         let h = self.hidden();
         self.emit(Op::Store(h));
         let t = self.call_sig(&f, &sig, Some((h, Ty::Obj(c.to_string()))), &[], self.line, true)?;
-        if t != Ty::Str {
+        // not known yet: the method's own lowering says why, or a later round
+        if t != Ty::Str && t != Ty::Unknown {
             return self.err(format!("{m} returned {}, not a string (TypeError)", t.describe()));
         }
         Ok(())
@@ -4813,7 +4903,7 @@ impl Fx<'_, '_> {
         }
         let t = self.expr(base, true)?;
         let Ty::Obj(c) = t else { return self.err(format!("{} has no attribute {a} in Strike", t.describe())) };
-        let attrs = self.class(&c).map(|k| k.attrs.clone()).unwrap_or_default();
+        let attrs = self.obj_attrs(&c);
         let owner = self.class_attr(&c, a);
         let missing = format!("AttributeError: '{c}' object has no attribute '{a}'\n").into_bytes();
         let h = self.hidden();
@@ -4887,9 +4977,14 @@ impl Fx<'_, '_> {
         };
         let t = self.expr(base, true)?;
         let Ty::Obj(c) = t else { return self.err(format!("{} has no attribute {a} in Strike", t.describe())) };
-        let attrs = self.class(&c).map(|k| k.attrs.clone()).unwrap_or_default();
+        let attrs = self.obj_attrs(&c);
+        // an attribute given outside the class's methods: the class's
+        // objects get a word for it from the next round on
+        if !self.class(&c).is_some_and(|k| k.attrs.iter().any(|x| x == a)) {
+            self.saw((format!("attrs {c}"), a.to_string()), Ty::Int);
+        }
         let Some(i) = attrs.iter().position(|x| x == a) else {
-            return self.err(format!("{a} is given to an object of class {c} outside its class's methods: that is not in Strike yet"));
+            return self.err(format!("{a} is given to an object of class {c}, which has no word for it yet"));
         };
         let was = self.attr_kind(&c, a);
         let Some(now) = unify(&was, &vt) else {
@@ -4913,11 +5008,27 @@ impl Fx<'_, '_> {
     /// values, as globals of the program (P::a).
     fn class_stmt(&mut self, c: &str) -> Result<(), E> {
         let Some(def) = self.sh.defs.get(c).cloned() else { return Ok(()) };
+        // a name the class's body has given so far is the class's own there
+        // (b = a + 1 reads the class's a), others are the module's
+        fn own(e: &Expr, c: &str, given: &HashSet<String>) -> Result<Expr, (u32, String)> {
+            Ok(match e {
+                Expr::Var(n, l) if given.contains(n) => Expr::Var(format!("{c}::{n}"), *l),
+                Expr::Num(..) | Expr::Float(_) | Expr::Str(_) | Expr::Var(..) => e.clone(),
+                Expr::Un(op, x) => Expr::Un(*op, Box::new(own(x, c, given)?)),
+                Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(own(a, c, given)?), Box::new(own(b, c, given)?)),
+                Expr::List(xs, l) => Expr::List(xs.iter().map(|x| own(x, c, given)).collect::<Result<_, _>>()?, *l),
+                Expr::Call(f, xs, l) if !given.contains(f) => Expr::Call(f.clone(), xs.iter().map(|x| own(x, c, given)).collect::<Result<_, _>>()?, *l),
+                _ => return Err((0, format!("this value in the body of class {c} is not in Strike yet (a number, a string, a list, or arithmetic of them and of names, is)"))),
+            })
+        }
+        let mut given = HashSet::new();
         for s in &def.attrs {
             match s {
                 Stmt::Assign { name, index, op: None, value, line } if index.is_empty() => {
                     self.line = *line;
-                    self.assign(&format!("{c}::{name}"), value)?;
+                    let v = own(value, c, &given).map_err(|(_, m)| (*line, m))?;
+                    self.assign(&format!("{c}::{name}"), &v)?;
+                    given.insert(name.clone());
                 }
                 Stmt::Nothing => {}
                 Stmt::Expr(Expr::Str(_)) => {}
@@ -4929,6 +5040,11 @@ impl Fx<'_, '_> {
 }
 
 fn combine(what: &str, tys: &[Ty], bools: bool) -> Result<Ty, String> {
+    // a value not known yet (a parameter passed on before its own kind is
+    // learned) says nothing: the next round tells
+    if !tys.is_empty() && tys.iter().all(|t| *t == Ty::Unknown) {
+        return Ok(Ty::Unknown);
+    }
     if tys.iter().any(|t| !t.scalar()) {
         let mut u = Ty::Unknown;
         for t in tys {
