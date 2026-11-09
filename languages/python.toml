@@ -225,6 +225,31 @@ pattern = "$place %= $expr $end"
 
 [[form]]
 kind = "assign"
+op = "shl"
+pattern = "$place <<= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "shr"
+pattern = "$place >>= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "band"
+pattern = "$place &= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "bor"
+pattern = "$place |= $expr $end"
+
+[[form]]
+kind = "assign"
+op = "bxor"
+pattern = "$place ^= $expr $end"
+
+[[form]]
+kind = "assign"
 pattern = "$place = $expr $end"
 
 [[form]]

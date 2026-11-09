@@ -122,6 +122,14 @@ fn simplified_expressions_are_what_clang_and_go_make_of_them() {
 /// C's bool is 0 or 1: a value going there becomes 1 where it is not
 /// zero, as clang converts it (in a variable, an array, a field, a
 /// parameter, from a float).
+/// <<=, >>=, &=, |= and ^= on variables and elements, in the three languages.
+#[test]
+fn bitwise_assignments_are_what_clang_go_and_python_make_of_them() {
+    for file in ["opassign.c", "opassign.go", "opassign.py"] {
+        runs_in_every_mode_as_the_real_one(file);
+    }
+}
+
 #[test]
 fn c_bool_is_what_clang_makes_of_it() {
     runs_in_every_mode_as_the_real_one("cbool.c");
