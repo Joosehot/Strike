@@ -230,6 +230,34 @@ pub fn compile(f: &Func) -> Code {
                 });
                 depth -= 2;
             }
+            Op::OpM(b, w) => {
+                a.e(&[0x59, 0x41, 0x58]); // pop rcx (the value); pop r8 (the address)
+                a.e(match w {
+                    1 => &[0x49, 0x0F, 0xBE, 0x00], // movsx rax, byte [r8]
+                    2 => &[0x49, 0x0F, 0xBF, 0x00],
+                    4 => &[0x49, 0x63, 0x00],
+                    _ => &[0x49, 0x8B, 0x00],
+                });
+                match b {
+                    BinOp::AddOv | BinOp::SubOv => {
+                        let t = *trap_at.get_or_insert_with(|| a.label());
+                        checked(&mut a, Some(*b), t);
+                    }
+                    BinOp::Add => a.e(&[0x48, 0x01, 0xC8]),
+                    BinOp::Sub => a.e(&[0x48, 0x29, 0xC8]),
+                    BinOp::Band => a.e(&[0x48, 0x21, 0xC8]),
+                    BinOp::Bor => a.e(&[0x48, 0x09, 0xC8]),
+                    BinOp::Bxor => a.e(&[0x48, 0x31, 0xC8]),
+                    b => unreachable!("{b:?} is not worked in memory"),
+                }
+                a.e(match w {
+                    1 => &[0x41, 0x88, 0x00], // mov [r8], al
+                    2 => &[0x66, 0x41, 0x89, 0x00],
+                    4 => &[0x41, 0x89, 0x00],
+                    _ => &[0x49, 0x89, 0x00],
+                });
+                depth -= 2;
+            }
             Op::Frame(n) => {
                 a.e(&[0x48, 0x8D, 0x85]); // lea rax, [rbp + d]
                 a.d32(memory + *n as i32);

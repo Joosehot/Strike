@@ -290,6 +290,9 @@ pub fn compile(src: &Path, out: &Path, brands: bool, gen: Gen, evaluate: bool) -
     if gen == Gen::Release {
         for f in low.funcs.iter_mut() {
             fold::run(f);
+            if opt::constants(f) > 0 {
+                fold::run(f);
+            }
             simplified += opt::simplify(f);
             hoisted += opt::hoist(f);
             simplified += opt::counters(f);

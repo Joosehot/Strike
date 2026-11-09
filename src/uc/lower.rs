@@ -257,6 +257,16 @@ fn sliced_names(body: &[Stmt]) -> HashSet<String> {
     out
 }
 
+/// Is the expression free of calls (nothing it does can change memory)?
+fn calls_nothing(e: &Expr) -> bool {
+    match e {
+        Expr::Num(..) | Expr::Str(_) | Expr::Var(..) | Expr::Type(..) => true,
+        Expr::Un(_, x) => calls_nothing(x),
+        Expr::Bin(_, a, b) | Expr::Index(a, b, _) => calls_nothing(a) && calls_nothing(b),
+        _ => false,
+    }
+}
+
 /// Does the body assign to name or an element of it?
 fn changes(body: &[Stmt], name: &str) -> bool {
     body.iter().any(|s| match s {
@@ -1424,6 +1434,16 @@ impl Fx<'_, '_> {
             }
             self.emit(Op::StoreM(size(&e, w) as u8));
             return Ok(());
+        }
+        // a[i] += x worked on the memory itself, where x calls nothing (so
+        // when the element is read does not matter)
+        if let Some(op @ (BinOp::Add | BinOp::Sub | BinOp::Band | BinOp::Bor | BinOp::Bxor)) = op {
+            if e.scalar() && e != Ty::Bool && calls_nothing(value) {
+                self.int_expr(value)?;
+                let op = if self.sh.l.checked { op.checked() } else { op };
+                self.emit(Op::OpM(op, size(&e, w) as u8));
+                return Ok(());
+            }
         }
         let a = self.hidden();
         self.emit(Op::Store(a));

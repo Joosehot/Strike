@@ -81,6 +81,10 @@ pub fn run(f: &mut Func) -> usize {
             }
         }
     }
+    // a label nothing jumps to is only the way on (a `for` loop's continue
+    // where no continue is): without it the loop's body is one straight run
+    let used: std::collections::HashSet<u32> = out.iter().filter_map(|o| if let Op::Jmp(l) | Op::Jz(l) | Op::Jnz(l) = o { Some(*l) } else { None }).collect();
+    out.retain(|o| !matches!(o, Op::Label(l) if !used.contains(l)));
     f.code = out;
     before - f.code.len()
 }

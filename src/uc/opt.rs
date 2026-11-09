@@ -53,7 +53,7 @@ pub(super) fn starts(code: &[Op]) -> Vec<Option<usize>> {
                 st.pop();
                 st.push(None);
             }
-            Op::StoreM(_) => {
+            Op::StoreM(_) | Op::OpM(..) => {
                 st.pop();
                 st.pop();
             }
@@ -232,6 +232,40 @@ fn narrow32(f: &Func) -> Vec<bool> {
             return narrow;
         }
     }
+}
+
+/// A local every store of which gives it the same constant (C's
+/// `int n = 300`) is read as that constant: its loops' counts become known.
+/// (Before its first store a C local holds nothing it may be read for, and
+/// Go and Python never read a variable before its first value.) Returns
+/// how many loads it replaced.
+pub fn constants(f: &mut Func) -> usize {
+    let mut value: Vec<Option<Option<i64>>> = vec![None; f.slots as usize];
+    for (k, op) in f.code.iter().enumerate() {
+        let Op::Store(s) = op else { continue };
+        let c = match k.checked_sub(1).map(|p| &f.code[p]) {
+            Some(Op::Push(c)) => Some(*c),
+            _ => None,
+        };
+        let v = &mut value[*s as usize];
+        *v = match (*v, c) {
+            (None, c) => Some(c),
+            (Some(Some(a)), Some(b)) if a == b => Some(Some(a)),
+            _ => Some(None),
+        };
+    }
+    let mut n = 0;
+    for op in f.code.iter_mut() {
+        if let Op::Load(s) = op {
+            if *s >= f.params {
+                if let Some(Some(c)) = value[*s as usize] {
+                    *op = Op::Push(c);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// The largest constant a local is ever given, where every store into it

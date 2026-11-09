@@ -182,6 +182,10 @@ pub enum Op {
     /// pops a value, then an address, and writes the value's low n bytes
     /// there
     StoreM(u8),
+    /// pops a value, then an address, and works the n bytes there with the
+    /// operation, the element on the left (C's a[i] += x: one instruction
+    /// that reads, works and writes the memory)
+    OpM(BinOp, u8),
     /// pushes the address of byte n of the function's own memory (its C
     /// arrays: they live as long as the call)
     Frame(u32),
@@ -248,7 +252,7 @@ pub fn label_count(code: &[Op]) -> u32 {
 }
 
 /// The version of the code generator; a new one gives every brand anew.
-pub const CODEGEN: &str = "strike-x64-3";
+pub const CODEGEN: &str = "strike-x64-4";
 
 /// How the IR's stack changes at an operation (None: nothing comes after
 /// it on the same way, a return or a stop).
@@ -257,7 +261,7 @@ pub fn stack_effect(op: &Op) -> Option<i32> {
         Op::Push(_) | Op::Load(_) | Op::Dup | Op::LoadG(_) | Op::ReadLine | Op::Frame(_) | Op::AddrG(_) => 1,
         Op::Store(_) | Op::Pop | Op::PrintInt | Op::Bin(_) | Op::Jz(_) | Op::Jnz(_) | Op::StoreG(_) => -1,
         Op::Un(_) | Op::Sext(_) | Op::PrintStr(_) | Op::Label(_) | Op::Jmp(_) | Op::LoadM(_) => 0,
-        Op::StoreM(_) => -2,
+        Op::StoreM(_) | Op::OpM(..) => -2,
         Op::ReadToken => 2,
         Op::Call(_, n) => 1 - *n as i32,
         Op::Ret | Op::Fail(..) => return None,
@@ -308,6 +312,7 @@ impl Func {
                 Op::LoadM(w) => (21, *w as i64),
                 Op::StoreM(w) => (22, *w as i64),
                 Op::Frame(n) => (23, *n as i64),
+                Op::OpM(b, w) => (26, (*b as i64) << 8 | *w as i64),
                 Op::AddrG(g) => (24, *g as i64),
                 Op::Fail(code, m) => {
                     h.update(&[25]);

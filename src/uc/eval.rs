@@ -235,6 +235,12 @@ pub fn run(funcs: &[Func], entry: &str, globals: u32, lim: &Limits) -> Option<Do
                 let a = stack.pop()?;
                 m.store(a, *w, v)?;
             }
+            Op::OpM(b, w) => {
+                let v = stack.pop()?;
+                let a = stack.pop()?;
+                let old = m.load(a, *w)?;
+                m.store(a, *w, bin(*b, old, v)?)?;
+            }
             // a program that stops so must stop so when it runs
             Op::Fail(..) => return None,
             Op::Sext(n) => {
