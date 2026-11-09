@@ -2,7 +2,9 @@
 
 **The King Killer.**
 
-A build system that calls the compiler itself. Two parts decide every build:
+A build system that calls the compiler itself, and a compiler of its own
+for every language it has a description of (below). Two parts decide
+every build:
 
 - **HotMotor** chooses how to build. One rule per decision (opt-level,
   codegen units, incremental, debuginfo, linker), each with variants scored
@@ -58,7 +60,7 @@ own time goes.
 ## The universal compiler
 
 ```
-strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release]
+strike compile <file> [-o EXE] [--explain] [--no-brand] [--plain] [--release [--no-evaluate]]
 ```
 
 Strike's own compiler. It does not know any language itself. Every
@@ -67,6 +69,7 @@ language is a description in [languages/](languages/):
 - how its text is cut into tokens (comments, strings, a block by braces or
   by indentation, where a line ends a statement);
 - its operators, with their precedence;
+- its integer types and their widths;
 - its forms, written as patterns. For example, `if ( $expr ) $body [ else
   $body ]` is C's if, and `for $name in range ( $args ) : $block` is
   Python's.
@@ -74,7 +77,7 @@ language is a description in [languages/](languages/):
 Each form says which universal construct it is. A new language is a new
 file, not a new compiler. There are three today: C, Go and Python.
 
-How a file becomes an executable:
+### How a file becomes an executable
 
 1. **HotMotor picks the language.** Every description is a candidate, and
    the judges in [languages/judges.toml](languages/judges.toml) score each
@@ -83,440 +86,215 @@ How a file becomes an executable:
    - the file's extension is one the description names;
    - how far into the file it read.
 
-   A description that could not beat the best score so far is not read at
-   all. A file with the wrong extension is still read in its own language.
-2. **Strike IR.** The file is lowered into one form shared by every
-   language: functions of stack operations on 64-bit integers.
-   - Truth values are followed through variables, parameters and results,
-     because Python prints `True` and Go prints `true` where C prints `1`.
-   - Each division keeps its language's meaning. C and Go round toward
-     zero, Python rounds down.
-3. **Brands per function.** Each function is branded by its IR. A
-   function whose brand already exists is struck instead of compiled, even
-   if the brand came from another language. The same work in two languages
-   is the same IR: a C `long long` function and a Go `int` one share their
-   brand. A C `int` one does not, since it wraps at 32 bits, and neither
-   does a Python one, which does not wrap at all.
-4. **Machine code by Strike.** x86-64 is written byte by byte in one pass,
-   with no LLVM and no assembler.
-5. **The executable by Strike.** The PE file, its import table (KERNEL32)
-   and the runtime (printing and the entry point) are written directly,
-   with no linker.
+   A description that cannot beat the best score so far is not read at all.
+   A file with the wrong extension is still read in its own language.
+2. **Strike IR** ([src/uc/ir.rs](src/uc/ir.rs)). The file is lowered into
+   one form shared by every language: functions of stack operations on
+   64-bit integers. Each language's meaning is kept in it:
+   - C and Go divide toward zero, and Python rounds down.
+   - Python prints `True`, Go prints `true`, and C prints `1`.
+   - C's `int` and `long` wrap at 32 bits, as clang makes them on Windows.
+   - Go's `int32` wraps at 32 bits.
+   - Python's integers do not wrap at all.
+3. **Brands per function.** Each function is branded by its IR and by the
+   generator's rules. A function whose brand exists is struck from the pack
+   (`~/.strike/uc/pack`) instead of compiled, even if the brand came from
+   another language. The same work in two languages is the same IR: a C
+   `long long` function and a Go `int` one share a brand. A C `int` one
+   does not share it, and neither does a Python one.
+4. **Machine code by Strike** ([src/uc/x64opt.rs](src/uc/x64opt.rs)).
+   x86-64 is written byte by byte, with no LLVM and no assembler.
+5. **The executable by Strike** ([src/uc/pe.rs](src/uc/pe.rs)). The PE
+   file, its import table and the runtime (printing, the entry point, the
+   overflow stop) are written directly, with no linker.
 
-Whatever Strike cannot do yet in the language's own way is refused with
-the line and the reason, never guessed. Examples are a chained comparison
-in Python, `/` on floats, and a function whose value is used but which can
-end without one. Stage one has integers and truth values, functions,
-if/else, while, for, Python's `range`, break and continue, and printing
-(including printf formats). It has no floats, strings as values, arrays,
-structs or libraries yet.
+### What it compiles today
 
-### Integers as each language has them
+Integers and truth values, functions and recursion, if/else, while, for,
+Python's `range`, break and continue, and printing (print, Println, puts,
+and printf with `%d`, `%s` and `%v`).
 
-Two places gave a wrong number with no warning. Both are fixed:
+Integers are exactly what each language says they are:
 
-- **Python's integers have no upper bound; Strike's are 64 bits.** 25!
-  came out as 7034535277573963776. Now `+`, `-`, `*`, `<<` and unary `-`
-  in Python are checked operations (`overflow = "error"` in
-  python.toml). Where a number would leave 64 bits, the program stops with
-  exit code 1 and says so on standard error. It never goes on with a wrong
-  number. Folding, working out while compiling, LICM and the closed form
-  of sums all leave a checked operation alone where it could stop the
-  program. Before this, the closed form would have wrapped a Python sum
-  without a word.
-- **C's `int` was 64 bits in Strike; clang's is 32.** On Windows clang's
-  `long` is 32 bits too. Now each type has its width (`[int_widths]` in
-  c.toml and go.toml). Arithmetic is done at least as wide as `int`, and a
-  result is cut back to the width of where it goes (`Sext` in the IR),
-  as C converts it. Go's `int32` wraps at 32 bits as Go defines. A Go
-  literal takes the width of what it meets, and one that does not fit is
-  an error, as in Go. `unsigned`, Go's `uint` and pointers are refused,
-  not guessed.
+- **C:** `int` and `long` are 32 bits (as clang makes them on Windows),
+  `long long` is 64, `short` is 16 and `char` is 8. Arithmetic is done at
+  least as wide as `int`, and a result is cut to the width of where it
+  goes.
+- **Go:** `int` is 64 bits and `int32` wraps at 32. A literal takes the
+  width of what it meets, and one that does not fit is an error, as in Go.
+- **Python:** `+`, `-`, `*`, `<<` and unary `-` are checked. Where a
+  number would leave 64 bits, the program stops with exit code 1 and a
+  message on standard error. It never goes on with a wrong number.
 
-[tests/uc/widths.c](tests/uc/widths.c) prints what clang -O0 prints in
-every mode: int, long, short and char wrapping, a parameter's conversion,
-and `-INT_MIN`. [tests/uc/widths.go](tests/uc/widths.go) prints what Go
-prints. A Python test checks that 20! prints and 25! stops the program,
-in every mode.
+Whatever Strike cannot do yet in the language's own way is refused, with
+the line and the reason, and never guessed. Refused today:
 
-The cost: a C `long` loop now cuts its results to 32 bits, as it must.
-Clang -O2 does not cut them, because signed overflow is undefined in C
-and it works in 32-bit registers. On 30 million `(a * 31 + b) % 1000003`
-Strike went from 0.085 s to 0.095 s, still 3.5% faster than clang -O2.
-Proving that no overflow can happen, and so leaving the cut out, is next.
+- strings as values, arrays, floats, structs, pointers, `unsigned` and
+  `uint`;
+- a chained comparison in Python;
+- a function whose value is used but which can end without one;
+- a Python variable that changes between a number and a truth value.
 
-[tests/uc/](tests/uc/) holds the same suite in all three languages.
-Strike's executables print byte for byte what clang, Go and Python print
-for them (the `.out` files were written by those toolchains).
+### How it is checked
 
-Measured on one program of 2000 functions (each a loop with a branch),
-written in each language, 3 runs, mean:
+- [tests/uc/](tests/uc/) holds the same suite in C, Go and Python, plus
+  integer-width programs. Strike's executables print byte for byte what
+  clang, Go and Python print; the `.out` files were written by those
+  toolchains.
+- `--plain` is the first, simple generator, with no optimization at all.
+  It is kept as the reference.
+- One test writes 100 random C programs and builds each in five modes:
+  plain, default, `--release`, `--release` with every division by a
+  constant as a multiplication, and `--release --no-evaluate`. Every mode
+  must give the same output and the same exit code. The programs have up
+  to six parameters, every operator, calls between functions, recursion in
+  every shape a return can call itself in, and sum loops. Across the 100
+  programs these are all exercised:
+  - inlined calls;
+  - tail calls made jumps;
+  - unrolled recursion;
+  - fast paths;
+  - expressions moved out of loops;
+  - loops replaced by their sums.
+- Unit tests check the magic division against real division, the
+  binomials against exact numbers, and the closed form of sums against the
+  loop for 300 random polynomials, with overflow.
+- 37 tests in all, in about 25 s.
 
-| compile to an executable | time |
-|---|---|
-| **Strike, C** | **0.12 s** (0.13 s all struck, 0.23 s with empty brands) |
-| **Strike, Go** | **0.12 s** |
-| **Strike, Python** | **0.17 s** |
-| clang -O0 | 0.27 s |
-| go build (standard library already built) | 0.86 s |
-| clang -O2 | 17.4 s |
+The tests have found real bugs, all fixed:
 
-Strike compiles 2.3 times as fast as clang -O0 and 7 times as fast as
-`go build`. Every executable gives the same answer as clang's, Go's or
-Python's own run.
+- a loop whose top was dropped as unreachable, so it never ended;
+- a panic in release builds, from jumps left in code that folding made
+  unreachable;
+- a crash on frames larger than a page;
+- Python's 25! and C's `int` overflow coming out wrong with no warning.
 
-### The optimizing generator
+### Code generation
 
-[src/uc/x64opt.rs](src/uc/x64opt.rs) is the default. `--plain` selects the
-first generator, which is kept as the reference.
+[src/uc/x64opt.rs](src/uc/x64opt.rs) does the following by default. Its
+numbers are in [codegen.toml](codegen.toml).
 
-- **Values stay where they are.** The IR's stack is followed at compile
-  time: a constant, a local or a result in rax stays put until an operation
-  needs it. A comparison followed by a jump becomes one `cmp` and one
-  `jcc`. Only what must cross a call, a jump or a label is pushed.
-- **HotMotor chooses which locals live in registers.** The rule is in
-  [codegen.toml](codegen.toml). Every local offers two variants: one of the
-  seven callee-saved registers, or memory. The judge scores the memory
-  operations a register saves, with a use inside a loop weighted 8 times
-  per level, against the cost of saving the register. The beam keeps the
-  best choices.
-- **Brands live in one pack**, `~/.strike/uc/pack`. It is read whole once
-  per compile, and new brands are added at its end. The brand covers the
-  IR and the generator with its rules, so other rules give other code.
-
-- **Calls take their arguments straight in registers.** Each argument goes
-  to rcx, rdx, r8, r9 or its stack slot from wherever it is. Nothing is
-  pushed except a result in rax that must outlive the call.
-- **HotMotor chooses which calls are inlined** ([src/uc/inline.rs](src/uc/inline.rs)).
-  The rule is the `[inline]` part of codegen.toml, and it applies to every
-  call of a function that calls nothing itself. There are two variants:
-  the call, or the callee's IR copied in its place. The judge scores the
-  cost of the call saved, weighted by the loops around the call, against
-  the operations copied. This is done before branding, so a caller's brand
-  covers what was copied into it.
-
-Every optimized program is checked against the plain one, which is not
-inlined either. One test writes 100 random C programs, with up to six
-parameters, loops, every operator and calls between functions; HotMotor
-inlines calls in most of them. Both must give the same output and the same
-exit code. The suites also still print what clang, Go and Python print.
-
-Running, the second and third runs:
-
-| | fib(36) | 30 million calls in a loop | primes below 300 000 |
-|---|---|---|---|
-| **Strike, optimized** | **0.079 s** | **0.086 s** | **0.022 s** |
-| Strike, plain | 0.125 s | 0.133 s | 0.043 s |
-| clang -O0 | 0.058 s | 0.126 s | 0.021 s |
-| go | 0.058 s | 0.091 s | 0.028 s |
-| clang -O2 | 0.031 s | 0.100 s | 0.021 s |
-| python | 1.3 s | | |
-
-- **A small function called in a loop:** Strike's code is the fastest of
-  all, because HotMotor inlined the call.
-- **Loops:** it is as fast as clang -O0 and faster than Go.
-- **Recursion (fib, which cannot be inlined):** it is 1.35 times as slow
-  as clang -O0, against 1.6 times before direct calls. The first call's
-  result still crosses the second call on the stack.
-
-### Release builds
-
-`--release` uses the same generator, plus the work a release build may
-spend more time on. The rules are in the `[release]` part of codegen.toml:
-
-- constant expressions are worked out while compiling
-  ([src/uc/fold.rs](src/uc/fold.rs)), by the machine's own rules
-  (wrapping, a shift's count modulo 64; never a division by zero);
-- calls are copied in more readily (callees of up to 200 operations).
-
-Every function also reserves its call area once, so a call with nothing
-pushed needs no stack adjustment. A frame larger than a page is touched
-page by page as Windows requires: before that, a function with very many
-locals crashed.
-
-Division by a constant as a multiplication by its magic number is written
-and tested. A unit test checks the sequence against real division, and
-the random-program test runs it on 100 programs. It is still off in
-codegen.toml, because on this machine it was slower: 0.095 s against
-0.085 s with `idiv`, on 30 million dependent `% 1000003`. Clang -O2's own
-multiplication took 0.100 s on the same loop.
-
-Measured, release builds are as fast as the default here and no faster:
-
-| | fib(36) | 30 million calls | primes |
-|---|---|---|---|
-| Strike --release | 0.082 s | 0.085 s | 0.023 s |
-| Strike | 0.083 s | 0.084 s | 0.022 s |
-| clang -O2 | 0.034 s | 0.101 s | 0.020 s |
-
-### Calls of a function by itself
-
-[src/uc/tail.rs](src/uc/tail.rs) turns a function's call of itself at a
-return into a jump to its start, in every mode but `--plain`:
-
-- `return f(args)`: the arguments go into the parameters, then back to the
-  start.
-- `return x + f(args)` and `return x * f(args)`: x goes into an
-  accumulator, then the same. Every other return gives the accumulator
-  combined with its own value.
-
-Wrapping addition and multiplication are associative and commutative, so
-the result is the same number. x and the arguments are worked out in the
-same order as before. `fib(n-1) + fib(n-2)` makes half as many calls; the
-function becomes a loop around one call.
-
-The random-program test now also writes four recursive functions per
-program, in every shape a return can call itself in, including shapes that
-must not be changed (`f(n-1) - x`, `x + f(n-1) * 3`). In the 100 programs,
-266 calls became jumps, and all printed what the plain code prints.
-
-fib(36): 0.082 s became **0.043 s**. That is faster than clang -O0
-(0.058 s) and Go (0.059 s).
-
-Two more changes went in for calls:
-
+- **The IR's stack is followed while compiling.** A constant, a local, a
+  local plus a constant (one `lea` when needed) or a result in rax stays
+  where it is until an operation needs it. A comparison followed by a jump
+  is one `cmp` and one `jcc`. A value that crosses a jump stays in rax.
+- **HotMotor chooses which locals live in registers.** Every local offers
+  one of the seven callee-saved registers, or memory. The judge scores the
+  memory operations a register saves, where a use in a loop weighs 8 times
+  more per level, against the cost of saving the register. A beam keeps
+  the best choices.
+- **The frame has no rbp.** Saved registers are pushed and popped, and
+  locals are addressed from rsp, because the generator knows how much is
+  pushed at every operation. Each frame reserves its call area once.
+- **Calls take their arguments straight in registers.** A result is
+  stored straight into the register of the local it goes to.
+- **HotMotor chooses which calls are inlined** (`[inline]`;
+  [src/uc/inline.rs](src/uc/inline.rs)). For each call of a function that
+  calls nothing, the judge weighs the call saved, weighted by the loops
+  around it, against the code copied.
+- **A function's calls of itself at its returns become jumps**
+  ([src/uc/tail.rs](src/uc/tail.rs)). `return x + f()` and `return x * f()`
+  get an accumulator, also through a C `int`'s cut. `fib` makes half as
+  many calls.
+- **Recursion is unrolled one level** (`[unroll]`), so each call that is
+  left does two levels' work.
 - **A frameless fast path.** A function that begins by testing its
-  parameters and returning at once, like fib's `if (n < 2) return n`, gets
-  that test and that return first, worked out from the argument registers.
-  No frame is made and no register is saved: fib's base case is four
-  instructions. Only operations that cannot touch an argument register are
-  taken: no call, no division, constants that fit 32 bits. In the 100
-  random programs, 208 functions in 91 programs got a fast path, and all
-  printed what the plain code prints.
-- **Results stored straight into a register.** An operation whose result
-  goes at once into a local held in a register is worked out in that
-  register: `n = n - 2` is one `sub`, and `acc = x + acc` is one `add`. The
-  call's result can then stay in rax.
+  parameters and returning, like `if (n < 2) return n`, does that from the
+  argument registers before any frame is made. fib's base case is four
+  instructions.
+- **A division whose numbers both fit 32 bits takes the 32-bit
+  instruction** (`[division]`), which gives the same quotient and is the
+  faster one.
 
-These took fib(36) only from 0.043 s to 0.041 s.
+### --release
 
-- **Recursion unrolled.** HotMotor's `[unroll]` rule in codegen.toml
-  copies a function's own body in place of each call of itself, `levels`
-  times, while the function is no longer than `max_ops` operations. The
-  calls inside the copy stay calls, so each call that is left does the
-  work of two levels. This is done before branding, with the same copying
-  as inlining. In the 100 random programs, 213 recursive calls were
-  unrolled, and all printed what the plain code prints.
+`--release` adds the work a release build may spend more time on. Each of
+these is also something clang -O2 does:
 
-fib(36), the last four of five runs:
-
-| unrolled levels | time | exe |
-|---|---|---|
-| 0 | 0.040-0.042 s | 1536 bytes |
-| **1 (the rule)** | **0.034-0.037 s** | 2048 bytes |
-| 2 | 0.031-0.039 s | 2048 bytes |
-| 3 | 0.035-0.039 s | 3072 bytes |
-| clang -O2 | 0.031-0.033 s | |
-
-One level takes fib from 0.041 s to 0.035 s, within 10% of clang -O2.
-More levels gave no gain that stands out from the noise, so the rule
-stays at one.
-
-What was still slow in that code, and is now fixed:
-
-1. **The frame.** Saving four registers to memory under an rbp frame cost
-   about 13 instructions per call. The frame now has no rbp: the saved
-   registers are pushed and popped. A local in memory is addressed from
-   rsp, because the generator knows at every operation how much has been
-   pushed since.
-2. **An unrolled copy's value went through the stack** (`push rax; jmp;
-   pop rax`). A value that crosses a jump now stays in rax. Every label
-   records what it expects (how much is pushed, and whether the top is in
-   rax), and every jump to it delivers that. A jump to the very next
-   instruction is left out.
-3. **The test ran twice.** After the fast path's test has failed, the full
-   function stores its constants and jumps straight to the rest of the
-   function.
-4. **Zeros were stored twice.** A store of zero into a slot already known
-   to be zero is left out.
-5. **`n - 1` took three instructions.** A local in a register plus or
-   minus a constant now waits as a lazy value and becomes one `lea` into
-   wherever it goes (`lea rcx, [rdi-1]`).
-
-Two bugs turned up while fixing these, and both are fixed:
-
-- **A loop that never ended.** Code that nothing falls into is not
-  emitted. A loop's top looked like such code where only later jumps came
-  back to it, so it was dropped.
-- **A release build stopped with a panic.** Folding constants had left
-  jumps in code that is never reached. Those jumps were counted, and a
-  label was given the wrong depth.
-
-The random-program test found the second one. Both are now settled by one
-pass: it follows every way through the IR from the start, and records
-which operations are reached and the depth of the stack at each.
-
-The last four of five runs:
-
-| | fib(36) | 30 million calls | primes |
-|---|---|---|---|
-| **Strike** | **0.029-0.030 s** | **0.083-0.086 s** | 0.022-0.023 s |
-| clang -O2 | 0.031-0.033 s | 0.101-0.102 s | 0.020 s |
-| clang -O0 | 0.057-0.058 s | 0.125-0.126 s | 0.021-0.022 s |
-| go | 0.057-0.058 s | 0.091-0.092 s | 0.026-0.027 s |
-
-On calls, Strike's code is now as fast as clang -O2 or faster.
-
-### Division of small numbers
-
-The primes loop divides by a variable, so the magic multiplication does not
-apply. clang -O2 was 11% faster on it, because C's `long` is 32 bits on
-Windows and clang uses the 32-bit division. Strike's numbers are 64 bits,
-and the 64-bit division is the slower instruction.
-
-Each division now first checks its two numbers. If both are at least zero
-and below 2^32, the 32-bit unsigned division gives the same quotient and
-remainder, so Strike uses it. Otherwise it uses the 64-bit one, so no
-64-bit number loses anything. LLVM does the same. The rule is `[division]
-bypass_32` in codegen.toml. A comparison with zero is also a `test` now,
-which sets the same flags as `cmp`.
-
-Primes below 300 000, mean of 7 runs:
-
-| | time | Strike against it |
-|---|---|---|
-| **Strike** | **0.0208 s** (0.0227 s before: 8% faster) | |
-| clang -O2 | 0.0205 s | 1.5% slower (min 0.0195 s against 0.0197 s) |
-| clang -O0 | 0.0208 s | the same |
-| go | 0.0283 s | 26% faster |
-
-## What clang -O2 does, in --release
-
-On top of the default generator, `--release` makes these optimizations,
-each of which clang -O2 also makes:
-
-- **Algebra** (clang's instcombine; [src/uc/opt.rs](src/uc/opt.rs)).
-  `x + 0`, `x * 1` and `x | 0` become `x`, and `x * 2^k` becomes `x << k`.
-  Python's `x // 2^k` becomes `x >> k`, and `x % 2^k` becomes
-  `x & (2^k - 1)`.
-- **Loop-invariant code motion** (LICM). An expression in a loop whose
-  locals the loop never stores is worked out once, before the loop, into a
-  new slot. Only expressions that cannot fail are moved (no division by a
-  variable), since a loop may not run at all. Only loops entered by falling
-  into their top are touched.
-- **Division by a constant as a multiplication by its magic number**,
-  where HotMotor's judge takes it (`magic_where` in x64opt.rs). A division
-  whose value comes back round its loop into what it divides waits on
-  itself, and there the divider is faster. Any other division gets the
-  multiplication, whose instructions overlap from one time round to the
-  next.
-- **Constant folding, readier inlining, and working out a program that
-  reads nothing** (above). Clang does the same. On pow2 its executable is
-  one constant and one printf.
-
-The random-program test now has a fifth mode, `--release --no-evaluate`:
-the release optimizations as machine code that runs. In the 100 programs,
-128 operations were simplified and 1053 expressions were moved out of
-loops. All printed what the plain code prints.
-
-Measured with `--no-evaluate`, so the generated code runs. Every C file
-uses 64-bit `long long`, since on Windows clang's `long` is 32 bits and
-would compute something else. Mean of 5 runs:
-
-| | Strike --release | clang -O2 | Strike against clang -O2 |
-|---|---|---|---|
-| fib(36) | 0.0300 s | 0.0335 s | 10% faster |
-| 30 million calls | 0.0857 s | 0.0995 s | 14% faster |
-| primes below 300 000 | 0.0204 s | 0.0208 s | 2% faster |
-| invariant loops (`s += (a*b + i*7 ^ j) % 1000`) | 0.0310 s (0.040 s before) | 0.0275 s | 13% slower |
-| pow2 (`s += i*8 + (i*4+1)*1 + 0`) | 0.0340 s | 0.0050 s | clang worked the loop out while compiling |
-
-On pow2, clang found the loop's sum while compiling, from the loop's
-recurrences (SCEV). Two more release passes followed:
-
-- **A sum's closed form** ([src/uc/scev.rs](src/uc/scev.rs)), as clang's
-  SCEV does. Take a loop `for (c = a; c < N; c++) s = s + P(c)`, where P
-  is a polynomial of degree up to 3. The stored expression is read as a
-  polynomial in s and c, and must be s plus P(c). P(a + k) is written in
-  the binomial basis, and sum_{k<T} C(k, m) = C(T, m+1), so the loop
-  becomes sum b_m C(T, m+1).
-  - The arithmetic is modulo 2^64, as the loop's own wrapping arithmetic
-    would be. The binomials are exact, because m! is divided out of the
-    factors before they are multiplied.
-  - The loop may add to several locals.
-  - A local copying the counter (Python's `for i in range(...)`) gets the
-    counter's last value.
-  - If N is known while compiling, any degree up to 3 works. If N is in a
-    local, degree up to 1 works, and the result is worked out when the
-    program runs.
-  - Unit tests check the binomials against exact numbers, and the closed
-    form against the loop for 300 random polynomials, with overflow. The
-    random-program test also writes three sum loops per program, in every
-    shape plus one that must stay a loop (`s = s * 3 + ...`). 438 loops
-    were replaced, and all printed what the plain code prints.
+- **Constant folding** ([src/uc/fold.rs](src/uc/fold.rs)), by the
+  machine's own rules.
+- **Algebra** ([src/uc/opt.rs](src/uc/opt.rs)). `x + 0` and `x * 1` become
+  `x`, and `x * 2^k` becomes a shift. Python's `// 2^k` and `% 2^k` become
+  a shift and a mask.
+- **Loop-invariant code motion.** An expression that cannot fail, made of
+  locals the loop never stores, is worked out once before the loop.
+- **Division by a constant as a magic multiplication**, where HotMotor's
+  judge takes it. A division whose value comes back round its loop into
+  what it divides keeps the divider, which is faster there. Any other
+  division is multiplied.
+- **A sum's closed form** ([src/uc/scev.rs](src/uc/scev.rs)), like clang's
+  SCEV. Take `for (c = a; c < N; c++) s += P(c)`, with P of degree up to 3.
+  The loop becomes sum b_m C(T, m+1), modulo 2^64 with exact binomials, so
+  it is bit for bit the loop's own result. A local that copies the counter
+  gets the counter's last value.
 - **Loop rotation and unrolling** ([src/uc/rotate.rs](src/uc/rotate.rs)).
-  The test moves to the loop's bottom, so there is one jump less each time
-  round. A short body with no jump in it goes round twice per jump back.
-- **A remainder by a magic number is three instructions**
-  (`imul; neg; add`), not eight.
+  The test moves to the bottom, and a short body with no jump goes round
+  twice per jump back.
+- **Inlining callees of up to 200 operations.**
+- **A program that reads nothing is worked out while compiling**
+  ([src/uc/eval.rs](src/uc/eval.rs)). Strike's IR runner tries first,
+  for up to 20 million steps. Then the compiled program is run once, for up
+  to 2 s; it prints a marker and then main's return, so a crash is never
+  taken for a result. The executable then only prints the output and
+  returns the number. A program that fails or does not finish in time is
+  compiled as it is. `--no-evaluate` turns this off, which is how the run
+  times below are measured.
 
-Against clang -O2 again, the mean of 7 runs, with `--no-evaluate`:
+A checked Python operation is never folded, moved, summed or worked out
+where it could stop the program.
 
-| | Strike --release | clang -O2 | go | Strike against clang -O2 |
-|---|---|---|---|---|
-| pow2 | 0.0044 s | 0.0051 s | 0.0415 s | as fast (both worked the loop out) |
-| invariant loops | 0.0271 s (0.031 s before) | 0.0275 s | 0.0283 s | 1% faster (13% slower before) |
-| primes | 0.0206 s | 0.0220 s | 0.0283 s | 6% faster |
-| 30 million calls | 0.0845 s | 0.0994 s | 0.0911 s | 15% faster |
-| fib(36) | 0.0293 s | 0.0345 s | 0.0591 s | 15% faster |
+### Measured
 
-On these five, Strike's release build is now as fast as clang -O2 or
-faster. What clang -O2 still has and Strike does not is SIMD
-vectorisation, and everything for the parts of the languages Strike does
-not have yet: arrays, strings, floats, memory.
+A whole build of one program of 2000 functions, from source to
+executable, 3 runs:
 
-## A program that reads nothing is worked out while compiling (--release)
-
-A program with no input has a fixed result: what it prints and what it
-returns. A release build works the program out while compiling, and the
-executable only prints that output and returns that number
-([src/uc/eval.rs](src/uc/eval.rs); limits in `[release.evaluate]` of
-codegen.toml):
-
-1. Strike's own IR runner tries first, for up to 20 million steps. It
-   follows the machine's rules: wrapping arithmetic, a shift's count modulo
-   64, and each language's division.
-2. If that is not enough, the program is compiled and run once, for up to
-   2 s. This run prints a marker and then the number main returned, so a
-   crash can never be taken for a result. It is safe, because these
-   languages can only print.
-3. If the program does not end in time, prints more than 1 MB, recurses
-   too deep, or fails (a division by zero), it is compiled as it is, and it
-   fails when it runs, as it would.
-
-Nothing is recognised or guessed. It is the program's own work, done once
-before it ships. Golden Answer would answer "how many primes are below
-300 000" as fast, but it answers a question; this runs the code, whatever
-it is.
-
-| --release | compile | run |
+| build | time | Strike against it |
 |---|---|---|
-| primes below 300 000 | 0.24 s | 0.005 s (0.021 s before) |
-| 30 million calls | 0.23 s | 0.004 s (0.085 s before) |
-| fib(36) | 0.21 s | 0.004 s (0.030 s before) |
-| big.c, the suites | 0.03-0.07 s (IR runner) | 0.004 s |
+| **Strike (C or Go)** | **0.07 s** | |
+| clang -O0 | 0.27 s | 3.7 times as fast |
+| go build, file changed | 0.86 s | 12 times as fast |
+| go build, nothing changed (Go's cache) | 0.12 s | 1.8 times as fast |
+| clang -O2 | 17.5 s | about 250 times as fast |
 
-The 4 ms left is starting the process. The run-time tables above measure
-the code generator, so they are built without `--release`. A benchmark of
-the generated code must take its numbers from outside, or a release build
-works it out.
+Running, `--release --no-evaluate` against clang -O2, mean of 7 runs. The
+C benchmarks use `long long` where they need 64 bits, so that clang
+computes the same numbers.
 
-Tests check four things:
+| | Strike | clang -O2 | go | Strike against clang -O2 |
+|---|---|---|---|---|
+| fib(36) | 0.0310 s | 0.0313 s | 0.059 s | 1% faster |
+| 30 million calls | 0.0951 s | 0.0986 s | 0.091 s | 3.5% faster |
+| primes below 300 000 | 0.0198 s | 0.0220 s | 0.028 s | 10% faster |
+| invariant loops | 0.0275 s | 0.0260 s | 0.028 s | 6% slower |
+| a sum loop | 0.0047 s | 0.0053 s | 0.042 s | as fast (both closed it) |
 
-- a release build of each suite prints what clang, Go and Python print,
-  by both ways;
-- the number main returns stays the exit code;
-- a program that divides by zero is not worked out and fails as the plain
-  build fails;
-- the random-program test runs division by multiplying with nothing
-  worked out, so that machine code is still tested. A release build of big.c takes 0.08 s, with all 2000 calls in
-main inlined.
+On these five, Strike's code is as fast as clang -O2's, and some are
+faster. The calls benchmark is a C `long` loop. It cuts each result to 32
+bits, because C's `long` is 32 bits on Windows. clang does not cut,
+because signed overflow is undefined in C. Proving that no overflow can
+happen, and so leaving the cut out, would win that back.
 
-Compiling big.c (2000 functions) with the optimizing generator takes
-0.07 s, 3 runs. The code part takes 0.004 s when every function is struck
-from the pack, against 0.007-0.010 s when compiled. With the pack, a brand
-is now faster to strike than to compile. Most of the remaining time
-(0.04 s) is reading the file.
+With evaluation on, `--release` builds the input-free benchmarks into
+executables that run in 4-5 ms, which is the process start. The builds
+take 0.2 s.
+
+### What is missing
+
+To compile ordinary programs, these are still missing, in the order they
+are planned:
+
+1. Input (standard input, command-line arguments) and global variables.
+2. Arrays and strings, with a heap and an allocator under them.
+3. Floats.
+4. Structs and classes.
+5. Several files and modules, and C's preprocessor. Today a `#` line is
+   skipped. It must become a preprocessor, or be refused.
+
+After those come garbage collection (for Python's and Go's objects),
+`unsigned`, maps, closures, exceptions, the rest of each standard library,
+debug information, and other platforms (ELF, Mach-O, ARM). Next to clang,
+Go and CPython, Strike covers a small part of each language. Within that
+part it is checked against them and gives their answers.
 
 ## fStrike: downloads
 
@@ -633,8 +411,9 @@ plugin passes an option the export does not show yet.
 
 ## Next
 
-1. The universal compiler: arguments in registers; floats, strings and
-   arrays; more languages as descriptions.
+1. The universal compiler: input and globals, arrays and strings, floats,
+   structs, several files (see What is missing above); then more languages
+   as descriptions.
 2. More drivers: C/C++ (clang `-MD`, MSVC `/showIncludes`), CUDA
    (`nvcc -MD`), Go, TypeScript; the motor and the lightning do not depend
    on the language.
