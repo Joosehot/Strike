@@ -70,7 +70,7 @@ impl Rules {
     pub fn key(&self, release: bool) -> String {
         let i = if release { &self.release.inline } else { &self.inline };
         format!(
-            "x64opt-20 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
+            "x64opt-21 release={release} magic={} div32={} unroll={},{} loop={} save={} beam={} inline={},{},{}",
             release && self.release.magic_division,
             self.division.bypass_32,
             self.unroll.levels,
@@ -1664,6 +1664,17 @@ impl G {
     /// arguments). Arguments already on the machine's stack take the
     /// plain way.
     fn call_direct(&mut self, sym: &str, n: usize) {
+        // a comparison's flags waiting under a call of no arguments (`(a <
+        // b) ^ f()`) become a number first: the callee changes the flags
+        // (with arguments, pushing the first one has made it one already)
+        if n == 0 {
+            if let Some(&V::Flags(cc)) = self.v.last() {
+                self.v.pop();
+                self.need_rax();
+                self.setcc_rax(cc);
+                self.v.push(V::Rax);
+            }
+        }
         let at = self.v.len() - n;
         if self.v[at..].contains(&V::Stack) {
             self.flush();

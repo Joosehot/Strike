@@ -112,6 +112,13 @@ fn work_across_statements_is_what_clang_and_go_make_of_it() {
     }
 }
 
+/// A comparison waiting as flags under a call of no arguments: in every
+/// mode what clang prints (a bug of the optimizing generator, fixed).
+#[test]
+fn a_comparison_before_a_call_of_no_arguments_keeps_its_value() {
+    runs_in_every_mode_as_the_real_one("flags_call.c");
+}
+
 #[test]
 fn simplified_expressions_are_what_clang_and_go_make_of_them() {
     for file in ["algebra.c", "algebra.go"] {
@@ -447,6 +454,9 @@ impl Gen {
         // h writes the volatile registers: its own locals, a division by a
         // constant and by a variable
         out += "long long h(long long a, long long b) {\n    long long q = a / 7 + b % 5;\n    long long r = (a ^ b) / ((b & 3) + 1);\n    long long t = q * 3 + r - (a >> 2);\n    return t * 3 - (b >> 2) + q;\n}\n";
+        // a function of no arguments that stays a call: a comparison
+        // waiting as flags before it must keep its value
+        out += "long long gz = 3;\nlong long z() {\n    if (gz > 0) {\n        gz = gz - 1;\n        return z() * 2 - 1;\n    }\n    gz = 3;\n    return -783;\n}\n";
         let mut funcs = Vec::new();
         for k in 0..4 {
             let np = 1 + self.below(6) as usize;
@@ -477,7 +487,12 @@ impl Gen {
             }
             body += &format!("    for (long long i = 0; i < {}; i++) {{\n{inner}    }}\n", self.below(9));
             let ret: Vec<String> = (0..3).map(|_| names[self.below(names.len() as u64) as usize].clone()).collect();
-            body += &format!("    return {} + {} * 3 - {};\n", ret[0], ret[1], ret[2]);
+            body += &if calls {
+                // a comparison as the left side of z(), straight in the return
+                format!("    return {} + (({} {} {}) {} z());\n", ret[0], ret[1], ["<", "<=", "==", "!="][self.below(4) as usize], ret[2], ["^", "+", "-"][self.below(3) as usize])
+            } else {
+                format!("    return {} + {} * 3 - {};\n", ret[0], ret[1], ret[2])
+            };
             let decl: Vec<String> = params.iter().map(|p| format!("long long {p}")).collect();
             out += &format!("long long f{k}({}) {{\n{body}}}\n", decl.join(", "));
             funcs.push((format!("f{k}"), np));
@@ -501,7 +516,10 @@ impl Gen {
         match self.below(8) {
             0..=3 => format!("({} {} {})", self.int_expr(names, d, calls), ["+", "-", "*", "^", "&", "|", "<", "=="][self.below(8) as usize], self.int_expr(names, d, calls)),
             4 => format!("({} >> {})", self.int_expr(names, d, calls), self.below(8)),
-            5 if calls => format!("h({}, {})", self.int_expr(names, d, calls), self.int_expr(names, d, calls)),
+            5 if calls => match self.below(2) {
+                0 => format!("h({}, {})", self.int_expr(names, d, calls), self.int_expr(names, d, calls)),
+                _ => format!("(({} {} {}) {} z())", self.int_expr(names, d, false), ["<", "<=", "==", "!="][self.below(4) as usize], self.int_expr(names, d, false), ["^", "+", "-", "*"][self.below(4) as usize]),
+            },
             6 => format!("-({})", self.int_expr(names, d, calls)),
             _ => self.int_expr(names, d, calls),
         }
