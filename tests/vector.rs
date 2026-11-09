@@ -195,8 +195,11 @@ impl Gen {
                 let dst = self.pick(&["da", "db", "dc"]);
                 let e = self.fexpr(3);
                 let idx = self.index();
-                let line = match self.below(3) {
+                let line = match self.below(4) {
                     0 => format!("{dst}[{idx}] += y * {};", self.fexpr(1)),
+                    // NaNs of both signs meet lane by lane: which comes out
+                    // shows the operands' order
+                    1 => format!("{dst}[i] = (da[i] {} db[i]) {} y;", self.pick(&["+", "-", "*", "/"]), self.pick(&["+", "-", "*", "/"])),
                     _ => format!("{dst}[{idx}] = {e};"),
                 };
                 body += &format!("{pre}    {head} {{\n        {line}\n    }}\n");
@@ -298,4 +301,51 @@ fn vectorized_loops_print_what_the_plain_code_prints() {
     }
     eprintln!("{total} loops vectorized");
     assert!(total >= 100, "only {total} loops vectorized");
+}
+
+/// tests/uc/vector.c (lane-wise loops, reductions of every kind, the loops
+/// that must stay scalar, lengths 0 to 37) prints in every mode what clang
+/// -O2 printed, and the release build vectorizes its loops.
+#[test]
+fn vectorized_loops_print_what_clang_prints() {
+    let r = root("fixture");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/uc/vector.c");
+    let want = std::fs::read(src.with_file_name("vector.c.out")).unwrap();
+    for mode in [vec!["--plain"], vec![], vec!["--release"], vec!["--release", "--no-evaluate"]] {
+        let exe = r.join("a.exe");
+        let o = compile(&r, &src, &exe, &mode);
+        assert!(o.status.success(), "{mode:?}: {}", text(&o));
+        if mode.len() == 2 {
+            assert!(vectorized(&o) >= 8, "{}", text(&o));
+        }
+        let got = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&want), "{mode:?}");
+    }
+}
+
+/// Loops that must stay scalar: a dependency from one time round to the
+/// next, pointer parameters (which may be the same array), a float
+/// reduction (vectorizing it would reorder the sum), a 64-bit product
+/// (SSE2 has none: three pmuludq lose to imul), Python's checked numbers,
+/// an element of another width, and a stride that is not the element's.
+#[test]
+fn loops_that_must_stay_scalar_are_not_vectorized() {
+    let r = root("scalar");
+    let progs = [
+        ("dep.c", "long long a[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i + 1] = a[i] + 1;\n    }\n    return a[40];\n}\n"),
+        ("dep2.c", "long long a[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = a[i + 1] + a[i];\n    }\n    return a[3];\n}\n"),
+        ("ptr.c", "void f(long long *p, long long *q, int n) {\n    for (int i = 0; i < n; i++) {\n        p[i] = q[i] + 1;\n    }\n}\nlong long a[50];\nint main() {\n    f(a, a, 40);\n    return a[3];\n}\n"),
+        ("fsum.c", "#include <stdio.h>\ndouble a[50];\nint main() {\n    double s = 0.0;\n    for (int i = 0; i < 40; i++) {\n        s += a[i] * 0.5;\n    }\n    printf(\"%f\", s);\n    return 0;\n}\n"),
+        ("mul.c", "long long a[50];\nlong long b[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = a[i] * b[i];\n    }\n    return a[3];\n}\n"),
+        ("width.c", "long long a[50];\nint b[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = b[i] + 1;\n    }\n    return a[3];\n}\n"),
+        ("stride.c", "long long a[100];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[2 * i] = a[2 * i] + 1;\n    }\n    return a[4];\n}\n"),
+        ("sum.py", "a = [1] * 50\ns = 0\nfor i in range(40):\n    s += a[i]\nprint(s)\n"),
+    ];
+    for (name, text_) in progs {
+        let src = r.join(name);
+        std::fs::write(&src, text_).unwrap();
+        let o = compile(&r, &src, &r.join("a.exe"), &["--release", "--no-evaluate"]);
+        assert!(o.status.success(), "{name}: {}", text(&o));
+        assert_eq!(vectorized(&o), 0, "{name}: {}", text(&o));
+    }
 }

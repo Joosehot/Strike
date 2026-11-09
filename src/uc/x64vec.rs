@@ -332,10 +332,17 @@ pub(super) fn plain_zero(a: &mut Asm, memory: i32, count: u32) {
 }
 
 /// The optimizing generator's register for vector local v: the last of
-/// the callee-saved xmm6 to xmm15 (float locals take the first).
+/// the callee-saved xmm6 to xmm15 (float locals take the first), then
+/// xmm5 down to xmm2 (vectorize.rs gives these only values of a loop's
+/// body, where no scalar float waits in them).
 pub(super) fn reg(v: u8) -> u8 {
-    assert!(v < 10, "vectorize keeps to ten vector locals");
+    assert!(v < 14, "vectorize keeps to fourteen vector locals");
     15 - v
+}
+
+/// How many of a function's vector locals are callee-saved registers.
+pub(super) fn saved(vectors: u32) -> usize {
+    vectors.min(10) as usize
 }
 
 #[cfg(test)]

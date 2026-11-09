@@ -271,7 +271,7 @@ fn weights(f: &Func, r: &Rules) -> (Vec<f64>, Vec<f64>) {
 fn choose(f: &Func, r: &Rules, vol_ok: &[u8]) -> Vec<Place> {
     let (w, wf) = weights(f, r);
     // the vector locals take the last xmm registers (x64vec.rs)
-    let float_regs = XSAVED.len() - super::ir::vector_locals(&f.code) as usize;
+    let float_regs = XSAVED.len() - super::x64vec::saved(super::ir::vector_locals(&f.code));
     let mut order: Vec<usize> = (0..w.len()).collect();
     order.sort_by(|&a, &b| (w[b] + wf[b]).total_cmp(&(w[a] + wf[a])).then(a.cmp(&b)));
     let mut beam: Vec<(f64, Vec<Place>)> = vec![(0.0, vec![Place::Mem; w.len()])];
@@ -2364,7 +2364,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     let mut mem = 0i32;
     let mut free = SAVED.iter();
     let vectors = super::ir::vector_locals(&f.code) as usize;
-    let mut xfree = XSAVED[..XSAVED.len() - vectors].iter();
+    let mut xfree = XSAVED[..XSAVED.len() - super::x64vec::saved(vectors as u32)].iter();
     let mut xused = Vec::new();
     for s in 0..f.slots as usize {
         match place[s] {
@@ -2392,7 +2392,7 @@ pub fn compile(f: &Func, rules: &Rules, release: bool) -> Code {
     // bytes of each xmm register it saves
     let memory = widest + 8 * mem;
     let xbase = memory + (f.frame as i32 + 7) / 8 * 8;
-    let xsaved: Vec<(u8, i32)> = xused.iter().copied().chain((0..vectors as u8).map(super::x64vec::reg)).enumerate().map(|(i, k)| (k, xbase + 16 * i as i32)).collect();
+    let xsaved: Vec<(u8, i32)> = xused.iter().copied().chain((0..super::x64vec::saved(vectors as u32) as u8).map(super::x64vec::reg)).enumerate().map(|(i, k)| (k, xbase + 16 * i as i32)).collect();
     let mut frame = xbase + 16 * xsaved.len() as i32;
     if (8 + 8 * pushed + frame) % 16 != 0 {
         frame += 8;

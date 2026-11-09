@@ -96,8 +96,12 @@ pub fn reduce(l: Lanes, op: BinOp, a: V128) -> Option<i64> {
 
 /// The most operations a loop's body may have to be vectorized.
 const MAX_BODY: usize = 200;
-/// The most vector locals a vectorized loop takes (each an xmm register).
-const MAX_VECTORS: u8 = 10;
+/// The most vector locals a vectorized loop takes (each an xmm register):
+/// the first KEPT may hold a value for the whole loop (callee-saved xmm15
+/// down to xmm6), the rest only a value of the body (xmm5 down to xmm2,
+/// which no scalar float code uses while the body runs).
+const MAX_VECTORS: u8 = 14;
+const KEPT: u8 = 10;
 
 /// A value of the loop's body, as a tree (shared where a local made in
 /// the body is read again).
@@ -428,6 +432,16 @@ impl<'a> Vz<'a> {
                 (N::Push(m), _) => scale(self.affine(y)?, *m),
                 _ => None,
             },
+            // a C int counter plus a constant cut to 32 bits, where the
+            // counter fits 32 bits and the sum does below the bound: the cut
+            // changes nothing
+            N::Sext(32, x) => {
+                let a = self.affine(x)?;
+                let Op::Push(bound) = self.sh.bound else { return None };
+                let c = self.sh.c as usize;
+                let fits = a.terms.is_empty() && a.coef == 1 && self.narrow[c] && a.disp >= 0 && bound.checked_add(a.disp).is_some_and(|e| e - 1 <= i32::MAX as i64);
+                fits.then_some(a)
+            }
             _ => None,
         }
     }
@@ -450,7 +464,7 @@ impl<'a> Vz<'a> {
     /// worked out in place), else a free one that is not `avoid` (which the
     /// operation still reads after it begins writing).
     fn alloc_for(&mut self, like: &[u8], avoid: Option<u8>) -> Option<u8> {
-        let v = like.iter().copied().find(|&v| !self.used[v as usize]).or_else(|| (0..MAX_VECTORS).find(|&v| !self.used[v as usize] && Some(v) != avoid))?;
+        let v = like.iter().copied().find(|&v| !self.used[v as usize]).or_else(|| (KEPT..MAX_VECTORS).chain(0..KEPT).find(|&v| !self.used[v as usize] && Some(v) != avoid))?;
         self.used[v as usize] = true;
         self.pinned[v as usize] = false;
         self.touched[v as usize] = true;
@@ -460,7 +474,7 @@ impl<'a> Vz<'a> {
     /// A free register; one kept for the whole loop (`pin`: set before
     /// it) must be one the body has not used yet.
     fn alloc(&mut self, pin: bool) -> Option<u8> {
-        let v = (0..MAX_VECTORS).find(|&v| !self.used[v as usize] && !(pin && self.touched[v as usize]))?;
+        let v = if pin { (0..KEPT).find(|&v| !self.used[v as usize] && !self.touched[v as usize])? } else { (KEPT..MAX_VECTORS).chain(0..KEPT).find(|&v| !self.used[v as usize])? };
         self.used[v as usize] = true;
         self.pinned[v as usize] = pin;
         self.touched[v as usize] |= !pin;
