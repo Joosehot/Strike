@@ -227,8 +227,15 @@ impl Gen {
     /// store through one may be what the other reads next time round.
     fn pointers(&mut self) -> String {
         let a = self.below(3) + 1;
-        let e = format!("q[i + {a}] {} p[i]", self.pick(&["+", "^", "-"]));
-        format!("void pp(long long *p, long long *q, long long n) {{\n    for (long long i = 0; i < n; i++) {{\n        p[i] = {e};\n    }}\n}}\nint ps(int *p, int *q, int n) {{\n    int r = 0;\n    for (int i = 0; i < n; i++) {{\n        r += p[i] * q[i] + (p[i] >> 1);\n    }}\n    return r;\n}}\n")
+        // p[i + a] written, q[i] read: the same array as both, a time round
+        // reads what one a before wrote (and q[i + a] read, p[i] written:
+        // one that reads ahead)
+        let (dst, e) = if self.below(2) == 0 {
+            (format!("p[i + {a}]"), format!("q[i] {} p[i + {a}]", self.pick(&["+", "^", "-"])))
+        } else {
+            ("p[i]".to_string(), format!("q[i + {a}] {} p[i]", self.pick(&["+", "^", "-"])))
+        };
+        format!("void pp(long long *p, long long *q, long long n) {{\n    for (long long i = 0; i < n; i++) {{\n        {dst} = {e};\n    }}\n}}\nint ps(int *p, int *q, int n) {{\n    int r = 0;\n    for (int i = 0; i < n; i++) {{\n        r += p[i] * q[i] + (p[i] >> 1);\n    }}\n    return r;\n}}\n")
     }
 
     fn program(&mut self) -> String {
@@ -324,7 +331,7 @@ fn vectorized_loops_print_what_clang_prints() {
 }
 
 /// Loops that must stay scalar: a dependency from one time round to the
-/// next, pointer parameters (which may be the same array), a float
+/// next, a float
 /// reduction (vectorizing it would reorder the sum), a 64-bit product
 /// (SSE2 has none: three pmuludq lose to imul), Python's checked numbers,
 /// an element of another width, and a stride that is not the element's.
@@ -334,7 +341,6 @@ fn loops_that_must_stay_scalar_are_not_vectorized() {
     let progs = [
         ("dep.c", "long long a[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i + 1] = a[i] + 1;\n    }\n    return a[40];\n}\n"),
         ("dep2.c", "long long a[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = a[i + 1] + a[i];\n    }\n    return a[3];\n}\n"),
-        ("ptr.c", "void f(long long *p, long long *q, int n) {\n    for (int i = 0; i < n; i++) {\n        p[i] = q[i] + 1;\n    }\n}\nlong long a[50];\nint main() {\n    f(a, a, 40);\n    return a[3];\n}\n"),
         ("fsum.c", "#include <stdio.h>\ndouble a[50];\nint main() {\n    double s = 0.0;\n    for (int i = 0; i < 40; i++) {\n        s += a[i] * 0.5;\n    }\n    printf(\"%f\", s);\n    return 0;\n}\n"),
         ("mul.c", "long long a[50];\nlong long b[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = a[i] * b[i];\n    }\n    return a[3];\n}\n"),
         ("width.c", "long long a[50];\nint b[50];\nint main() {\n    for (int i = 0; i < 40; i++) {\n        a[i] = b[i] + 1;\n    }\n    return a[3];\n}\n"),

@@ -96,6 +96,8 @@ pub fn reduce(l: Lanes, op: BinOp, a: V128) -> Option<i64> {
 
 /// The most operations a loop's body may have to be vectorized.
 const MAX_BODY: usize = 200;
+/// The most pairs of accesses a vectorized loop checks apart before it runs.
+const MAX_CHECKS: usize = 6;
 /// The most vector locals a vectorized loop takes (each an xmm register):
 /// the first KEPT may hold a value for the whole loop (callee-saved xmm15
 /// down to xmm6), the rest only a value of the body (xmm5 down to xmm2,
@@ -123,98 +125,6 @@ enum S {
     Store(u32, usize),
     StoreM(u8, usize, usize),
     OpM(BinOp, u8, usize, usize),
-}
-
-/// What an address points into: no object (a number), a global, the
-/// function's own memory from an offset, or anything (a parameter, an
-/// address read from memory). Distinct globals and distinct places of the
-/// function's own memory never overlap.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Prov {
-    Int,
-    Global(u32),
-    Frame(u32),
-    Any,
-}
-
-fn is_object(p: Prov) -> bool {
-    matches!(p, Prov::Global(_) | Prov::Frame(_))
-}
-
-/// x + y: an object plus a number is in the object (C indexes an array
-/// only from its start; Strike makes no other address arithmetic).
-fn add_prov(x: Prov, y: Prov) -> Prov {
-    match (x, y) {
-        (Prov::Int, Prov::Int) => Prov::Int,
-        (o, Prov::Int | Prov::Any) | (Prov::Int | Prov::Any, o) if is_object(o) => o,
-        (Prov::Int, Prov::Any) | (Prov::Any, Prov::Int) | (Prov::Any, Prov::Any) => Prov::Any,
-        _ => Prov::Any,
-    }
-}
-
-fn join(a: Prov, b: Prov) -> Prov {
-    match (a, b) {
-        (Prov::Int, x) | (x, Prov::Int) => x,
-        (x, y) if x == y => x,
-        _ => Prov::Any,
-    }
-}
-
-/// The provenance of a run of operations, given the locals'.
-fn run_prov(run: &[Op], slot: &[Prov]) -> Prov {
-    let mut st: Vec<Prov> = Vec::new();
-    for op in run {
-        match op {
-            Op::Push(_) => st.push(Prov::Int),
-            Op::Load(s) => st.push(slot[*s as usize]),
-            Op::AddrG(g) => st.push(Prov::Global(*g)),
-            Op::Frame(n) => st.push(Prov::Frame(*n)),
-            Op::Bin(b) => {
-                let (Some(y), Some(x)) = (st.pop(), st.pop()) else { return Prov::Any };
-                st.push(match b {
-                    BinOp::Add => add_prov(x, y),
-                    BinOp::Sub if is_object(x) && !is_object(y) => x,
-                    _ if is_object(x) || is_object(y) => Prov::Any,
-                    _ => Prov::Int,
-                });
-            }
-            Op::Un(_) | Op::Sext(_) => {
-                let Some(x) = st.pop() else { return Prov::Any };
-                st.push(if is_object(x) { Prov::Any } else { Prov::Int });
-            }
-            _ => return Prov::Any,
-        }
-    }
-    if st.len() == 1 {
-        st[0]
-    } else {
-        Prov::Any
-    }
-}
-
-/// Every local's provenance: the join of what every store gives it (a
-/// local starts at zero, a number; a parameter may be anything).
-fn provenance(f: &Func) -> Vec<Prov> {
-    let st = super::opt::starts(&f.code);
-    let mut p: Vec<Prov> = (0..f.slots).map(|s| if s < f.params { Prov::Any } else { Prov::Int }).collect();
-    loop {
-        let mut changed = false;
-        for (k, op) in f.code.iter().enumerate() {
-            let Op::Store(s) = op else { continue };
-            let got = match k.checked_sub(1).and_then(|q| st[q].map(|b| (b, q))) {
-                Some((b, q)) => run_prov(&f.code[b..=q], &p),
-                None => Prov::Any,
-            };
-            let new = join(p[*s as usize], got);
-            if new != p[*s as usize] {
-                p[*s as usize] = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            return p;
-        }
-    }
 }
 
 /// The locals that only ever hold numbers that fit 32 bits (sign-extended
@@ -304,7 +214,6 @@ struct Vz<'a> {
     /// reductions: (statement, accumulator, the operation, the other
     /// operand, cut to 32 bits)
     reductions: Vec<(usize, u32, BinOp, usize, bool)>,
-    prov: Vec<Prov>,
     narrow: Vec<bool>,
     /// the lanes of the integers (I32 for elements of 4 bytes, else I64)
     k: Lanes,
@@ -385,12 +294,6 @@ impl<'a> Vz<'a> {
         let mut v = Vec::new();
         self.scalar(n, &mut v);
         format!("{v:?}")
-    }
-
-    fn prov_of(&self, n: usize) -> Prov {
-        let mut v = Vec::new();
-        self.scalar(n, &mut v);
-        run_prov(&v, &self.prov)
     }
 
     fn affine(&self, n: usize) -> Option<Aff> {
@@ -555,19 +458,12 @@ impl<'a> Vz<'a> {
         Some(out)
     }
 
-    /// The (base terms' key, provenance, displacement) of an access.
-    fn access(&self, n: usize) -> Option<(String, Prov, i64)> {
+    /// The (base terms' key, displacement) of an access.
+    fn access(&self, n: usize) -> Option<(String, i64)> {
         let a = self.affine(n)?;
         let mut keys: Vec<String> = a.terms.iter().map(|&t| self.key(t)).collect();
         keys.sort();
-        let mut p = Prov::Int;
-        for &t in &a.terms {
-            p = add_prov(p, self.prov_of(t));
-        }
-        if p == Prov::Int {
-            p = Prov::Any;
-        }
-        Some((keys.join(" + "), p, a.disp))
+        Some((keys.join(" + "), a.disp))
     }
 
     /// The vector register holding node n's lanes (compiled into the body,
@@ -826,9 +722,13 @@ impl<'a> Vz<'a> {
 
 /// Reads the body into trees and statements; None where it is not only
 /// stores of expressions (a call, a jump, a print, a Dup...).
-fn read(code: &[Op], sh: &Shape) -> Option<(Vec<N>, Vec<S>)> {
+/// (Also where each node and statement is in the code.)
+#[allow(clippy::type_complexity)]
+fn read(code: &[Op], sh: &Shape) -> Option<(Vec<N>, Vec<S>, Vec<usize>, Vec<usize>)> {
     let mut nodes = Vec::new();
     let mut stmts = Vec::new();
+    let mut node_at: Vec<usize> = Vec::new();
+    let mut stmt_at: Vec<usize> = Vec::new();
     let mut st: Vec<usize> = Vec::new();
     let mut temp: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     let mut read_before: Vec<u32> = Vec::new();
@@ -836,7 +736,10 @@ fn read(code: &[Op], sh: &Shape) -> Option<(Vec<N>, Vec<S>)> {
         nodes.push(n);
         nodes.len() - 1
     };
-    for op in &code[sh.body.clone()] {
+    for k in sh.body.clone() {
+        let op = &code[k];
+        let made = nodes.len();
+        let stmts_before = stmts.len();
         match op {
             Op::Push(v) => st.push(new(&mut nodes, N::Push(*v))),
             Op::Load(s) => match temp.get(s) {
@@ -895,8 +798,14 @@ fn read(code: &[Op], sh: &Shape) -> Option<(Vec<N>, Vec<S>)> {
             }
             _ => return None,
         }
+        node_at.resize(made, 0);
+        node_at.resize(nodes.len(), k);
+        if stmts.len() > stmts_before {
+            stmt_at.push(k);
+        }
     }
-    st.is_empty().then_some((nodes, stmts))
+    node_at.resize(nodes.len(), 0);
+    st.is_empty().then_some((nodes, stmts, node_at, stmt_at))
 }
 
 fn reaches(nodes: &[N], n: usize, target: &N) -> usize {
@@ -910,9 +819,9 @@ fn reaches(nodes: &[N], n: usize, target: &N) -> usize {
 
 /// The loop vectorized: the code to put before its top (the vector loop,
 /// and after it the reductions' lanes added in), and the slots it made.
-fn vectorize(f: &Func, sh: &Shape, prov: &[Prov], unroll: i64) -> Option<(Vec<Op>, u32)> {
+fn vectorize(f: &Func, sh: &Shape, globals: u32, unroll: i64) -> Option<(Vec<Op>, u32)> {
     let code = &f.code;
-    let (nodes, stmts) = read(code, sh)?;
+    let (nodes, stmts, node_at, stmt_at) = read(code, sh)?;
     let stored: Vec<u32> = stmts.iter().filter_map(|s| if let S::Store(x, _) = s { Some(*x) } else { None }).collect();
     if let Op::Load(nb) = sh.bound {
         if stored.contains(&nb) {
@@ -1000,7 +909,6 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov], unroll: i64) -> Option<(Vec<Op
         stmts,
         stored,
         reductions,
-        prov: prov.to_vec(),
         narrow,
         k,
         lanes,
@@ -1029,36 +937,53 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov], unroll: i64) -> Option<(Vec<Op
     // the memory the body reads and writes: a store and another access of
     // the same object (or of one that may be anything) must be at the same
     // address every time round, so no time round reads what another wrote
-    let mut accesses: Vec<(bool, usize, u8)> = Vec::new();
+    // (a store, its address node, where it is in the code)
+    let mut accesses: Vec<(bool, usize, usize)> = Vec::new();
     for n in 0..z.nodes.len() {
-        if let N::LoadM(w, a) = z.nodes[n] {
-            accesses.push((false, a, w));
+        if let N::LoadM(_, a) = z.nodes[n] {
+            accesses.push((false, a, node_at[n]));
         }
     }
-    let mut addr_nodes = Vec::new();
-    for s in &z.stmts {
-        if let S::StoreM(w, a, _) | S::OpM(_, w, a, _) = s {
-            accesses.push((true, *a, *w));
+    for (i, s) in z.stmts.iter().enumerate() {
+        if let S::StoreM(_, a, _) | S::OpM(_, _, a, _) = s {
+            accesses.push((true, *a, stmt_at[i]));
         }
     }
-    for &(_, a, _) in &accesses {
-        addr_nodes.push(a);
-    }
+    let addr_nodes: Vec<usize> = accesses.iter().map(|x| x.1).collect();
+    let facts = super::alias::Facts::new(f, globals);
     let mut seen = Vec::new();
-    for &(store, a, _) in &accesses {
-        let acc = z.access(a)?;
-        seen.push((store, acc));
+    for &(store, a, at) in &accesses {
+        let mem = if store { facts.writes(at) } else { facts.reads(at) };
+        seen.push((store, a, z.access(a)?, mem));
     }
-    for (i, (si, (ki, pi, di))) in seen.iter().enumerate() {
-        for (j, (sj, (kj, pj, dj))) in seen.iter().enumerate() {
-            if i == j || !(*si || *sj) {
+    // a store and another access: at the same address every time round
+    // (each time round reads only what it wrote itself), or apart as
+    // alias.rs finds them over the whole loop, or else checked apart
+    // before the vector loop runs, exactly
+    let mut checks: Vec<(usize, usize)> = Vec::new();
+    for (i, (si, ai, (ki, di), mi)) in seen.iter().enumerate() {
+        for (j, (sj, aj, (kj, dj), mj)) in seen.iter().enumerate() {
+            if i == j || !(*si || *sj) || (ki == kj && di == dj) {
                 continue;
             }
-            let apart = is_object(*pi) && is_object(*pj) && pi != pj;
-            if !apart && (ki != kj || di != dj) {
+            // the same base a few elements apart: what one time round
+            // writes, another reads
+            if ki == kj {
                 return None;
             }
+            if let (Some(x), Some(y)) = (mi, mj) {
+                if !super::alias::may_alias(*x, *y) {
+                    continue;
+                }
+            }
+            let pair = (*ai.min(aj), *ai.max(aj));
+            if !checks.contains(&pair) {
+                checks.push(pair);
+            }
         }
+    }
+    if checks.len() > MAX_CHECKS {
+        return None;
     }
     // a node used as an address is never also a value
     for (i, s) in z.stmts.clone().iter().enumerate() {
@@ -1198,6 +1123,38 @@ fn vectorize(f: &Func, sh: &Shape, prov: &[Prov], unroll: i64) -> Option<(Vec<Op
         }
     }
     }
+    // the checks: the accesses of all the times round left touch the bytes
+    // [lo, lo + (bound - c) w) from lane 0's address now; two such runs
+    // meet where either's start lies less than the other's length past
+    // it, counted round the addresses modulo 2^64 (exact: memory's own
+    // addresses wrap so); bound - c must be below 2^40, so the lengths do
+    // not wrap. Where they may meet, only the scalar loop runs.
+    if !checks.is_empty() {
+        z.copy = 0;
+        let w = k.width();
+        let len = z.slots;
+        z.slots += 1;
+        z.pre.extend([sh.bound.clone(), Op::Load(sh.c), Op::Bin(BinOp::Sub), Op::Push(1 << 40), Op::Bin(BinOp::Ult), Op::Jz(top)]);
+        z.pre.extend([sh.bound.clone(), Op::Load(sh.c), Op::Bin(BinOp::Sub), Op::Push(w.trailing_zeros() as i64), Op::Bin(BinOp::Shl), Op::Store(len)]);
+        let mut lo: Vec<(usize, u32)> = Vec::new();
+        for &(x, y) in &checks.clone() {
+            for n in [x, y] {
+                if !lo.iter().any(|l| l.0 == n) {
+                    let addr = z.address(n, w, false)?;
+                    let s = z.slots;
+                    z.slots += 1;
+                    z.pre.extend(addr);
+                    z.pre.push(Op::Store(s));
+                    lo.push((n, s));
+                }
+            }
+            let at = |n: usize| lo.iter().find(|l| l.0 == n).unwrap().1;
+            let (lx, ly) = (at(x), at(y));
+            for (p, q) in [(lx, ly), (ly, lx)] {
+                z.pre.extend([Op::Load(p), Op::Load(q), Op::Bin(BinOp::Sub), Op::Load(len), Op::Bin(BinOp::Ult), Op::Jnz(top)]);
+            }
+        }
+    }
     let mut out = std::mem::take(&mut z.pre);
     out.push(Op::Label(vtop));
     out.extend([Op::Load(sh.c), limit, Op::Bin(BinOp::Lt), Op::Jz(vend)]);
@@ -1244,7 +1201,7 @@ fn insert(f: &mut Func, sh: &Shape, vector: Vec<Op>, slots: u32, done: &mut Vec<
 }
 
 /// Vectorizes the function's innermost counted loops; returns how many.
-pub fn run(f: &mut Func) -> usize {
+pub fn run(f: &mut Func, globals: u32) -> usize {
     if std::env::var_os("STRIKE_DUMP_VEC").is_some() {
         eprintln!("{} ({} params, {} slots) before vectorizing:", f.name, f.params, f.slots);
         for (i, op) in f.code.iter().enumerate() {
@@ -1258,7 +1215,6 @@ pub fn run(f: &mut Func) -> usize {
     let mut done: Vec<u32> = Vec::new();
     let mut count = 0;
     'again: loop {
-        let prov = provenance(f);
         for j in 0..f.code.len() {
             let Some(sh) = shape(&f.code, j) else { continue };
             if done.contains(&sh.top) {
@@ -1271,7 +1227,7 @@ pub fn run(f: &mut Func) -> usize {
             // what is left of whole vectors
             let mut made = None;
             for u in [4, 2, 1] {
-                if let Some(v) = vectorize(f, &sh, &prov, u) {
+                if let Some(v) = vectorize(f, &sh, globals, u) {
                     made = Some((v, u));
                     break;
                 }
@@ -1279,10 +1235,9 @@ pub fn run(f: &mut Func) -> usize {
             let Some(((vector, slots), u)) = made else { continue };
             insert(f, &sh, vector, slots, &mut done);
             if u > 1 {
-                let prov = provenance(f);
-                let again = (0..f.code.len()).find_map(|j| shape(&f.code, j).filter(|s| s.top == sh.top));
+                        let again = (0..f.code.len()).find_map(|j| shape(&f.code, j).filter(|s| s.top == sh.top));
                 if let Some(sh) = again {
-                    if let Some((vector, slots)) = vectorize(f, &sh, &prov, 1) {
+                    if let Some((vector, slots)) = vectorize(f, &sh, globals, 1) {
                         insert(f, &sh, vector, slots, &mut done);
                     }
                 }

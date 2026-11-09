@@ -350,7 +350,7 @@ pub fn compile(input: &Input, out: &Path, brands: bool, gen: Gen, evaluate: bool
             simplified += ranges::run(f);
             closed += scev::run(f);
             fold::run(f);
-            vectorized += vectorize::run(f);
+            vectorized += vectorize::run(f, globals);
             rotate::run(f);
             simplified += values::run(f);
             simplified += opt::defer_cuts(f);
