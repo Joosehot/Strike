@@ -325,9 +325,13 @@ fn lay_out(p: &Program, l: &Lang) -> Result<Types, E> {
 /// going there is cut by masking, not by sign-extending.
 pub const U8: u8 = 0x88;
 
+/// The width of C's bool (_Bool): one byte holding 0 or 1, and a value
+/// going there becomes 1 where it is not zero (C's conversion), not cut.
+pub const CBOOL: u8 = 0x81;
+
 /// The bits a width takes.
 fn bits(w: u8) -> u8 {
-    if w == U8 {
+    if w == U8 || w == CBOOL {
         8
     } else {
         w
@@ -686,6 +690,11 @@ fn width_of(l: &Lang, words: &[String]) -> Result<u8, String> {
     let w: Vec<&str> = words.iter().map(String::as_str).filter(|s| !matches!(*s, "static" | "const" | "signed" | "register" | "volatile")).collect();
     if matches!(w.as_slice(), ["byte"] | ["uint8"]) {
         return Ok(U8);
+    }
+    // a language that prints no truth words (C) keeps them as numbers that
+    // are 0 or 1
+    if l.bool_print.is_none() && matches!(w.as_slice(), ["bool"] | ["_Bool"]) {
+        return Ok(CBOOL);
     }
     if w.iter().any(|s| *s == "unsigned" || s.starts_with("uint") || *s == "byte") {
         return Err("unsigned numbers are not in Strike yet: they wrap and compare differently, so they are not guessed at".into());
@@ -1046,6 +1055,14 @@ impl Fx<'_, '_> {
     /// A value of width `from` going where `to` bits are kept: cut to them
     /// and sign-extended back, as C and Go convert.
     fn narrow(&mut self, to: u8, from: u8) -> Result<(), E> {
+        if to == CBOOL {
+            // C's bool: anything not zero is 1
+            if from != CBOOL {
+                self.ops(&[Op::Push(0), Op::Bin(BinOp::Ne)]);
+            }
+            return Ok(());
+        }
+        let from = if from == CBOOL { 8 } else { from };
         if to == U8 {
             // Go's byte: 0 to 255, a constant that is not one an error
             if !self.typed() || from == U8 {
@@ -1085,6 +1102,8 @@ impl Fx<'_, '_> {
         if !self.typed() {
             return 64;
         }
+        // C's bool is promoted as any narrow number is
+        let (a, b) = (if a == CBOOL { 8 } else { a }, if b == CBOOL { 8 } else { b });
         let w = match (a, b) {
             (0, x) | (x, 0) => x,
             (x, y) => x.max(y),
@@ -1258,6 +1277,11 @@ impl Fx<'_, '_> {
     /// conversion and Go's int(x) do it (the machine's cvttsd2si: 32 bits
     /// for a width of 32 or less, as clang and Go convert to an int).
     fn float_to_int(&mut self, w: u8) {
+        if w == CBOOL {
+            // C's (bool)x of a float: 1 where it is not zero (NaN too)
+            self.ops(&[Op::Push(0), Op::Bin(BinOp::FNe)]);
+            return;
+        }
         let op = if w <= 32 { UnOp::ToInt32 } else { UnOp::ToInt };
         match self.constant_at(self.code.len()) {
             Some(c) => *self.code.last_mut().unwrap() = Op::Push(op.float_eval(c).unwrap()),
@@ -1690,7 +1714,7 @@ impl Fx<'_, '_> {
         // a constant that does not fit (Go) is checked
         let v = self.hidden();
         if t.whole() && vt.whole() {
-            if from == 0 {
+            if from == 0 || w == CBOOL {
                 self.narrow(w, from)?;
             }
         } else if t.scalar() {
@@ -2433,7 +2457,7 @@ impl Fx<'_, '_> {
             };
             self.elem_kind(target, &e, &t)?;
             if e.whole() && t.whole() {
-                if from == 0 {
+                if from == 0 || w == CBOOL {
                     self.narrow(w, from)?;
                 }
             } else if e.scalar() {
@@ -2446,7 +2470,7 @@ impl Fx<'_, '_> {
         // a[i] += x worked on the memory itself, where x calls nothing (so
         // when the element is read does not matter); whole numbers only
         if let Some(op @ (BinOp::Add | BinOp::Sub | BinOp::Band | BinOp::Bor | BinOp::Bxor)) = op {
-            if e.whole() && e != Ty::Bool && calls_nothing(value) && self.whole_value(value) {
+            if e.whole() && e != Ty::Bool && w != CBOOL && calls_nothing(value) && self.whole_value(value) {
                 self.int_expr(value)?;
                 let op = if self.sh.l.checked { op.checked() } else { op };
                 self.emit(Op::OpM(op, size(&e, w) as u8));

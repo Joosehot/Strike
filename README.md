@@ -476,7 +476,7 @@ the line and the reason, and never guessed. Refused today:
   pointer and Python's AttributeError one by one, and each refusal. The
   random C programs have structs too: nested, arrays of them and in them,
   given and returned by value, changed through pointers, copied whole.
-- 95 tests in all (every target of `cargo test --release`), in about 60 s.
+- 96 tests in all (every target of `cargo test --release`), in about 60 s.
 
 The tests have found real bugs, all fixed:
 
