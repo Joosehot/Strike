@@ -1086,6 +1086,15 @@ fn what_several_files_cannot_do_yet_is_refused_not_guessed() {
         ("star", vec![("__main__.py", "from m import *\n"), ("m.py", "x = 1\n")], "from m import * is not in Strike yet"),
         ("module_line", vec![("__main__.py", "import m\n"), ("m.py", "x = 1\nprint(x ** 2)\n")], "m.py:2:"),
         ("module_value", vec![("__main__.py", "import m\nprint(m)\n"), ("m.py", "x = 1\n")], "m is a module"),
+        // structs and classes of other packages and modules, and one struct
+        // name given two shapes by two C files
+        (
+            "package_type",
+            vec![go_mod, ("main.go", "package main\nimport \"example.com/m/calc\"\nfunc main() {\n\tcalc.F()\n}\n"), ("calc/calc.go", "package calc\ntype T struct {\n\tA int\n}\nfunc F() {\n}\n")],
+            "calc/calc.go:2: a type of a package other than main is not in Strike yet",
+        ),
+        ("module_class", vec![("__main__.py", "import m\nprint(m.x)\n"), ("m.py", "class C:\n    pass\n\n\nx = 1\n")], "m.py:1: a class of a module other than the main one is not in Strike yet"),
+        ("two_shapes", vec![("a.c", "struct D { int z; };\nint main() { return 0; }\n"), ("b.c", "struct D { long long z; };\n")], "struct D is defined differently in two files"),
     ];
     for (name, files, says) in cases {
         let d = r.join(name);

@@ -1270,7 +1270,7 @@ impl<'a> P<'a> {
 /// The names a file gives its types (struct P, type P, class P, and a
 /// typedef's last name), found before the file is read, so that a type is
 /// read as one wherever it is written.
-fn type_names(toks: &[Tok], l: &Lang) -> std::collections::HashSet<String> {
+pub fn type_names(toks: &[Tok], l: &Lang) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let Some(r) = &l.records else { return out };
     let word = |i: usize| match toks.get(i).map(|t| &t.t) {
@@ -1305,7 +1305,15 @@ fn type_names(toks: &[Tok], l: &Lang) -> std::collections::HashSet<String> {
 }
 
 pub fn parse(toks: &[Tok], l: &Lang) -> Result<Program, Failure> {
-    let mut p = P { t: toks, i: 0, l, far: 0, far_msg: String::new(), fatal: None, types: type_names(toks, l) };
+    parse_with(toks, l, &std::collections::HashSet::new())
+}
+
+/// The file's tokens read, with the types other files of its package
+/// declare known as types too (Go's package of several files).
+pub fn parse_with(toks: &[Tok], l: &Lang, others: &std::collections::HashSet<String>) -> Result<Program, Failure> {
+    let mut types = type_names(toks, l);
+    types.extend(others.iter().cloned());
+    let mut p = P { t: toks, i: 0, l, far: 0, far_msg: String::new(), fatal: None, types };
     let mut prog = Program::default();
     let fail = |p: &P| {
         let reach = p.far as f64 / toks.len().max(1) as f64;

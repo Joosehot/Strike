@@ -2105,8 +2105,21 @@ impl Fx<'_, '_> {
         let ty = match value {
             Some(e) => {
                 let t = self.value(e)?;
-                // a struct given whole: the variable's own copy
+                // a struct given whole: the variable's own copy (a global's
+                // in its own words)
                 if let Ty::Struct(_) = &t {
+                    if self.globals_here {
+                        let src = self.hidden();
+                        self.emit(Op::Store(src));
+                        let words = u32::try_from(t.words()).ok().filter(|w| *w < 1 << 26).ok_or((self.line, "a global struct this large is not in Strike yet".to_string()))?;
+                        if self.sh.globals.contains_key(name) {
+                            return self.err(format!("{name} is declared twice"));
+                        }
+                        let g = self.declare_words(name, t.clone(), words);
+                        let a = self.hidden();
+                        self.ops(&[Op::AddrG(g & !GLOBAL), Op::Store(a), Op::Load(src)]);
+                        return self.put(a, &t, 64, &t, 64);
+                    }
                     let own = !self.escapes.contains(name);
                     self.copy_to_new(&t, own)?;
                 }

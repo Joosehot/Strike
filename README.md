@@ -258,6 +258,60 @@ against printf, Go and Python on 10,095 doubles (all the powers of 2 and
 10, random bit patterns, random decimals, subnormals, halfway cases):
 504,750 printf results, 353,325 Go Printf results, every repr, and every
 %v of float64 and float32 were all the same.
+
+### Structs and classes
+
+A description says how its language writes them, in its `[records]`
+table: the words that name a type (`struct`, `type`, `class`), `->`, `&`
+and `*`, how an element names its field (`.x =` or `X:`), and whether the
+values are structs or objects. The IR needed nothing new: a struct is
+memory, as an array is.
+
+- **C** ([c.toml](languages/c.toml)). A struct is laid out as clang lays
+  it out on x86-64: each field at the next multiple of its alignment, the
+  whole rounded up to the largest. It is held in place (the function's own
+  memory, or a global's words) and copied when it is assigned, given or
+  returned. A struct returned goes straight into memory its caller gives,
+  so nothing is made on the heap for it. `struct P`, `typedef struct ...
+  P`, `typedef struct P P`, nested structs, arrays of structs and arrays in
+  them, `{1, 2}` and `{.y = 2, 3}` (the rest zero), `&s`, `p->x`, `(*p).x`,
+  `*p = s`, a pointer to a struct as a parameter, a variable or a field
+  (`struct Node *next`), and an array of structs given as one. `sizeof` of
+  a type, a variable, a field or an element, and `offsetof`, count as clang
+  counts; `sizeof a / sizeof a[0]` is worked out while compiling, so its
+  unsigned division is exact.
+- **Go** ([go.toml](languages/go.toml)). A struct is a value too: assigned,
+  given and returned as a copy, and an array in it with it. `P{1, 2}`
+  gives every field, `P{X: 1}` the ones named, `[]P{{1, 2}}` leaves the
+  type out. `&P{...}` and `&v` make pointers, and what they point at lives
+  on the heap, new each time, as Go's escape analysis puts it: a variable
+  whose address is taken, or that a method wanting a pointer is called on,
+  is never the function's own memory. `p.X` follows a pointer, and a nil
+  one panics with exit code 2. Methods take a value (copied) or a pointer,
+  which Go takes of an addressable value by itself. A struct declared in
+  one file of the package is a type in all of them. Println and `%v` print
+  `{1 2 hi}`, `&{1 2}` and `<nil>`, `%+v` prints `{X:1 Y:2}`, and a String
+  method with a value receiver is what fmt prints. A slice of structs grows
+  by Go's own size of the struct, so `cap` is Go's.
+- **Python** ([python.toml](languages/python.toml)). An object is an
+  address on the heap, shared by every name that holds it. Its first word
+  says which attributes are set, and each attribute has a word of its own:
+  those any method of its class (or of a base) gives `self`, and those
+  given outside, learned round by round as kinds are. An attribute's kind
+  is learned as a list's elements are. Reading one that is not set is
+  Python's AttributeError, or the class's own attribute (`count = 0`; `P.a`
+  and `b = a + 1` in the body read the class's). A base class, overriding
+  and `super().m()` are Python's: each method is lowered for each class it
+  is called on, so `self.speak()` finds the override, as Python finds it.
+  `print` uses `__str__` or `__repr__`, and a list shows its objects by
+  `__repr__`.
+
+Checked as everything else is: tests/uc/structs.c, structs.go and
+classes.py print what clang, Go and Python print, in every mode, and
+[tools/struct_layouts.py](tools/struct_layouts.py) writes 160 structs of
+random fields whose every `sizeof` and `offsetof` Strike's executable
+prints as clang's does.
+
 ### Several files, modules and C's preprocessor
 
 `strike compile a.c b.c`, or a directory: `strike compile prog/`. Each
@@ -319,8 +373,21 @@ a value.
 Whatever Strike cannot do yet in the language's own way is refused, with
 the line and the reason, and never guessed. Refused today:
 
-- structs, pointer arithmetic, `&` and `*`, and the unsigned types other
-  than Go's `byte`;
+- pointer arithmetic, `&` and `*` of anything but a struct, and the
+  unsigned types other than Go's `byte`;
+- a C struct with a `float` field (Strike holds a float as a double, so its
+  four bytes are not where clang puts them), a struct that holds itself, a
+  Go `byte` field, `==` of structs, and `sizeof` of an expression other
+  than a variable, a field or an element;
+- printing what Go prints as an address (a pointer inside a struct or a
+  slice), a type with an Error, Format or GoString method, or one with a
+  String method inside another value; a pointer method called on a value
+  that has no address; a type of a package other than main;
+- printing a Python object that has no `__str__` or `__repr__` (it prints
+  its address), a list of objects without `__repr__`, an object as a
+  condition, `==` of objects, `isinstance`, a static method, a method called
+  on its class, a name holding objects of two classes, and a class of a
+  module other than the main one;
 - a Python string past ASCII, a string changed in place, `split` with a
   separator, Go's `[]byte`;
 - a chained comparison in Python;
@@ -383,7 +450,11 @@ the line and the reason, and never guessed. Refused today:
   TypeError, EOFError, Go's panics) and each refusal. The random C
   programs make strings in char arrays too, and compare them with strlen
   and strcmp.
-- 82 tests in all (every target of `cargo test --release`), in about 50 s.
+- Structs and classes: the three suites, the 160 random layouts, Go's nil
+  pointer and Python's AttributeError one by one, and each refusal. The
+  random C programs have structs too: nested, arrays of them and in them,
+  given and returned by value, changed through pointers, copied whole.
+- 85 tests in all (every target of `cargo test --release`), in about 50 s.
 
 The tests have found real bugs, all fixed:
 
@@ -393,7 +464,12 @@ The tests have found real bugs, all fixed:
 - a crash on frames larger than a page;
 - Python's 25! and C's `int` overflow coming out wrong with no warning;
 - Go's `x := int32(y)` (and `c := s[0]`) taking int's width, not the
-  value's, so x did not wrap at 32 bits.
+  value's, so x did not wrap at 32 bits;
+- a Python parameter passed on to another function before its own kind
+  was known made that function's a whole number, so `super().__init__(name)`
+  (or any `f(s)` that calls `g(s)` with a string) was refused;
+- Go's `a[i] = -1` into a float slice refused, as if the constant could not
+  be a float.
 
 ### Code generation
 
@@ -657,7 +733,7 @@ are planned:
 1. Command-line arguments, which are strings now there are strings.
 2. More of floats: reading floats from input, and more of each language's
    math library.
-3. Structs and classes.
+3. ~~Structs and classes.~~ Done: see above.
 4. ~~Several files and modules, and C's preprocessor.~~ Done: see
    above.
 

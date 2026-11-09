@@ -47,6 +47,8 @@ struct Reader<'a> {
     files: Vec<PathBuf>,
     /// every line read: its file and its line there
     at: Vec<(u32, u32)>,
+    /// the types the other files of the package being read declare
+    types: HashSet<String>,
 }
 
 impl Reader<'_> {
@@ -102,7 +104,7 @@ impl Reader<'_> {
         for t in toks.iter_mut() {
             t.line += base;
         }
-        parse::parse(&toks, self.l).map_err(|f| self.fail((f.line, f.message), f.reach))
+        parse::parse_with(&toks, self.l, &self.types).map_err(|f| self.fail((f.line, f.message), f.reach))
     }
 }
 
@@ -135,7 +137,7 @@ pub fn units(l: &Lang, files: &[PathBuf], dir: Option<&Path>) -> Vec<PathBuf> {
 
 /// The program's files, made one program and lowered; and every file read.
 pub fn front(l: &Lang, units: &[PathBuf], include: &[PathBuf]) -> Result<(lower::Lowered, Vec<PathBuf>), Fail> {
-    let mut r = Reader { l, include, files: Vec::new(), at: Vec::new() };
+    let mut r = Reader { l, include, files: Vec::new(), at: Vec::new(), types: HashSet::new() };
     let prog = match l.program.model {
         Model::Units => link_units(&mut r, units)?,
         Model::Packages => link_packages(&mut r, units)?,
@@ -900,8 +902,17 @@ impl Packages {
         self.loading.push(path.to_string());
         let mut read = Vec::new();
         let mut name: Option<(String, PathBuf)> = None;
+        // a type declared in one file of the package is a type in all of them
+        let mut types = HashSet::new();
         for f in files {
+            if let Ok(toks) = hot::read_file(f).map_err(|_| ()).and_then(|t| lex::lex(&t, r.l).map_err(|_| ())) {
+                types.extend(parse::type_names(&toks, r.l));
+            }
+        }
+        for f in files {
+            r.types = types.clone();
             let prog = r.read(f)?;
+            r.types.clear();
             let Some((n, line)) = prog.package.clone() else {
                 let first = prog.funcs.first().map(|f| f.line).unwrap_or(1);
                 return Err(r.fail((first, "a Go file begins with its package clause".into()), 1.0));

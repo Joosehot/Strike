@@ -54,6 +54,11 @@ var origin = Vec{0, 0}
 var registry []Shape
 var keep []Vec
 var zero P
+var first = Money{100}
+var copied = first
+var made = mk(3)
+var pair [2]Inner
+var toFirst = &first
 
 func (c *Counter) Inc(by int) {
 	c.n += by
@@ -255,4 +260,7 @@ func main() {
 	var nm *Money
 	fmt.Println(money, &money, nm)
 	fmt.Printf("%v %+v\n", money, money)
+	copied.Cents = 5
+	toFirst.Cents += 1
+	fmt.Println(first, copied, made.Name, made.Y, pair, *toFirst)
 }

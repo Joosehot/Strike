@@ -17,4 +17,7 @@ func main() {
 	calc.Bump()
 	fmt.Println(calc.Total, calc.Count())
 	fmt.Println(counter)
+	t := Tally{Name: "t"}
+	t.Add(counter)
+	fmt.Println(t)
 }
