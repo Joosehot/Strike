@@ -1406,3 +1406,7 @@ plugin passes an option the export does not show yet.
    Clockwork's: every order is correct, only speed changes.
 
 MIT. © 2026 Joose Hotari.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

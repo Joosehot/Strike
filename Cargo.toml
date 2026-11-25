@@ -3,6 +3,7 @@ name = "strike"
 version = "0.1.0"
 edition = "2021"
 description = "A Rust build system that calls rustc itself: HotMotor chooses the build, lightning remembers it"
+license = "MIT"
 publish = false
 
 [dependencies]
